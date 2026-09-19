@@ -209,6 +209,8 @@ C_SRCS = \
 	$(SRC_DIR)/sdk_surface.c \
 	$(SRC_DIR)/sdk_aperture_layout.c \
 	$(SRC_DIR)/sdk_mailbox.c \
+	$(SRC_DIR)/rfb/rfb_encode.c \
+	$(SRC_DIR)/rfb/rfb_words.c \
 	$(SRC_DIR)/watchdog.c \
 	$(SRC_DIR)/newlib_compat.c
 
@@ -335,6 +337,12 @@ $(BUILD_DIR)/sdk_video_plmpeg.o: $(SRC_DIR)/sdk_video_plmpeg.c
 $(BUILD_DIR)/lzh/%.o: $(SRC_DIR)/lzh/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -I$(SRC_DIR)/lzh -DHAVE_CONFIG_H $(CFLAGS) -MMD -MP -o $@ $<
+
+# rfb_words is the RFB wire-word emitter.  -Os here keeps the firmware's
+# low sections under the 0x00200000 framebuffer budget once the console
+# encoder is linked in, without touching the hot pixel loop in
+# rfb_encode.c (which stays -O2).
+$(BUILD_DIR)/rfb/%.o: EXTRA_CFLAGS := -Os
 
 # Default rule for all other files (-O2).
 # -MMD emits a .d file next to the .o listing every header the source
