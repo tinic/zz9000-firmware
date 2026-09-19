@@ -15,6 +15,7 @@
 #include "sdk_palette.h"
 #include "sdk_mailbox.h"
 #include "sdk_compression.h"
+#include <zlib.h>
 #include "lzh/zz9k_lzh.h"
 #include "sdk_crypto.h"
 #include "sdk_offload_params.h"
@@ -7750,6 +7751,8 @@ static uint32_t    cenc_scratch_len;
 static int         cenc_ready;
 static rfb_u8     *cenc_snap;       /* one coherent whole-frame copy per pass */
 static uint32_t    cenc_snap_len;
+static uint8_t    *cenc_defl;        /* per-message deflate scratch */
+static uint32_t    cenc_defl_len;
 
 static int cenc_geom_same(const rfb_geom *a, const rfb_geom *b)
 {
@@ -7899,6 +7902,31 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	n = rfb_encode_band(&cenc_enc, planes, outp, out_capacity, ty0, ty1);
 	if (n < 0)
 		return complete_status(req, comp, SDK_STATUS_INTERNAL_ERROR);
+
+	/* Deflate the ops payload (everything after the 4-byte header) in place, so
+	 * the wire carries the header raw -- version/flags/seq stay readable for the
+	 * viewer's seq-gap recovery -- and the compressed body follows.  The ARM has
+	 * spare cycles; the 68030 does not, which is exactly why compressing here
+	 * (not host-side) is the right place.  flags bit 0 tells the viewer to
+	 * inflate.  Kept raw if compression does not shrink it (tiny bands). */
+	if (n > 4L) {
+		uLong bound = compressBound((uLong)(n - 4L));
+		if (cenc_defl_len < (uint32_t)bound) {
+			free(cenc_defl);
+			cenc_defl = (uint8_t *)malloc(bound);
+			cenc_defl_len = cenc_defl ? (uint32_t)bound : 0u;
+		}
+		if (cenc_defl) {
+			uLongf clen = (uLongf)cenc_defl_len;
+			if (compress2(cenc_defl, &clen, (const Bytef *)(outp + 4),
+			              (uLong)(n - 4L), 6) == Z_OK &&
+			    (long)(4UL + clen) < n) {
+				memcpy(outp + 4, cenc_defl, clen);
+				outp[1] |= 0x01u;          /* flags: ops are zlib-deflated */
+				n = (long)(4UL + clen);
+			}
+		}
+	}
 
 	/* Publish to the 68k: flush the written span (Xil_DCacheFlushRange ends in
 	 * a DSB, so the store is ordered before the completion is posted). */
