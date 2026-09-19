@@ -89,7 +89,7 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
   -DCMAKE_C_COMPILER=arm-none-eabi-gcc \
   -DCMAKE_AR=arm-none-eabi-ar \
   -DCMAKE_RANLIB=arm-none-eabi-ranlib \
-  -DCMAKE_C_FLAGS="-mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard -O2 -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-strict-aliasing" \
+  -DCMAKE_C_FLAGS="-mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard -O2 -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-strict-aliasing -Wno-error=incompatible-pointer-types -Wno-incompatible-pointer-types" \
   -DPNG_TARGET_ARCHITECTURE=arm \
   -DPNG_ARM_NEON=on \
   -DPNG_SHARED=OFF \

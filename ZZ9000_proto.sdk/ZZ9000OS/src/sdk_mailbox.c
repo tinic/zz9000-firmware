@@ -8,7 +8,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include "xil_cache.h"
+#include <aminetxduo/rfb_encode.h>
 #include "xtime_l.h"
 #include "sdk_palette.h"
 #include "sdk_mailbox.h"
@@ -1343,6 +1345,15 @@ static const struct SDKServiceDescriptor sdk_services[] = {
 		SDK_SERVICE_VIDEO,
 		14,
 		"video"
+	},
+	{
+		SDK_SERVICE_CONSOLE,
+		0x00020000U,
+		SDK_CAP_CONSOLE_ENCODE,
+		SDK_SERVICE_FLAG_FIRMWARE,
+		SDK_SERVICE_CONSOLE,
+		1,
+		"console"
 	}
 };
 
@@ -7717,6 +7728,194 @@ static int opcode_reserves_request_id_zero(uint16_t opcode)
 	}
 }
 
+/* ==== AmiNetXDuo console encoder (vendor service 0x8200) ===================
+ * Offload of the httpd web-console framebuffer encode.  The 68k host maps the
+ * displayed framebuffer, allocates a shared output buffer, and sends one
+ * tile-row band [ty0,ty1) per call together with the encoder geometry it
+ * configured; we run the shared RFB encoder (src/rfb, byte-identical to the
+ * 68k fallback path) over the framebuffer into that buffer.  Wire contract:
+ * AmiNetXDuo src/tools/httpzz.h (HttpZzEncodeReq/Reply), all ints big-endian,
+ * fields at fixed offsets (the layout is asserted host-side). */
+#define HTTPZZ_F_RESET      0x0001u   /* drop the delta baseline (keyframe) */
+#define HTTPZZ_RF_KEYFRAME  0x0001u
+#define HTTPZZ_CODEC_NONE   0u
+
+static rfb_encoder cenc_enc;
+static rfb_geom    cenc_geom;
+static rfb_u32     cenc_flags;
+static rfb_u8     *cenc_shadow;
+static rfb_u8     *cenc_scratch;
+static uint32_t    cenc_shadow_len;
+static uint32_t    cenc_scratch_len;
+static int         cenc_ready;
+static rfb_u8     *cenc_snap;       /* one coherent whole-frame copy per pass */
+static uint32_t    cenc_snap_len;
+
+static int cenc_geom_same(const rfb_geom *a, const rfb_geom *b)
+{
+	return a->width == b->width && a->height == b->height &&
+	       a->bytes_per_row == b->bytes_per_row && a->depth == b->depth &&
+	       a->tile_w == b->tile_w && a->tile_h == b->tile_h &&
+	       a->format == b->format;
+}
+
+/* (Re)configure the persistent encoder for geometry g + flags.  The sequence
+ * number is preserved across a reconfigure so the viewer never sees a spurious
+ * gap.  Returns 1 on success, 0 if geometry is unusable or memory is short. */
+static int cenc_configure(const rfb_geom *g, rfb_u32 flags)
+{
+	rfb_scroll_cfg cfg;
+	uint32_t shadow_len;
+	uint32_t scratch_len;
+	rfb_u16 seq_keep = cenc_ready ? cenc_enc.seq : 0;
+
+	rfb_scroll_defaults(&cfg);
+	shadow_len = rfb_shadow_size(g);
+	scratch_len = rfb_scratch_size(g, flags, &cfg);
+	if (shadow_len == 0u || scratch_len == 0u)
+		return 0;
+
+	if (shadow_len != cenc_shadow_len) {
+		free(cenc_shadow);
+		cenc_shadow = (rfb_u8 *)malloc(shadow_len);
+		cenc_shadow_len = cenc_shadow ? shadow_len : 0u;
+	}
+	if (scratch_len != cenc_scratch_len) {
+		free(cenc_scratch);
+		cenc_scratch = (rfb_u8 *)malloc(scratch_len);
+		cenc_scratch_len = cenc_scratch ? scratch_len : 0u;
+	}
+	if (!cenc_shadow || !cenc_scratch)
+		return 0;
+
+	/* Zeroed shadow => the first band codes as a full frame from the same
+	 * all-zero the viewer starts from. */
+	memset(cenc_shadow, 0, cenc_shadow_len);
+	if (rfb_encoder_init(&cenc_enc, g, flags, &cfg,
+	                     cenc_shadow, cenc_shadow_len,
+	                     cenc_scratch, cenc_scratch_len) != 0)
+		return 0;
+	cenc_enc.seq = seq_keep;
+	cenc_geom = *g;
+	cenc_flags = flags;
+	cenc_ready = 1;
+	return 1;
+}
+
+static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
+                                      volatile struct SDKMailboxEntry *comp,
+                                      uint16_t payload_len)
+{
+	const volatile uint8_t *p = req->payload;
+	uint32_t surface_handle;
+	uint32_t out_handle;
+	uint32_t out_capacity;
+	uint32_t enc_flags;
+	uint16_t width, height, bpr, ty0, ty1, rflags;
+	struct SDKSurface fb;
+	struct SDKSharedBuffer *out;
+	rfb_geom g;
+	const rfb_u8 *planes[1];
+	rfb_u8 *outp;
+	long n;
+	int reinit = 0;
+	uint16_t reply_flags = 0;
+
+	if (payload_len < 34u)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	surface_handle = get_be32(p + 0);
+	out_handle     = get_be32(p + 4);
+	out_capacity   = get_be32(p + 8);
+	enc_flags      = get_be32(p + 12);
+	width          = get_be16(p + 16);
+	height         = get_be16(p + 18);
+	bpr            = get_be16(p + 20);
+	ty0            = get_be16(p + 22);
+	ty1            = get_be16(p + 24);
+	rflags         = get_be16(p + 26);
+	/* p+28 codec (requested wire codec) -- v1 answers NONE only */
+	g.depth  = p[30];
+	g.tile_w = p[31];
+	g.tile_h = p[32];
+	g.format = p[33];
+
+	/* The displayed framebuffer.  Honour the handle the host mapped; fall back
+	 * to the framebuffer sentinel so a stale or ambiguous handle still resolves. */
+	if (!get_surface_info(surface_handle, &fb) &&
+	    !get_surface_info(SDK_SURFACE_HANDLE_FRAMEBUFFER, &fb))
+		return complete_status(req, comp, SDK_STATUS_BAD_HANDLE);
+
+	out = find_shared_buffer(out_handle);
+	if (!out || out_capacity == 0u || !buffer_range_valid(out, 0u, out_capacity))
+		return complete_status(req, comp, SDK_STATUS_BAD_HANDLE);
+
+	/* The host frames bands from the geometry it sent; it must match the real
+	 * surface or the pixel stride and tiling disagree.  Mismatch => let the
+	 * host fall back to its own encode. */
+	if (width != fb.width || height != fb.height || bpr != fb.pitch)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	g.width = width;
+	g.height = height;
+	g.bytes_per_row = bpr;
+
+	if (!cenc_ready || cenc_flags != enc_flags ||
+	    !cenc_geom_same(&g, &cenc_geom) || (rflags & HTTPZZ_F_RESET)) {
+		if (!cenc_configure(&g, enc_flags))
+			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
+		reinit = 1;
+	}
+
+	/* One coherent snapshot of the whole framebuffer per pass.  The card reads
+	 * the live framebuffer and an encode spans ~10-30 ms -- long enough for a
+	 * dragged window to smear across it.  A single memcpy is a ~1 ms read that a
+	 * drag cannot noticeably move, so band 0 copies the frame and every band of
+	 * the pass encodes off the stable copy: clean AND live, no layer lock. */
+	if (ty0 == 0) {
+		if (cenc_snap_len < fb.length) {
+			free(cenc_snap);
+			cenc_snap = (rfb_u8 *)malloc(fb.length);
+			cenc_snap_len = cenc_snap ? fb.length : 0u;
+		}
+		if (!cenc_snap)
+			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
+		/* Read the live RTG framebuffer COHERENTLY -- do NOT invalidate.
+		 * The Amiga's RTG pixel writes enter the PS through the cache-coherent
+		 * ACP port (MNTZorro m00_axi, AWCACHE=0x3), so they snoop/update the ARM
+		 * caches directly while DDR can stay stale.  An invalidate here would
+		 * DISCARD those freshly host-written lines and re-read stale DDR -- the
+		 * "top rows live, everything below frozen" bug.  This matches overlay.c
+		 * overlay_run_compose(), which reads this exact address with no
+		 * invalidate; whole-frame coherency is kept by the per-vblank
+		 * Xil_L1DCacheFlush()/Xil_L2CacheFlush() in video.c's isr_video(). */
+		memcpy(cenc_snap, (const void *)(uintptr_t)fb.address, fb.length);
+	}
+	if (!cenc_snap)   /* a mid-pass band arrived before any band 0 */
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	planes[0] = (const rfb_u8 *)cenc_snap;
+	outp = (rfb_u8 *)(uintptr_t)out->address;
+	n = rfb_encode_band(&cenc_enc, planes, outp, out_capacity, ty0, ty1);
+	if (n < 0)
+		return complete_status(req, comp, SDK_STATUS_INTERNAL_ERROR);
+
+	/* Publish to the 68k: flush the written span (Xil_DCacheFlushRange ends in
+	 * a DSB, so the store is ordered before the completion is posted). */
+	Xil_DCacheFlushRange((INTPTR)(uintptr_t)outp, (uint32_t)n);
+
+	if (reinit && ty0 == 0)
+		reply_flags |= HTTPZZ_RF_KEYFRAME;
+
+	write_completion(comp, req, SDK_STATUS_OK, 8);
+	memset((void *)comp->payload, 0, sizeof(comp->payload));
+	put_be32(comp->payload + 0, (uint32_t)n);        /* out_len */
+	put_be16(comp->payload + 4, HTTPZZ_CODEC_NONE);  /* codec   */
+	put_be16(comp->payload + 6, reply_flags);        /* flags   */
+	return SDK_STATUS_OK;
+}
+
+
 static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
                                volatile struct SDKMailboxEntry *comp,
                                uint32_t pending_requests)
@@ -7869,6 +8068,8 @@ static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
 		return handle_decompress_stream_close(req, comp, payload_len);
 	case SDK_OP_DECOMPRESS_BATCH:
 		return handle_decompress_batch(req, comp, payload_len);
+	case SDK_OP_CONSOLE_ENCODE:
+		return handle_console_encode(req, comp, payload_len);
 	case SDK_OP_CRYPTO_HASH:
 		return handle_crypto_hash(req, comp, payload_len);
 	case SDK_OP_CRYPTO_STREAM:

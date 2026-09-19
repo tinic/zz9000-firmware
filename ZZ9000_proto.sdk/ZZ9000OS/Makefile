@@ -64,7 +64,7 @@ COMMON_FLAGS = $(INCLUDES) -Wall -c
 COMMON_FLAGS += -ffunction-sections -fdata-sections
 COMMON_FLAGS += -fno-unwind-tables -fno-asynchronous-unwind-tables
 COMMON_FLAGS += -fno-strict-aliasing
-COMMON_FLAGS += -Wno-incompatible-pointer-types -Wno-return-mismatch -Wno-implicit-function-declaration
+COMMON_FLAGS += -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-int -Wno-return-mismatch -Wno-implicit-function-declaration
 COMMON_FLAGS += -DCONFIG_EHCI_IS_TDI
 # TXFIFO threshold tuning: raises the EHCI TX FIFO fill threshold
 # from 2 to 4 DWORDs before a transaction is launched. Compensates
@@ -209,6 +209,8 @@ C_SRCS = \
 	$(SRC_DIR)/sdk_surface.c \
 	$(SRC_DIR)/sdk_aperture_layout.c \
 	$(SRC_DIR)/sdk_mailbox.c \
+	$(SRC_DIR)/rfb/rfb_encode.c \
+	$(SRC_DIR)/rfb/rfb_words.c \
 	$(SRC_DIR)/watchdog.c \
 	$(SRC_DIR)/newlib_compat.c
 
