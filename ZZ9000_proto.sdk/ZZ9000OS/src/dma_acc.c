@@ -224,26 +224,14 @@ void handle_acc_op(uint16_t zdata)
                     decompress_rle_smush1_data((uint8_t *)data->clut4, (uint8_t *)data->offset[0] + dest_offset, data->u32_user[0], data->x[1], data->y[1], data->pitch[0]);
                     break;
                 }
-                case ACC_CMPTYPE_SMUSH_CODEC37: {
-                    //XTime tim1, tim2;
-                    //XTime_GetTime(&tim1);
-                    uint32_t dest_offset = data->x[0] + (data->pitch[0] * data->y[0]);
-                    Codec37Decoder_decode(Codec37Decoder_GetCur(), (uint8_t *)data->offset[0] + dest_offset, (uint8_t *)data->clut4);
-                    //XTime_GetTime(&tim2);
-                    //printf("c37 frame size: %d bytes", data->u32_user[0]);
-                    //printf("c37 frame decode time: %f ms\n", ((float)(tim2 - tim1) / (float)COUNTS_PER_SECOND) * 1000.0f);
+                /* SMUSH codec37/codec47 (LucasArts game-cutscene) decode is
+                   disabled in this build to keep the firmware under its 1 MB
+                   low-section budget for the console-encode offload.  The ops
+                   stay in the ACC command ABI (the enum values are unchanged)
+                   but decode nothing. */
+                case ACC_CMPTYPE_SMUSH_CODEC37:
+                case ACC_CMPTYPE_SMUSH_CODEC47:
                     break;
-                }
-                case ACC_CMPTYPE_SMUSH_CODEC47: {
-                    //XTime tim1, tim2;
-                    //XTime_GetTime(&tim1);
-                    uint32_t dest_offset = data->x[0] + (data->pitch[0] * data->y[0]);
-                    Codec47Decoder_decode(Codec47Decoder_GetCur(), (uint8_t *)data->offset[0] + dest_offset, (uint8_t *)data->clut4);
-                    //XTime_GetTime(&tim2);
-                    //printf("c47 frame size: %d bytes", data->u32_user[0]);
-                    //printf("c47 frame decode time: %f ms\n", ((float)(tim2 - tim1) / (float)COUNTS_PER_SECOND) * 1000.0f);
-                    break;
-                }
                 case ACC_CMPTYPE_IMA_ADPCM_VBR: {
                     if (!imc_tables_initialized) {
                         init_imc_tables();
@@ -258,31 +246,10 @@ void handle_acc_op(uint16_t zdata)
             break;
         case ACC_OP_CODEC_OP:
             switch(data->u8_user[0]) {
+                /* SMUSH codec37/codec47 disabled in this build (see the
+                   ACC_OP_DECOMPRESS switch above). */
                 case ACC_CMPTYPE_SMUSH_CODEC37:
-                    if (data->u8_user[1] == 1) {
-                        SWAP16(data->x[0]);
-                        SWAP16(data->y[0]);
-                        Codec37Decoder_Init(Codec37Decoder_GetCur(), data->x[0], data->y[0]);
-                        printf("Initializing codec37 decoder %d: %dx%d\n", Codec37Decoder_GetCur(), data->x[0], data->y[0]);
-                        data->u8_user[2] = Codec37Decoder_GetCur() + 1;
-                    }
-                    else {
-                        printf("Switching to next codec37 decoder.\n");
-                        Codec37Decoder_Next();
-                    }
-                    break;
                 case ACC_CMPTYPE_SMUSH_CODEC47:
-                    if (data->u8_user[1] == 1) {
-                        SWAP16(data->x[0]);
-                        SWAP16(data->y[0]);
-                        Codec47Decoder_Init(Codec47Decoder_GetCur(), data->x[0], data->y[0]);
-                        printf("Initializing codec47 decoder %d: %dx%d\n", Codec47Decoder_GetCur(), data->x[0], data->y[0]);
-                        data->u8_user[2] = Codec47Decoder_GetCur() + 1;
-                    }
-                    else {
-                        printf("Switching to next codec47 decoder.\n");
-                        Codec47Decoder_Next();
-                    }
                     break;
             }
             break;

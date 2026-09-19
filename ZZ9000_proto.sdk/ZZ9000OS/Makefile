@@ -110,8 +110,6 @@ C_SRCS = \
 	$(SRC_DIR)/audio_scene.c \
 	$(SRC_DIR)/sdk_audio_control.c \
 	$(SRC_DIR)/bootrom.c \
-	$(SRC_DIR)/codec37.c \
-	$(SRC_DIR)/codec47.c \
 	$(SRC_DIR)/compression.c \
 	$(SRC_DIR)/core2.c \
 	$(SRC_DIR)/scheduler.c \
