@@ -54,6 +54,14 @@ uint8_t* ethernet_current_receive_ptr();
 int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
+/* REG_ZZ_ETH_RX_META: presence plus the current BD's GEM checksum verdict. */
+#define ETH_RX_META_PRESENT 0x8000u
+#define ETH_RX_META_MASK    0x0003u
+#define ETH_RX_META_NONE    0u
+#define ETH_RX_META_IP      1u
+#define ETH_RX_META_TCP     2u
+#define ETH_RX_META_UDP     3u
+u16 ethernet_get_rx_meta();
 void ethernet_task();
 void ethernet_reset_for_amiga();
 

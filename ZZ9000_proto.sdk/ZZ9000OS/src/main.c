@@ -1893,6 +1893,12 @@ int main() {
 						     | ethernet_get_rx_stats();
 						break;
 					}
+					/* 0xa6 is the low word of the 0xa4 register group.  The old
+					 * ARM argv interface occupying 0xa4 is inert in v2.x. */
+					case REG_ZZ_ARM_ARGV7: {
+						data = ethernet_get_rx_meta();
+						break;
+					}
 					case REG_ZZ_ETH_ERRORS: {
 						data = ethernet_get_errors();
 						break;

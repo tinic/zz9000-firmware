@@ -118,6 +118,11 @@ static int ethernet_prepare_rx_bd(XEmacPs_BdRing *rxring, XEmacPs_Bd *rxbd);
 	(((u32)bdptr - (u32)(ringptr)->BaseBdAddr) / (ringptr)->Separation)
 
 static u16 rx_bd_backlog_slot[RXBD_CNT];
+/* Bits 23..22 of the GEM receive descriptor, indexed by the host backlog
+ * slot.  The slot remains owned by the host until its serial is accepted, so
+ * this verdict and the frame presented through the Zorro window cannot part
+ * company. */
+static u8 rx_backlog_csum[FRAME_MAX_BACKLOG];
 
 static u16 ethernet_next_backlog_slot(u16 slot)
 {
@@ -204,6 +209,7 @@ static void ethernet_backlog_slot_publish(u16 slot, u32 bytes)
 
 static void ethernet_clear_backlog_slot(u16 slot)
 {
+	rx_backlog_csum[slot] = ETH_RX_META_NONE;
 	memset(ethernet_backlog_slot_ptr(slot), 0, RX_FRAME_PAD);
 	ethernet_backlog_slot_publish(slot, RX_FRAME_PAD);
 }
@@ -769,6 +775,7 @@ static void XEmacPsRecvHandler(void *Callback)
 		cur_bd_ptr = rxbdset;
 
 		for (int i=0; i<num_rx_bufs; i++) {
+			u32 bd_status = XEmacPs_BdRead(cur_bd_ptr, XEMACPS_BD_STAT_OFFSET);
 
 			frame_serial++;
 			/* 0 and 1 are reserved values the RX-accept handshake treats
@@ -816,6 +823,12 @@ static void XEmacPsRecvHandler(void *Callback)
 				ethernet_clear_backlog_slot(backlog_slot);
 			} else {
 				uint8_t* frame_bl_ptr = ethernet_backlog_slot_ptr(backlog_slot);
+				/* With RX checksum offload enabled, descriptor bits 23..22 are
+				 * none, IP-only, IP+TCP, or IP+UDP.  Preserve them beside the
+				 * slot; REG_ZZ_ETH_RX_META exposes the verdict for exactly the
+				 * slot selected by frames_backlog_read. */
+				rx_backlog_csum[backlog_slot] =
+					(u8)((bd_status & XEMACPS_RXBUF_IDMATCH_MASK) >> 22);
 				/*
 				 * THE ORDER IS THE POINT.  The 68k starts copying the moment
 				 * the header's line shows the serial, so every payload line
@@ -907,6 +920,19 @@ u16 ethernet_get_rx_stats() {
 	}
 
 	return (dropped << 8) | pause;
+}
+
+u16 ethernet_get_rx_meta() {
+	u16 verdict = ETH_RX_META_NONE;
+
+	if (frames_backlog > 0) {
+		verdict = rx_backlog_csum[frames_backlog_read] & ETH_RX_META_MASK;
+	}
+
+	/* Do not advertise a descriptor verdict if a future firmware build has
+	 * disabled the GEM's receive-checksum option. */
+	return (XEmacPs_IsRxCsum(&EmacPsInstance) ? ETH_RX_META_PRESENT : 0U) |
+	       verdict;
 }
 
 int ethernet_receive_frame(u16 acked_serial) {
