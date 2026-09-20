@@ -116,8 +116,9 @@ enum zz_reg_offsets {
   REG_ZZ_ARM_ARGV6      = 0xA2,
   REG_ZZ_ARM_ARGV7      = 0xA4,
   /* Read in the low half of the 0xA4 longword: bit 15 says the per-frame
-   * GEM receive-checksum verdict is present, bits 1..0 are the verdict for
-   * the frame currently presented in the RX window. */
+   * GEM receive-checksum verdict is present, bit 14 says full transmit
+   * checksum insertion is enabled, and bits 1..0 are the receive verdict
+   * for the frame currently presented in the RX window. */
   REG_ZZ_ETH_RX_META    = 0xA6,
   REG_ZZ_LOOP_GAP       = 0xA8,  /* read: longest service-loop pass, us; resets */
   REG_ZZ_LOOP_GAP_TAG   = 0xAA,  /* read: 15..12 what it did, 11..0 passes >1 ms */

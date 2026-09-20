@@ -54,8 +54,9 @@ uint8_t* ethernet_current_receive_ptr();
 int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
-/* REG_ZZ_ETH_RX_META: presence plus the current BD's GEM checksum verdict. */
+/* REG_ZZ_ETH_RX_META: checksum capabilities plus the current RX verdict. */
 #define ETH_RX_META_PRESENT 0x8000u
+#define ETH_TX_CSUM_PRESENT 0x4000u
 #define ETH_RX_META_MASK    0x0003u
 #define ETH_RX_META_NONE    0u
 #define ETH_RX_META_IP      1u

@@ -943,15 +943,21 @@ u16 ethernet_get_rx_stats() {
 
 u16 ethernet_get_rx_meta() {
 	u16 verdict = ETH_RX_META_NONE;
+	u16 capabilities = 0;
 
 	if (frames_backlog > 0) {
 		verdict = rx_backlog_csum[frames_backlog_read] & ETH_RX_META_MASK;
 	}
 
-	/* Do not advertise a descriptor verdict if a future firmware build has
-	 * disabled the GEM's receive-checksum option. */
-	return (XEmacPs_IsRxCsum(&EmacPsInstance) ? ETH_RX_META_PRESENT : 0U) |
-	       verdict;
+	/* Advertise only engines which are actually enabled in the GEM.  The TX
+	 * bit lets a driver zero the transport checksum field for full checksum
+	 * insertion without assuming the Xilinx library's default options. */
+	if (XEmacPs_IsRxCsum(&EmacPsInstance))
+		capabilities |= ETH_RX_META_PRESENT;
+	if (XEmacPs_IsTxCsum(&EmacPsInstance))
+		capabilities |= ETH_TX_CSUM_PRESENT;
+
+	return capabilities | verdict;
 }
 
 int ethernet_receive_frame(u16 acked_serial) {
