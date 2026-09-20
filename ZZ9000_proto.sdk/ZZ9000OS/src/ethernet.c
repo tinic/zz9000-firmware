@@ -260,6 +260,25 @@ int init_ethernet_buffers() {
 
 	XEmacPs_Stop(EmacPsInstancePtr);
 
+	/*
+	 * RECEIVE GROUP-ADDRESSED FRAMES.  The Xilinx defaults the GEM ran with
+	 * accept unicast to its own address and broadcast, nothing else: every
+	 * multicast frame -- IPv6 neighbour solicitations to the solicited-node
+	 * groups, router advertisements to all-nodes, mDNS, IGMP/MLD -- was
+	 * dropped in the MAC before any ring saw it, so no stack behind this
+	 * card could be found on IPv6 or by name, and no SANA-II multicast
+	 * command could change that.  The hash is set to accept every group;
+	 * the driver on the 68k keeps the filter its stack asked for
+	 * (S2_ADDMULTICASTADDRESS) and drops the rest after a 14-byte look, the
+	 * price every other Amiga card pays.  Options are taken while the
+	 * device is stopped, which is what XEmacPs_SetOptions insists on.
+	 */
+	XEmacPs_SetOptions(EmacPsInstancePtr, XEMACPS_MULTICAST_OPTION);
+	XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+	                 XEMACPS_HASHL_OFFSET, 0xFFFFFFFFU);
+	XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+	                 XEMACPS_HASHH_OFFSET, 0xFFFFFFFFU);
+
 	XEmacPs_BdClear(&BdTemplate);
 
 	int Status = XEmacPs_BdRingCreate(&(XEmacPs_GetRxRing
