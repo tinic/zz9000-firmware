@@ -44,8 +44,8 @@ SECTIONS
 .text : {
    KEEP (*(.vectors))
    KEEP (*(.boot))
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o) .text)
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o) .text.*)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text.*)
    *(.gnu.linkonce.t.*)
    *(.plt)
    *(.gnu_warning)
@@ -67,8 +67,8 @@ SECTIONS
 
 .rodata : {
    __rodata_start = .;
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o) .rodata)
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o) .rodata.*)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata.*)
    *(.gnu.linkonce.r.*)
    __rodata_end = .;
 } > ps7_ddr_0
@@ -301,6 +301,28 @@ ASSERT(__z2_direct_ring_end <= (ORIGIN(ps7_ddr_0) + LENGTH(ps7_ddr_0)),
    *sdk_video_yuy2.o(.rodata.*)
    . = ALIGN(16);
    __sdk_codec_text_end = .;
+} > ps7_ddr_hi
+
+/* The SDK crypto (BearSSL) and LHA services are neither boot-path nor
+ * interrupt code: another ~55 KB out of the low sections, which the Arm GNU
+ * 13.2 Linux build overran by 16 KB (the framebuffer boundary ASSERT). */
+.aux_service_text : {
+   . = ALIGN(16);
+   __aux_service_text_start = .;
+   *bearssl/*.o(.text)
+   *bearssl/*.o(.text.*)
+   *bearssl/*.o(.rodata)
+   *bearssl/*.o(.rodata.*)
+   *sdk_crypto.o(.text)
+   *sdk_crypto.o(.text.*)
+   *sdk_crypto.o(.rodata)
+   *sdk_crypto.o(.rodata.*)
+   *lzh/*.o(.text)
+   *lzh/*.o(.text.*)
+   *lzh/*.o(.rodata)
+   *lzh/*.o(.rodata.*)
+   . = ALIGN(16);
+   __aux_service_text_end = .;
 } > ps7_ddr_hi
 
 /* Qualified audio conversion coefficient tables (~73 KB) and the

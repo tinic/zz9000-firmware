@@ -137,9 +137,37 @@ static uint8_t *ethernet_backlog_payload_ptr(u16 slot)
 	return ethernet_backlog_slot_ptr(slot) + RX_FRAME_PAD;
 }
 
+/*
+ * THE ZORRO SIDE READS THROUGH L2, THIS SIDE WRITES AROUND IT.
+ *
+ * mntzorro.v's bulk path (the RX window at Zorro +0x2000, the framebuffer)
+ * is an AXI master on the ACP with ARCACHE = 0xF, so every longword the
+ * 68k reads is allocated in the PL310.  The backlog section is mapped
+ * strongly ordered here, so the four header bytes written below go to DDR
+ * and never touch that L2 line, and the GEM's DMA lands the payload in DDR
+ * the same way.  A line the 68k has already read -- the header of the
+ * presented slot, which every driver polls while it is empty -- is then
+ * served stale from L2 until something evicts it: measured from the Amiga
+ * side (AmiNetXDuo anxzz9000.device, A3000), the serial appeared 0.1-4 ms
+ * after this handler had counted the frame, and often later, while the
+ * status register said a frame was ready.  Drivers that poll in a loop
+ * (ZZ9000Net.device) wait it out; an interrupt-driven one sees an
+ * interrupt for a frame that is not there.  The payload has the same
+ * exposure 128 frames later, when the slot comes round again.
+ *
+ * So the slot's lines are dropped from L2 whenever this side changes them:
+ * after the header is written, and after it is cleared.  Slots are 2 KB
+ * aligned and lines 32 bytes, so no line is shared with anything else.
+ */
+static void ethernet_backlog_slot_publish(u16 slot, u32 bytes)
+{
+	Xil_L2CacheInvalidateRange((u32)ethernet_backlog_slot_ptr(slot), bytes);
+}
+
 static void ethernet_clear_backlog_slot(u16 slot)
 {
 	memset(ethernet_backlog_slot_ptr(slot), 0, RX_FRAME_PAD);
+	ethernet_backlog_slot_publish(slot, RX_FRAME_PAD);
 }
 
 void micrel_auto_negotiate(XEmacPs *xemacpsp, u32 phy_addr);
@@ -746,6 +774,8 @@ static void XEmacPsRecvHandler(void *Callback)
 				*(frame_bl_ptr+1) = (rx_bytes&0xff);
 				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
 				*(frame_bl_ptr+3) = (frame_serial&0xff);
+				/* header and payload, before the count makes it visible */
+				ethernet_backlog_slot_publish(backlog_slot, RX_FRAME_PAD + rx_bytes);
 
 				frames_backlog_write = ethernet_next_backlog_slot(frames_backlog_write);
 				frames_backlog++;
