@@ -22,6 +22,8 @@
 #include <xil_printf.h>
 #include <xil_cache.h>
 #include <xil_mmu.h>
+#include <xl2cc.h>
+#include <xparameters_ps.h>
 #include "sleep.h"
 #include "xparameters.h"
 #include <xemacps.h>
@@ -82,6 +84,13 @@ u32 PhyAddr;
 
 typedef char EthernetFrame[XEMACPS_MAX_VLAN_FRAME_SIZE_JUMBO] __attribute__ ((aligned(64)));
 
+/* Frames the host handed to the asynchronous path that are finished with,
+ * sent or dropped (ethernet.h ETH_TX_ASYNC); read back through
+ * REG_ZZ_ETH_TX_STATUS.  A u16 that wraps, and the driver counts the
+ * difference. */
+static volatile u16 rx_fifo_overruns = 0;
+static volatile u16 eth_tx_host_done = 0;
+static volatile u16 eth_tx_async_dropped = 0;
 volatile char* TxFrame = (char*)TX_FRAME_ADDRESS;		/* Transmit buffer */
 
 /*
@@ -159,9 +168,38 @@ static uint8_t *ethernet_backlog_payload_ptr(u16 slot)
  * after the header is written, and after it is cleared.  Slots are 2 KB
  * aligned and lines 32 bytes, so no line is shared with anything else.
  */
+static void ethernet_backlog_slot_publish_from(u16 slot, u32 from, u32 bytes)
+{
+	/* Invalidate by physical address, a line at a time, one sync at the
+	 * end.  Not Xil_L2CacheInvalidateRange(): that masks interrupts, turns
+	 * the whole L2's line fills and write-back off for the duration and
+	 * syncs after every line -- for a frame's 48 lines, inside the GEM's
+	 * interrupt, with a gigabit sender 12 us apart.  Slots are 2 KB aligned
+	 * and lines 32 bytes, so no line is shared with anything else. */
+	u32 addr = (u32)ethernet_backlog_slot_ptr(slot) + from;
+	u32 end  = addr + bytes;
+	volatile u32 *inv  = (volatile u32 *)(XPS_L2CC_BASEADDR + XPS_L2CC_CACHE_INVLD_PA_OFFSET);
+	volatile u32 *sync = (volatile u32 *)(XPS_L2CC_BASEADDR + XPS_L2CC_CACHE_SYNC_OFFSET);
+
+	addr &= ~31U;
+	while (addr < end) {
+		*inv = addr;
+		/* bit 0 stays set while the line operation runs; a write that
+		 * lands before it clears is lost (PL310 TRM), and a line the loop
+		 * skipped is a frame the 68k reads stale: TCP drops it, the sender
+		 * retransmits, and this looked like wire loss until the line
+		 * count and the loss count matched. */
+		while ((*inv & 1U) != 0U)
+			;
+		addr += 32U;
+	}
+	*sync = 0U;
+	dsb();
+}
+
 static void ethernet_backlog_slot_publish(u16 slot, u32 bytes)
 {
-	Xil_L2CacheInvalidateRange((u32)ethernet_backlog_slot_ptr(slot), bytes);
+	ethernet_backlog_slot_publish_from(slot, 0, bytes);
 }
 
 static void ethernet_clear_backlog_slot(u16 slot)
@@ -378,8 +416,13 @@ int ethernet_task_state = ETH_TASK_SETUP;
  * already be owned by the GEM. This avoids accepting frames that cannot fit in
  * the Amiga-facing backlog, and gives pause frames time to slow the sender.
  */
-#define ETH_BACKLOG_HIGH_WATERMARK (FRAME_MAX_BACKLOG - RXBD_CNT)
-#define ETH_BACKLOG_LOW_WATERMARK (ETH_BACKLOG_HIGH_WATERMARK / 2)
+/* Pending = queued for the host + armed for the GEM.  Pause the wire when
+ * the ring is nearly full and arm again once the host has drained it below
+ * the low mark; with RXBD_CNT armed, what the host may leave queued without
+ * a pause is HIGH - RXBD_CNT = 56 frames, which is what the driver reports
+ * as the card's capacity (anxzz9000.device ZZ_ARM_RING_FRAMES_FORK). */
+#define ETH_BACKLOG_HIGH_WATERMARK (FRAME_MAX_BACKLOG - 8)
+#define ETH_BACKLOG_LOW_WATERMARK (FRAME_MAX_BACKLOG - RXBD_CNT + RXBD_CNT / 2)
 #define ETH_PAUSE_QUANTUM 0x0800
 
 static u16 ethernet_backlog_pending()
@@ -490,6 +533,7 @@ static void ethernet_clear_host_state() {
 	FramesTx = 0;
 	frames_dropped = 0;
 	frames_backlog_full = 0;
+	eth_tx_async_dropped = 0;
 	rx_backpressure = 0;
 	rx_pause_frames = 0;
 	rx_slot_mismatch = 0;
@@ -592,9 +636,10 @@ static void XEmacPsSendHandler(void *Callback)
 
 	//printf("XEMACPS_TXSR status: %lu\n", status);
 
-	int bds_sent = XEmacPs_BdRingFromHwTx(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr);
-
-	if (bds_sent == 1) {
+	/* Every BD the GEM has finished, not one per interrupt: two frames that
+	 * complete before this runs raise one interrupt, and a BD left in the
+	 * hardware state is a slot the asynchronous path never gets back. */
+	while (XEmacPs_BdRingFromHwTx(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr) == 1) {
 		status = XEmacPs_BdGetStatus(BdTxPtr);
 
 		/*printf("BD status: ");
@@ -619,6 +664,7 @@ static void XEmacPsSendHandler(void *Callback)
 	    XEmacPs_BdSetStatus(BdTxPtr, XEMACPS_TXBUF_USED_MASK); // XEMACPS_TXBUF_WRAP_MASK
 
 	    FramesTx++;
+	    eth_tx_host_done++;
 	}
 }
 
@@ -770,12 +816,29 @@ static void XEmacPsRecvHandler(void *Callback)
 				ethernet_clear_backlog_slot(backlog_slot);
 			} else {
 				uint8_t* frame_bl_ptr = ethernet_backlog_slot_ptr(backlog_slot);
+				/*
+				 * THE ORDER IS THE POINT.  The 68k starts copying the moment
+				 * the header's line shows the serial, so every payload line
+				 * must be dropped from L2 before the header is written, and
+				 * the header's own line after.  Dropping header first and
+				 * payload after left a window in which a driver already
+				 * draining the slot before read payload lines the L2 still
+				 * held from the slot's last use or from prefetch past the
+				 * polled header: about one frame in a hundred failed its
+				 * checksum and was retransmitted.  Not the header's line
+				 * alone either: while a slot stood empty and presented, the
+				 * L2 prefetched past the line the 68k polled, and half the
+				 * frames then read back with a stale IP header.  With 64
+				 * descriptors armed the interrupt has time for 48 lines.
+				 */
+				if (rx_bytes + RX_FRAME_PAD > 32U)
+					ethernet_backlog_slot_publish_from(backlog_slot, 32U,
+					                                   rx_bytes + RX_FRAME_PAD - 32U);
 				*(frame_bl_ptr)   = (rx_bytes&0xff00)>>8;
 				*(frame_bl_ptr+1) = (rx_bytes&0xff);
 				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
 				*(frame_bl_ptr+3) = (frame_serial&0xff);
-				/* header and payload, before the count makes it visible */
-				ethernet_backlog_slot_publish(backlog_slot, RX_FRAME_PAD + rx_bytes);
+				ethernet_backlog_slot_publish_from(backlog_slot, 0U, 32U);
 
 				frames_backlog_write = ethernet_next_backlog_slot(frames_backlog_write);
 				frames_backlog++;
@@ -905,6 +968,54 @@ int ethernet_receive_frame(u16 acked_serial) {
 	return(frames_backlog_read);
 }
 
+void ethernet_send_frame_async(u16 slot, u16 frame_size) {
+	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
+	XEmacPs_Bd *BdTxPtr;
+
+	if (ethernet_task_state != ETH_TASK_READY || frame_size == 0) {
+		eth_tx_async_dropped++;
+		eth_tx_host_done++;
+		return;
+	}
+
+	/* The TX window's section is strongly ordered and the 68k never reads
+	 * it, so there is no cached line to drop: the bytes are in DDR. */
+	/* The driver keeps at most TXBD_CNT in flight and reuses a slot only
+	 * after the status count says its frame is done, which the send handler
+	 * counts after freeing the BD: this cannot fail for want of one. */
+	LONG Status = XEmacPs_BdRingAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr);
+	if (Status != XST_SUCCESS) {
+		eth_tx_async_dropped++;
+		eth_tx_host_done++;
+		ethernet_log_status("tx-async-bd-alloc-error");
+		return;
+	}
+
+	XEmacPs_BdSetAddressTx(BdTxPtr, (UINTPTR)TxFrame + (UINTPTR)slot * FRAME_SIZE);
+	XEmacPs_BdSetLength(BdTxPtr, frame_size);
+	XEmacPs_BdClearTxUsed(BdTxPtr);
+	XEmacPs_BdSetLast(BdTxPtr);
+
+	Status = XEmacPs_BdRingToHw(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
+	if (Status != XST_SUCCESS) {
+		XEmacPs_BdRingUnAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
+		eth_tx_async_dropped++;
+		eth_tx_host_done++;
+		ethernet_log_status("tx-async-bd-to-hw-error");
+		return;
+	}
+
+	XEmacPs_Transmit(EmacPsInstancePtr);
+}
+
+u32 ethernet_get_errors() {
+	return ((u32)rx_fifo_overruns << 16) | (DeviceErrors & 0xffffU);
+}
+
+u16 ethernet_get_tx_status() {
+	return (u16)(ETH_TX_STATUS_PRESENT | (eth_tx_host_done & ETH_TX_STATUS_COUNT));
+}
+
 u32 get_frames_received() {
 	return frames_received;
 }
@@ -949,6 +1060,9 @@ static void XEmacPsErrorHandler(void *Callback, u8 Direction, u32 ErrorWord)
 			printf("EMAC: Receive DMA error\n");
 		}
 		if (ErrorWord & XEMACPS_RXSR_RXOVR_MASK) {
+			/* the GEM's FIFO overflowed before its DMA reached DDR: a frame
+			 * lost that no backlog counter sees; REG_ZZ_ETH_ERRORS says */
+			rx_fifo_overruns++;
 			printf("EMAC: Receive over run\n");
 		}
 		if (ErrorWord & XEMACPS_RXSR_BUFFNA_MASK) {

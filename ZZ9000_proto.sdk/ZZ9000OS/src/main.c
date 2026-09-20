@@ -677,13 +677,41 @@ int main() {
 
 	// last time the ethernet state machine was serviced
 	XTime eth_task_last_run = 0;
+	/* SERVICE-LOOP LATENCY DIAGNOSTIC (REG_ZZ_LOOP_GAP, 0xa8/0xaa).  Every
+	 * Zorro register access stalls the 68k until this loop comes round to
+	 * it, so the longest pass of this loop is the longest bus stall the
+	 * Amiga sees.  0xa8 reads the longest pass since the last read in
+	 * microseconds (saturating) and resets it; 0xaa reads the tag of what
+	 * the loop was doing on that pass (bits 15..12) and how many passes
+	 * were over a millisecond (bits 11..0). */
+	XTime loop_last_t = 0;
+	u32 loop_gap_max_us = 0;
+	u32 loop_gap_over_ms = 0;
+	u32 loop_tag = 0;
+	u32 loop_gap_tag = 0;
+	XTime_GetTime(&loop_last_t);
 	uint32_t sdk_mailbox_poll_divider = 0;
 	uint8_t aperture_ack_poll_divider = 0;
 	uint32_t core1_fault_reported = CORE_FAULT_NONE;
 
 	while (1) {
+		{
+			XTime loop_now;
+			u32 gap_us;
+			XTime_GetTime(&loop_now);
+			gap_us = (u32)((loop_now - loop_last_t) / (COUNTS_PER_SECOND / 1000000U));
+			loop_last_t = loop_now;
+			if (gap_us > loop_gap_max_us) {
+				loop_gap_max_us = gap_us;
+				loop_gap_tag = loop_tag;
+			}
+			if (gap_us > 1000U)
+				loop_gap_over_ms++;
+			loop_tag = 0;
+		}
 		watchdog_kick();
 		sd_activity_led_poll();
+		loop_tag = 1;   /* usb pumps */
 		usb_proxy_periodic_pump();
 		usb_proxy_iso_pump();
 #ifdef AUDIO_FABRIC_BENCH
@@ -754,7 +782,9 @@ int main() {
 		 * runs, so a scene/equalizer commit's ~170-transaction
 		 * sequence interleaves with the per-period AHI traffic and
 		 * never blocks the mailbox dispatch below. */
+		loop_tag = 2;   /* audio scene */
 		audio_scene_poll();
+		loop_tag = 3;   /* zorro request or idle work */
 		u32 zstate = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3);
 		u32 aperture_flags = sdk_aperture_runtime_flags();
 		/* Acknowledge late: firmware normally boots before the RTG driver.
@@ -775,6 +805,7 @@ int main() {
 		if (writereq) {
 			u32 zaddr = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG0);
 			u32 zdata = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG1);
+			loop_tag = 4;   /* a zorro write */
 
 			u32 ds3 = (zstate_raw & (1 << 29));
 			u32 ds2 = (zstate_raw & (1 << 28));
@@ -1285,7 +1316,14 @@ int main() {
 
 				// Ethernet
 				case REG_ZZ_ETH_TX:
-					ethernet_send_result = ethernet_send_frame(zdata);
+					if (zdata & ETH_TX_ASYNC) {
+						/* the bus is given back before the GEM has sent;
+						 * completion is counted in REG_ZZ_ETH_TX_STATUS */
+						ethernet_send_frame_async((zdata >> ETH_TX_SLOT_SHIFT) & ETH_TX_SLOT_MASK,
+						                          zdata & ETH_TX_LEN_MASK);
+					} else {
+						ethernet_send_result = ethernet_send_frame(zdata);
+					}
 					//printf("SEND frame sz: %ld res: %d\n",zdata,ethernet_send_result);
 					break;
 				case REG_ZZ_ETH_RX: {
@@ -1656,6 +1694,7 @@ int main() {
 			need_req_ack = 1;
 		} else if (readreq) {
 			uint32_t zaddr = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG0);
+			loop_tag = 5;   /* a zorro read */
 
 			if (debug_lowlevel) {
 				printf("READ: %08lx\n",zaddr);
@@ -1728,8 +1767,11 @@ int main() {
 						break;
 					}
 					case REG_ZZ_ETH_MAC_LO: {
+						/* the low half is REG_ZZ_ETH_TX_STATUS (0x8a): a read of
+						 * an odd word register is served from its even
+						 * neighbour's longword, as RX_STATS is from RX_STATUS */
 						uint8_t* mac = ethernet_get_mac_address_ptr();
-						data = mac[4] << 24 | mac[5] << 16;
+						data = mac[4] << 24 | mac[5] << 16 | ethernet_get_tx_status();
 						break;
 					}
 					case REG_ZZ_ETH_TX:
@@ -1849,6 +1891,21 @@ int main() {
 					case REG_ZZ_ETH_RX_STATUS: {
 						data = ((uint32_t)ethernet_get_rx_status() << 16)
 						     | ethernet_get_rx_stats();
+						break;
+					}
+					case REG_ZZ_ETH_ERRORS: {
+						data = ethernet_get_errors();
+						break;
+					}
+					case REG_ZZ_LOOP_GAP: {
+						u32 gap = loop_gap_max_us > 0xffffU ? 0xffffU : loop_gap_max_us;
+						data = (gap << 16)
+						     | ((loop_gap_tag & 0xfU) << 12)
+						     | (loop_gap_over_ms & 0xfffU);
+						if ((zaddr & 2U) == 0U) {   /* the high word's read resets */
+							loop_gap_max_us = 0;
+							loop_gap_over_ms = 0;
+						}
 						break;
 					}
 					case REG_ZZ_SD_STATUS: {
@@ -2012,6 +2069,7 @@ int main() {
 						(volatile void *)USB_BLOCK_STORAGE_ADDRESS, 0U);
 			}
 
+			loop_tag = 6;   /* ethernet task */
 			{
 				// service the ethernet state machine every 10 ms; the old
 				// idle-iteration counter left it starved for seconds
@@ -2025,8 +2083,10 @@ int main() {
 
 			// keep the AX TX ring fed from a bound audio-stream session
 			// (SDK_OP_AUDIO_STREAM_PLAY); no-op when nothing is bound
+			loop_tag = 7;   /* audio playback pump */
 			sdk_mailbox_audio_playback_pump();
 
+			loop_tag = 8;   /* sdk mailbox events / task */
 			if (sdk_mailbox_register_events) {
 				uint32_t events = sdk_mailbox_register_events;
 				sdk_mailbox_register_events = 0;
@@ -2058,6 +2118,7 @@ int main() {
 #endif
 			sdk_mailbox_poll_divider++;
 			if ((sdk_mailbox_poll_divider & 0xffU) == 0) {
+				loop_tag = 9;   /* sdk mailbox periodic task */
 				sdk_mailbox_task();
 				sdk_diag_task_count++;
 
