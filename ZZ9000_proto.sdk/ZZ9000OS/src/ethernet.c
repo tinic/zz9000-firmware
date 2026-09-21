@@ -22,6 +22,7 @@
 #include <xil_printf.h>
 #include <xil_cache.h>
 #include <xil_mmu.h>
+#include <xl2cc.h>
 #include "sleep.h"
 #include "xparameters.h"
 #include <xemacps.h>
@@ -137,9 +138,45 @@ static uint8_t *ethernet_backlog_payload_ptr(u16 slot)
 	return ethernet_backlog_slot_ptr(slot) + RX_FRAME_PAD;
 }
 
+/*
+ * The Zorro bulk read path (mntzorro.v m00_axi, the RX window) sits on the
+ * ACP with ARCACHE = 0xF, so every 68k read of a backlog slot allocates its
+ * line in the PL310 L2.  This side writes the slot header strongly ordered
+ * and the GEM DMAs the payload straight to DDR, so neither update touches
+ * that line: a driver that polled the presented slot while it was empty
+ * keeps reading the stale header until something evicts the line -- 0.1 to
+ * 4 ms on an idle A3000, and the payload has the same exposure the next
+ * time the slot comes round.  Drop the slot's lines from L2 whenever this
+ * side changes them.
+ *
+ * By physical address, one line at a time, one sync at the end: not
+ * Xil_L2CacheInvalidateRange(), which masks interrupts, disables the L2's
+ * line fills and syncs after every line, inside the GEM interrupt with
+ * frames 12 us apart.  PL310: bit 0 of INV_PA stays set while the operation
+ * runs and a write issued before it clears is lost, so each line is waited
+ * for.  Slots are 2 KB aligned and lines 32 bytes; no line is shared.
+ */
+static void ethernet_backlog_slot_publish(u16 slot, u32 from, u32 bytes)
+{
+	u32 addr = ((u32)ethernet_backlog_slot_ptr(slot) + from) & ~31U;
+	u32 end  = (u32)ethernet_backlog_slot_ptr(slot) + from + bytes;
+	volatile u32 *inv  = (volatile u32 *)(XPS_L2CC_BASEADDR + XPS_L2CC_CACHE_INVLD_PA_OFFSET);
+	volatile u32 *sync = (volatile u32 *)(XPS_L2CC_BASEADDR + XPS_L2CC_CACHE_SYNC_OFFSET);
+
+	while (addr < end) {
+		*inv = addr;
+		while ((*inv & 1U) != 0U)
+			;
+		addr += 32U;
+	}
+	*sync = 0U;
+	dsb();
+}
+
 static void ethernet_clear_backlog_slot(u16 slot)
 {
 	memset(ethernet_backlog_slot_ptr(slot), 0, RX_FRAME_PAD);
+	ethernet_backlog_slot_publish(slot, 0U, RX_FRAME_PAD);
 }
 
 void micrel_auto_negotiate(XEmacPs *xemacpsp, u32 phy_addr);
@@ -742,10 +779,20 @@ static void XEmacPsRecvHandler(void *Callback)
 				ethernet_clear_backlog_slot(backlog_slot);
 			} else {
 				uint8_t* frame_bl_ptr = ethernet_backlog_slot_ptr(backlog_slot);
+				/* Payload lines first, header line last: the 68k starts
+				 * copying as soon as the header's line shows the serial,
+				 * and a payload line the L2 still held from the slot's last
+				 * use (or prefetched past the polled header) would be read
+				 * stale -- measured as one frame in a hundred failing its
+				 * TCP checksum when the header went first. */
+				if (rx_bytes + RX_FRAME_PAD > 32U)
+					ethernet_backlog_slot_publish(backlog_slot, 32U,
+					                              rx_bytes + RX_FRAME_PAD - 32U);
 				*(frame_bl_ptr)   = (rx_bytes&0xff00)>>8;
 				*(frame_bl_ptr+1) = (rx_bytes&0xff);
 				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
 				*(frame_bl_ptr+3) = (frame_serial&0xff);
+				ethernet_backlog_slot_publish(backlog_slot, 0U, 32U);
 
 				frames_backlog_write = ethernet_next_backlog_slot(frames_backlog_write);
 				frames_backlog++;
