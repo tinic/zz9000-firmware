@@ -400,12 +400,17 @@ int ethernet_task_state = ETH_TASK_SETUP;
 
 #define ETH_RX_INTERRUPT_MASK (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RX_ERR_MASK)
 /*
- * Stop rearming RX BDs while there is still room for the descriptors that may
- * already be owned by the GEM. This avoids accepting frames that cannot fit in
- * the Amiga-facing backlog, and gives pause frames time to slow the sender.
+ * Stop rearming RX BDs before the Amiga-facing backlog is full, and give
+ * pause frames time to slow the sender.  Pending counts the frames the host
+ * has not read plus the slots armed in descriptors, so the bound is the
+ * ring itself less a little slack; the old FRAME_MAX_BACKLOG - RXBD_CNT
+ * would, with 64 descriptors, stop arming at 64 pending and leave a host
+ * that is 40 frames behind with 24 armed -- fewer than before.  What the
+ * host may leave unread and still have every descriptor armed is
+ * HIGH - RXBD_CNT (56 frames), the receive window a driver should fit to.
  */
-#define ETH_BACKLOG_HIGH_WATERMARK (FRAME_MAX_BACKLOG - RXBD_CNT)
-#define ETH_BACKLOG_LOW_WATERMARK (ETH_BACKLOG_HIGH_WATERMARK / 2)
+#define ETH_BACKLOG_HIGH_WATERMARK (FRAME_MAX_BACKLOG - 8)
+#define ETH_BACKLOG_LOW_WATERMARK (ETH_BACKLOG_HIGH_WATERMARK - RXBD_CNT / 2)
 #define ETH_PAUSE_QUANTUM 0x0800
 
 static u16 ethernet_backlog_pending()

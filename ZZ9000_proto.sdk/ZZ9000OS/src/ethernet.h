@@ -32,7 +32,16 @@ void ethernet_reset_for_amiga();
 
 #define FRAME_MAX_BACKLOG 128
 
-#define RXBD_CNT       32	/* Number of RxBDs to use */
+/*
+ * Receive descriptors armed at once: the frames the GEM can land without
+ * the ARM's help.  A sender on the same gigabit switch puts a whole TCP
+ * window on the wire back to back, 12 us a frame, and every frame past the
+ * armed count is lost in the GEM before anything here counts it: with 32,
+ * a 47 KB window lost frames 33-35 of every burst (measured on an A3000,
+ * 25-275 TCP retransmissions in ten seconds, nothing in the error
+ * counters).  The BD ring region at RX_BD_LIST_START_ADDRESS has room.
+ */
+#define RXBD_CNT       64	/* Number of RxBDs to use */
 #define TXBD_CNT       2	/* Number of TxBDs to use */
 
 #endif
