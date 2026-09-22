@@ -841,6 +841,13 @@ u16 ethernet_get_rx_bdfree_failures() {
 	return rx_bdfree_failures;
 }
 
+/* The exact 32-bit word the REG_ZZ_ETH_DIAG read returns. Kept here rather
+ * than inline in the read dispatch so a host test can cover the packing:
+ * an aligned register's value occupies the HIGH 16 bits. */
+u32 ethernet_get_rx_diag_word() {
+	return ((u32)rx_bdfree_failures) << 16;
+}
+
 u16 ethernet_get_rx_stats() {
 	u16 dropped = frames_dropped;
 	u16 pause = rx_pause_frames;

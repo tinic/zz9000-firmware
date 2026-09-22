@@ -28,6 +28,7 @@ u32 mock_rx_free_count(void) { return g_rx ? g_rx->FreeCnt : 0; }
 u32 mock_rx_stranded_count(void) { return g_rx ? g_rx->PostCnt : 0; }
 u32 mock_rx_capacity(void) { return g_rx ? (g_rx->cnt - g_rx->PostCnt) : 0; }
 u32 mock_rx_inflight(void) { return g_rx ? g_rx->HwCnt : 0; }
+XEmacPs_Bd *mock_rx_post_head(void) { return g_rx ? &g_rx->base[g_rx->PostHead] : 0; }
 int mock_rx_double_release(void) { return mock_double_release; }
 
 void XEmacPs_BdClear(XEmacPs_Bd *bd) { memset(bd, 0, sizeof(*bd)); }

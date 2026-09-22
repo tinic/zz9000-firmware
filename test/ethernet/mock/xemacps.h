@@ -86,6 +86,7 @@ u32  mock_rx_free_count(void);
 u32  mock_rx_stranded_count(void);   /* BDs left in 'post' */
 u32  mock_rx_capacity(void);         /* BDs still in circulation */
 u32  mock_rx_inflight(void);         /* BDs currently handed to hardware */
+XEmacPs_Bd *mock_rx_post_head(void); /* first BD of the posted set */
 int  mock_rx_double_release(void);   /* 1 if a free-to-free release was seen */
 
 /* ---- BD accessors ------------------------------------------------- */

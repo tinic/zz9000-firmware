@@ -21,6 +21,7 @@
 #include <string.h>
 #include "xemacps.h"
 #include "ethernet.h"
+#include "zz_regs.h"
 
 /* Not exported in ethernet.h; declared here rather than widening the
  * firmware header for a test. EmacPsInstance is static in ethernet.c, so the
@@ -32,6 +33,7 @@ extern int  ethernet_receive_frame(u16 acked_serial);
 extern int  init_ethernet_buffers(void);
 extern void ethernet_alloc_rx_frames(void);
 extern u16  ethernet_mock_occupied_slots(void);
+extern u32  ethernet_get_rx_diag_word(void);
 
 static int failures = 0;
 static int checks = 0;
@@ -124,12 +126,51 @@ int main(void)
     u16 reserved = (u16)((status >> 8) & 0x7f);
     check_eq("T1_reserved_matches_slots", reserved, ethernet_mock_occupied_slots());
 
-    /* Diagnostic, not transient: further healthy traffic must not clear or
-     * re-increment it. */
+    /* The previous revision asserted the counter was "stable under further
+     * healthy traffic" here. That was misleading: once the ring is stranded
+     * there is no traffic at all, so the assertion re-read the same value
+     * and proved nothing. Assert the real consequences instead.
+     *
+     * (a) The strand is PERMANENT without a reset. */
     mock_bdfree_fail_remaining = 0;
+    u32 calls_before = (u32)mock_bdfree_calls;
     for (int i = 0; i < 4; i++)
         rx_cycle(0);
-    check_eq("T1_counter_stable_after",   ethernet_get_rx_bdfree_failures(), 1);
+    check_eq("T1_ring_does_not_self_recover", quiescent_capacity(), 0);
+    /* (b) and those cycles really were no-ops -- stated explicitly so this
+     * can never be mistaken for a healthy-traffic test again. */
+    check_eq("T1_no_further_frees_attempted", (u32)mock_bdfree_calls, calls_before);
+    check_eq("T1_counter_did_not_climb",      ethernet_get_rx_bdfree_failures(), 1);
+
+    /* (c) The PostHead cascade itself: the real ring refuses a release that
+     * does not start at PostHead, or that covers more BDs than are posted.
+     * That refusal is WHY one failed free cascades -- the stranded set stays
+     * at the head and blocks every later release. Asserted behaviourally
+     * against the contract, not by reading the field. */
+    XEmacPs_BdRing *rx = ethernet_mock_rx_ring();
+    XEmacPs_Bd *head = mock_rx_post_head();
+    u32 posted = mock_rx_stranded_count();
+    check_eq("T1_cascade_precondition_posted", posted > 1, 1);
+    check_eq("T1_free_rejects_overlong",
+             XEmacPs_BdRingFree(rx, posted + 1, head) == XST_SUCCESS, 0);
+    check_eq("T1_free_rejects_wrong_head",
+             XEmacPs_BdRingFree(rx, 1, head + 1) == XST_SUCCESS, 0);
+    /* a refused release must not have mutated the ring */
+    check_eq("T1_refusals_left_ring_intact", mock_rx_stranded_count(), posted);
+
+    /* ---- T2: the REG_ZZ_ETH_DIAG read contract -------------------- */
+    /* main.c's read dispatch is not compiled into this suite, which is
+     * exactly how the original 0x62 blocker got through: a case label for an
+     * odd-word register can never match, because the dispatch switches on
+     * (zaddr & 0xffffffc). Cover the two properties of that contract which
+     * ARE checkable from here. */
+    check_eq("T2_register_survives_dispatch_mask",
+             (REG_ZZ_ETH_DIAG & 0xffffffc) == REG_ZZ_ETH_DIAG, 1);
+
+    u32 word = ethernet_get_rx_diag_word();
+    check_eq("T2_word_nonzero_after_failure", word != 0, 1);
+    check_eq("T2_count_in_high_half",  word >> 16, ethernet_get_rx_bdfree_failures());
+    check_eq("T2_low_half_clear",      word & 0xffff, 0);
 
     if (failures == 0)
         printf("RESULT PASS checks=%d\n", checks);

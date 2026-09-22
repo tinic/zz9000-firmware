@@ -39,6 +39,8 @@ u16 ethernet_get_rx_stats();
  * register it is indistinguishable from firmware that lacks the
  * diagnostic. */
 u16 ethernet_get_rx_bdfree_failures();
+/* The 32-bit word REG_ZZ_ETH_DIAG reads back: count in the HIGH 16 bits. */
+u32 ethernet_get_rx_diag_word();
 void ethernet_task();
 void ethernet_reset_for_amiga();
 

@@ -1858,7 +1858,7 @@ int main() {
 						 * predates this register, which is the same
 						 * value as "no failures", so a driver can read
 						 * it unconditionally. */
-						data = ((uint32_t)ethernet_get_rx_bdfree_failures()) << 16;
+						data = ethernet_get_rx_diag_word();
 						break;
 					}
 					case REG_ZZ_ETH_RX_STATUS: {
