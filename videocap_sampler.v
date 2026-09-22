@@ -495,6 +495,35 @@ endfunction
 wire [9:0] grid_intra_delta = grid_rgb_delta(rgbin, rgb_prev);
 wire [9:0] grid_cross_delta = grid_prev_second_valid ?
     grid_rgb_delta(rgbin, grid_prev_second) : 10'd0;
+/* #103 videocap E7M timing (was -3.945 ns overall setup on e7m_shifted):
+ * the RGB abs-delta, a 27-bit saturation compare on the accumulator enable,
+ * and the 27-bit add sat in one capture-clock path.  Split it into two
+ * cap_clk stages -- stage 1 registers the delta and an accumulate strobe,
+ * stage 2 does only the saturating add.  The metric is read once per frame
+ * at vsync, so the one-cycle accumulation latency does not move the pairing
+ * decision. */
+reg [9:0] grid_intra_delta_q = 0;
+reg [9:0] grid_cross_delta_q = 0;
+reg       grid_intra_acc_q = 0;
+reg       grid_cross_acc_q = 0;
+wire [27:0] grid_intra_sum_next =
+    {1'b0, grid_intra_sum} + {18'd0, grid_intra_delta_q};
+wire [27:0] grid_cross_sum_next =
+    {1'b0, grid_cross_sum} + {18'd0, grid_cross_delta_q};
+/* #103 videocap E7M timing, deeper split: the RGB abs-diff feeding the
+ * metric was still one route-dominated e7m_shifted path (-0.318 ns).  Add a
+ * stage that registers the three per-channel |diffs|; the next stage sums
+ * them into grid_*_delta_q, then the saturating add follows.  Still read
+ * only at vsync, so the extra cap_clk of latency is immaterial. */
+function [7:0] absd8;
+    input [7:0] a;
+    input [7:0] b;
+    absd8 = (a > b) ? (a - b) : (b - a);
+endfunction
+reg [7:0] grid_intra_dr_a = 0, grid_intra_dg_a = 0, grid_intra_db_a = 0;
+reg [7:0] grid_cross_dr_a = 0, grid_cross_dg_a = 0, grid_cross_db_a = 0;
+reg       grid_intra_acc_a = 0;
+reg       grid_cross_acc_a = 0;
 /* Margin comparison in a widened domain: both sums saturate
  * at 27 bits on max-activity frames, where a 27-bit add would
  * wrap and misread equal metrics as misaligned (PR review).
@@ -565,6 +594,25 @@ xpm_cdc_single #(
 reg [15:0] diff_count = 0;
 
 always @(posedge cap_clk) begin
+    /* #103 videocap E7M timing, stage B: sum the three per-channel |diffs|
+     * into the metric delta and advance the accumulate strobe. */
+    grid_intra_acc_a <= 1'b0;
+    grid_cross_acc_a <= 1'b0;
+    grid_intra_delta_q <= {2'b0, grid_intra_dr_a} + {2'b0, grid_intra_dg_a} +
+                          {2'b0, grid_intra_db_a};
+    grid_cross_delta_q <= {2'b0, grid_cross_dr_a} + {2'b0, grid_cross_dg_a} +
+                          {2'b0, grid_cross_db_a};
+    grid_intra_acc_q <= grid_intra_acc_a;
+    grid_cross_acc_q <= grid_cross_acc_a;
+    /* stage C: 27-bit saturating add.  The vsync reset below overrides
+     * these writes on frame boundaries. */
+    if (grid_intra_acc_q)
+        grid_intra_sum <= grid_intra_sum_next[27] ?
+            27'h7ffffff : grid_intra_sum_next[26:0];
+    if (grid_cross_acc_q)
+        grid_cross_sum <= grid_cross_sum_next[27] ?
+            27'h7ffffff : grid_cross_sum_next[26:0];
+
     if (!ctl_dest_req)
         ctl_dest_ack <= 1'b0;
     else if (!ctl_dest_ack && frame_sync) begin
@@ -797,21 +845,28 @@ always @(posedge cap_clk) begin
                      * 512-pair output window (or on cropped rows)
                      * would dilute the margin (PR review). */
                     if (grid_seen && cap_x < 11'h200 &&
-                            capture_output_line_valid &&
-                            grid_cross_sum <=
-                                27'h7ffffff - {17'd0, grid_cross_delta})
-                        grid_cross_sum <=
-                            grid_cross_sum + {17'd0, grid_cross_delta};
+                            capture_output_line_valid) begin
+                        grid_cross_dr_a <= grid_prev_second_valid ?
+                            absd8(rgbin[23:16], grid_prev_second[23:16]) : 8'd0;
+                        grid_cross_dg_a <= grid_prev_second_valid ?
+                            absd8(rgbin[15:8], grid_prev_second[15:8]) : 8'd0;
+                        grid_cross_db_a <= grid_prev_second_valid ?
+                            absd8(rgbin[7:0], grid_prev_second[7:0]) : 8'd0;
+                        grid_cross_acc_a <= 1'b1;
+                    end
                 end else if (half) begin
                     half <= 0;
                     if (grid_seen && cap_x < 11'h200 &&
                             capture_output_line_valid) begin
                         grid_prev_second <= rgbin;
                         grid_prev_second_valid <= 1;
-                        if (grid_intra_sum <=
-                                27'h7ffffff - {17'd0, grid_intra_delta})
-                            grid_intra_sum <=
-                                grid_intra_sum + {17'd0, grid_intra_delta};
+                        grid_intra_dr_a <=
+                            absd8(rgbin[23:16], rgb_prev[23:16]);
+                        grid_intra_dg_a <=
+                            absd8(rgbin[15:8], rgb_prev[15:8]);
+                        grid_intra_db_a <=
+                            absd8(rgbin[7:0], rgb_prev[7:0]);
+                        grid_intra_acc_a <= 1'b1;
                     end
                     if (capture_head_valid)
                         linebuf[capture_buf_addr] <= {8'b0, filtered_sample};
