@@ -27,9 +27,17 @@ uint8_t* ethernet_current_receive_ptr();
 int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
-/* Detection only: count of failed XEmacPs_BdRingFree calls on the RX ring.
- * Each failure strands the BDs of that call outside the free list, which is
- * invisible in every other counter. Saturates at 0xffff. */
+/* Detection only: count of FAILED XEmacPs_BdRingFree OPERATIONS on the RX
+ * ring since the last host-state reset -- not lost BDs, and not a rate.
+ * Each failure strands that call's BDs outside the free list, which is
+ * invisible in every other counter. Because the receive path frees every
+ * reclaimed BD in one call, a single failure can strand the entire ring, so
+ * any non-zero value is significant and the magnitude is not a severity
+ * scale. Bounded by RXBD_CNT under the current ownership/reset model;
+ * saturates at 0xffff defensively, since a wrap to 0 would read as
+ * "no failures". Zero is likewise not proof of RX health: through the
+ * register it is indistinguishable from firmware that lacks the
+ * diagnostic. */
 u16 ethernet_get_rx_bdfree_failures();
 void ethernet_task();
 void ethernet_reset_for_amiga();

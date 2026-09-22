@@ -77,7 +77,20 @@ enum zz_reg_offsets {
   REG_ZZ_SET_SPLIT_POS  = 0x5E,
 
   REG_ZZ_SET_FEATURE    = 0x60,
-  REG_ZZ_ETH_DIAG       = 0x62,  /* read: RX BdRingFree failures (saturating); 0 on firmware without it */
+  /* read: count of FAILED RX BdRingFree OPERATIONS since the last host-state
+   * reset. Not lost BDs, and not a rate. Any non-zero value means RX
+   * descriptors have been stranded outside the free list; the receive path
+   * frees every reclaimed BD in one call, so even 1 can represent the whole
+   * 32-BD ring -- magnitude is NOT a severity scale. Bounded by RXBD_CNT
+   * under the current ownership/reset model; the 0xffff saturation is
+   * defensive only.
+   *
+   * ZERO IS AMBIGUOUS and is NOT proof of RX health: it means either no
+   * failures have been recorded since the last host-state reset, or the
+   * firmware predates this diagnostic. That ambiguity is deliberate -- it is
+   * what lets a driver read this register unconditionally on any firmware --
+   * but it means 0 can never be used to conclude the ring is healthy. */
+  REG_ZZ_ETH_DIAG       = 0x62,
   REG_ZZ_UNUSED_REG64   = 0x64,
   REG_ZZ_UNUSED_REG66   = 0x66,
   REG_ZZ_UNUSED_REG68   = 0x68,
