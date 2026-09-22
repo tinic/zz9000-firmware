@@ -1846,6 +1846,14 @@ int main() {
 						data = 0;
 						break;
 					}
+					case REG_ZZ_ETH_DIAG: {
+						/* Detection only. Reads 0 on firmware that
+						 * predates this register, which is the same
+						 * value as "no failures", so a driver can read
+						 * it unconditionally. */
+						data = ethernet_get_rx_bdfree_failures();
+						break;
+					}
 					case REG_ZZ_ETH_RX_STATUS: {
 						data = ((uint32_t)ethernet_get_rx_status() << 16)
 						     | ethernet_get_rx_stats();

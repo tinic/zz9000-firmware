@@ -77,7 +77,7 @@ enum zz_reg_offsets {
   REG_ZZ_SET_SPLIT_POS  = 0x5E,
 
   REG_ZZ_SET_FEATURE    = 0x60,
-  REG_ZZ_UNUSED_REG62   = 0x62,
+  REG_ZZ_ETH_DIAG       = 0x62,  /* read: RX BdRingFree failures (saturating); 0 on firmware without it */
   REG_ZZ_UNUSED_REG64   = 0x64,
   REG_ZZ_UNUSED_REG66   = 0x66,
   REG_ZZ_UNUSED_REG68   = 0x68,

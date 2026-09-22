@@ -72,6 +72,11 @@ static volatile int tx_recoveries = 0;
 static volatile int rx_backpressure = 0;
 static volatile int rx_pause_frames = 0;
 static volatile int rx_slot_mismatch = 0;
+/* Detection only (no recovery): XEmacPs_BdRingFree failures on the RX ring
+ * were discarded here, so a BD that never returns to the free list left the
+ * ring quietly short of capacity with every other counter still correct.
+ * Count each failed call exactly once. */
+static volatile u16 rx_bdfree_failures = 0;
 static volatile int frames_ack_rejected = 0;	/* issue #29: RX-accept handshake rejects */
 
 #define ETH_PHY_TYPE_MICREL 0
@@ -465,6 +470,7 @@ static void ethernet_clear_host_state() {
 	rx_backpressure = 0;
 	rx_pause_frames = 0;
 	rx_slot_mismatch = 0;
+	rx_bdfree_failures = 0;
 
 	for (int i = 0; i < RXBD_CNT; i++) {
 		rx_bd_backlog_slot[i] = ETH_INVALID_BACKLOG_SLOT;
@@ -766,9 +772,12 @@ static void XEmacPsRecvHandler(void *Callback)
 
 		int Status = XEmacPs_BdRingFree(rxring, num_rx_bufs, rxbdset);
 		if (Status != XST_SUCCESS) {
-			//printf("EMAC: Error freeing RxBDs\n");
-		} else {
-			//printf("EMAC: freed %d RxBDs\n", num_rx_bufs);
+			/* One increment per failed call, not per BD and not per
+			 * retry: the count is of lost release operations, and
+			 * num_rx_bufs BDs are stranded by this one failure. */
+			if (rx_bdfree_failures != 0xffffu) {
+				rx_bdfree_failures++;
+			}
 		}
 
 		ethernet_alloc_rx_frames();
@@ -800,6 +809,36 @@ u16 ethernet_get_rx_status() {
 	}
 
 	return (rx_backpressure ? 0x8000 : 0) | (reserved << 8) | ready;
+}
+
+#ifdef ETH_HOST_TEST
+/* Test-only entry to the receive path, so a host test exercises the real
+ * BdRingFree call site rather than calling the ring API itself. Never
+ * compiled into firmware. */
+void ethernet_mock_recv_handler(void) {
+	XEmacPsRecvHandler(&EmacPsInstance);
+}
+
+/* Test-only handle on the RX ring, so a host test can drive receive/repost
+ * cycles without the firmware's static instance leaking into production
+ * linkage. Never compiled into firmware. */
+XEmacPs_BdRing *ethernet_mock_rx_ring(void) {
+	return &(XEmacPs_GetRxRing(&EmacPsInstance));
+}
+
+/* Test-only window on the BD->slot table, so a host test can assert the
+ * reservation/slot invariant. Never compiled into firmware. */
+u16 ethernet_mock_occupied_slots(void) {
+	u16 n = 0;
+	for (int i = 0; i < RXBD_CNT; i++) {
+		if (rx_bd_backlog_slot[i] != ETH_INVALID_BACKLOG_SLOT) n++;
+	}
+	return n;
+}
+#endif
+
+u16 ethernet_get_rx_bdfree_failures() {
+	return rx_bdfree_failures;
 }
 
 u16 ethernet_get_rx_stats() {

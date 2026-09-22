@@ -27,6 +27,10 @@ uint8_t* ethernet_current_receive_ptr();
 int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
+/* Detection only: count of failed XEmacPs_BdRingFree calls on the RX ring.
+ * Each failure strands the BDs of that call outside the free list, which is
+ * invisible in every other counter. Saturates at 0xffff. */
+u16 ethernet_get_rx_bdfree_failures();
 void ethernet_task();
 void ethernet_reset_for_amiga();
 
