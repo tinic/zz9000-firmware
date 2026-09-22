@@ -479,29 +479,19 @@ reg [23:0] grid_prev_second = 0;
 reg grid_prev_second_valid = 0;
 wire grid_pair_first = (cap_grid[0] == pair_parity);
 
-/* Alignment metric across all three channels: edges that change
- * only green or blue while red stays constant must still move the
- * phase measurement, or such content would never adapt. */
-function [9:0] grid_rgb_delta;
-    input [23:0] a;
-    input [23:0] b;
-    begin
-        grid_rgb_delta =
-            (a[23:16] > b[23:16] ? a[23:16] - b[23:16] : b[23:16] - a[23:16]) +
-            (a[15:8] > b[15:8] ? a[15:8] - b[15:8] : b[15:8] - a[15:8]) +
-            (a[7:0] > b[7:0] ? a[7:0] - b[7:0] : b[7:0] - a[7:0]);
-    end
-endfunction
-wire [9:0] grid_intra_delta = grid_rgb_delta(rgbin, rgb_prev);
-wire [9:0] grid_cross_delta = grid_prev_second_valid ?
-    grid_rgb_delta(rgbin, grid_prev_second) : 10'd0;
 /* #103 videocap E7M timing (was -3.945 ns overall setup on e7m_shifted):
  * the RGB abs-delta, a 27-bit saturation compare on the accumulator enable,
- * and the 27-bit add sat in one capture-clock path.  Split it into two
- * cap_clk stages -- stage 1 registers the delta and an accumulate strobe,
- * stage 2 does only the saturating add.  The metric is read once per frame
- * at vsync, so the one-cycle accumulation latency does not move the pairing
- * decision. */
+ * and the 27-bit add all sat in one capture-clock path.  Split across THREE
+ * cap_clk stages -- A registers the per-channel |diffs|, B sums them into
+ * grid_*_delta_q and advances the accumulate strobe, C does the saturating
+ * add.  The metric is read once per frame at vsync, so the added latency
+ * does not move the pairing decision.
+ *
+ * Saturation is a deliberate CLAMP TO MAX, not a wrap: on a max-activity
+ * frame the sum sticks at 27'h7ffffff.  Clamping keeps the frame's metric
+ * ordered against the other sum, which is what the margin comparison below
+ * needs; a wrap would read a maximally-busy frame as a quiet one and flip
+ * the pairing for the wrong reason. */
 reg [9:0] grid_intra_delta_q = 0;
 reg [9:0] grid_cross_delta_q = 0;
 reg       grid_intra_acc_q = 0;
@@ -604,8 +594,10 @@ always @(posedge cap_clk) begin
                           {2'b0, grid_cross_db_a};
     grid_intra_acc_q <= grid_intra_acc_a;
     grid_cross_acc_q <= grid_cross_acc_a;
-    /* stage C: 27-bit saturating add.  The vsync reset below overrides
-     * these writes on frame boundaries. */
+    /* stage C: 27-bit saturating add (clamp to max, see above).  The vsync
+     * branch below overrides these writes on the vsync cycle itself AND
+     * clears the accumulate strobes, so no frame-N contribution still in
+     * stage A or B can land in frame N+1's sum. */
     if (grid_intra_acc_q)
         grid_intra_sum <= grid_intra_sum_next[27] ?
             27'h7ffffff : grid_intra_sum_next[26:0];
@@ -743,6 +735,16 @@ always @(posedge cap_clk) begin
             pair_parity <= ~pair_parity;
         grid_intra_sum <= 0;
         grid_cross_sum <= 0;
+        /* Drain the metric pipeline with the sums.  Stages A and B can each
+         * hold a frame-N contribution at this point; without clearing the
+         * strobes those land in the next one or two cap_clk cycles, after
+         * the reset, and corrupt frame N+1's metric.  Clearing the strobes
+         * is sufficient -- the delta registers are ignored when they are
+         * low. */
+        grid_intra_acc_a <= 1'b0;
+        grid_cross_acc_a <= 1'b0;
+        grid_intra_acc_q <= 1'b0;
+        grid_cross_acc_q <= 1'b0;
 
         if (raw_y != 0)
             cap_ymax <= raw_y;
