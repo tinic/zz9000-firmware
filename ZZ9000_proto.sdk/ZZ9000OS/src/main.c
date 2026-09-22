@@ -409,6 +409,13 @@ static void activate_aperture_layout_if_acknowledged(void)
 	}
 }
 
+/* The register read dispatch switches on (zaddr & 0xffffffc), so a case for
+ * an odd-word register can never match: it is the low half of the preceding
+ * aligned read. Catch that at build time rather than shipping a diagnostic
+ * that silently always reads 0. */
+_Static_assert((REG_ZZ_ETH_DIAG & 3) == 0,
+               "REG_ZZ_ETH_DIAG must be 4-byte aligned to be reachable in the read switch");
+
 void handle_amiga_reset(enum amiga_reset_mode mode) {
 	printf("    _______________   ___   ___   ___  \n");
 	printf("   |___  /___  / _ \\ / _ \\ / _ \\ / _ \\ \n");
@@ -1851,7 +1858,7 @@ int main() {
 						 * predates this register, which is the same
 						 * value as "no failures", so a driver can read
 						 * it unconditionally. */
-						data = ethernet_get_rx_bdfree_failures();
+						data = ((uint32_t)ethernet_get_rx_bdfree_failures()) << 16;
 						break;
 					}
 					case REG_ZZ_ETH_RX_STATUS: {

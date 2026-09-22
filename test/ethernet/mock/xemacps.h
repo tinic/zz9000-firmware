@@ -21,6 +21,7 @@ typedef struct {
     /* state per BD index: 0 free, 1 pre, 2 hw, 3 post */
     u8  state[MOCK_RING_MAX];
     u32 FreeCnt, PreCnt, HwCnt, PostCnt, AllCnt;
+    u32 PostHead;   /* first BD of the post set, as the real ring keeps */
     u32 next_free;
 } XEmacPs_BdRing;
 

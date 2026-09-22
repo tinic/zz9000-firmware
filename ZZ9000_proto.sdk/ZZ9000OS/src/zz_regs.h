@@ -77,6 +77,7 @@ enum zz_reg_offsets {
   REG_ZZ_SET_SPLIT_POS  = 0x5E,
 
   REG_ZZ_SET_FEATURE    = 0x60,
+  REG_ZZ_UNUSED_REG62   = 0x62,
   /* read: count of FAILED RX BdRingFree OPERATIONS since the last host-state
    * reset. Not lost BDs, and not a rate. Any non-zero value means RX
    * descriptors have been stranded outside the free list; the receive path
@@ -89,9 +90,14 @@ enum zz_reg_offsets {
    * failures have been recorded since the last host-state reset, or the
    * firmware predates this diagnostic. That ambiguity is deliberate -- it is
    * what lets a driver read this register unconditionally on any firmware --
-   * but it means 0 can never be used to conclude the ring is healthy. */
-  REG_ZZ_ETH_DIAG       = 0x62,
-  REG_ZZ_UNUSED_REG64   = 0x64,
+   * but it means 0 can never be used to conclude the ring is healthy.
+   *
+   * Address must be 4-byte aligned: the read dispatch switches on
+   * (zaddr & 0xffffffc), so a case for an odd-word register such as 0x62
+   * can never match -- it is the low half of the 0x60 read. Per the
+   * convention (see REG_ZZ_AUDIO_TX_STATUS), an aligned register's value
+   * occupies the HIGH 16 bits of the 32-bit read. */
+  REG_ZZ_ETH_DIAG       = 0x64,
   REG_ZZ_UNUSED_REG66   = 0x66,
   REG_ZZ_UNUSED_REG68   = 0x68,
   REG_ZZ_UNUSED_REG6A   = 0x6A,

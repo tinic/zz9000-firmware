@@ -50,6 +50,7 @@ LONG XEmacPs_BdRingCreate(XEmacPs_BdRing *r, UINTPTR phys, UINTPTR virt, u32 ali
     r->cnt = cnt;
     memset(r->state, 0, sizeof(r->state));
     r->FreeCnt = cnt; r->PreCnt = r->HwCnt = r->PostCnt = 0; r->AllCnt = cnt;
+    r->PostHead = 0;
     r->next_free = 0;
     if (!g_rx) g_rx = r;          /* first ring created is RX (ethernet.c order) */
     return XST_SUCCESS;
@@ -87,7 +88,7 @@ u32 XEmacPs_BdRingFromHwRx(XEmacPs_BdRing *r, u32 n, XEmacPs_Bd **bd) {
     u32 got = 0;
     for (u32 idx = 0; idx < r->cnt && got < n; idx++) {
         if (r->state[idx] == 2) {
-            if (got == 0) *bd = &r->base[idx];
+            if (got == 0) { *bd = &r->base[idx]; if (r->PostCnt == 0) r->PostHead = idx; }
             r->state[idx] = 3; r->HwCnt--; r->PostCnt++; got++;
         }
     }
@@ -97,6 +98,13 @@ u32 XEmacPs_BdRingFromHwTx(XEmacPs_BdRing *r, u32 n, XEmacPs_Bd **bd) { return X
 
 LONG XEmacPs_BdRingFree(XEmacPs_BdRing *r, u32 n, XEmacPs_Bd *bd) {
     mock_bdfree_calls++;
+    /* Real contract (xemacps_bdring.c): fail iff PostCnt < NumBd or the set
+     * does not start at PostHead. Modelled so the test cannot pass against a
+     * caller that releases the wrong set or too many. */
+    if (r->PostCnt < n || MOCK_IDX(r, bd) != r->PostHead) {
+        mock_bdfree_failed_calls++;
+        return XST_FAILURE;
+    }
     if (mock_bdfree_fail_remaining > 0) {
         mock_bdfree_fail_remaining--;
         mock_bdfree_failed_calls++;
@@ -109,6 +117,7 @@ LONG XEmacPs_BdRingFree(XEmacPs_BdRing *r, u32 n, XEmacPs_Bd *bd) {
         if (r->state[idx] == 3) { r->PostCnt--; }
         r->state[idx] = 0; r->FreeCnt++;
     }
+    r->PostHead = (MOCK_IDX(r, bd) + n) % r->cnt;
     return XST_SUCCESS;
 }
 LONG XEmacPs_BdRingUnAlloc(XEmacPs_BdRing *r, u32 n, XEmacPs_Bd *bd) {
