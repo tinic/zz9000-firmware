@@ -8,6 +8,9 @@
  * here: recovery is a separate policy, and a full DMA restart also destroys
  * in-flight TX, so it must not be entangled with detecting the fault.
  *
+ * Scope: this suite compiles ethernet.c only. main.c's register read
+ * dispatch is NOT executed here -- see the coverage boundary note at T2.
+ *
  * T0 CONTROL   receive/repost cycles with no injected failure; free-BD count
  *              sampled only at matched quiescent points must return to
  *              baseline. Without this control a stranding assertion proves
@@ -159,6 +162,15 @@ int main(void)
     check_eq("T1_refusals_left_ring_intact", mock_rx_stranded_count(), posted);
 
     /* ---- T2: the REG_ZZ_ETH_DIAG read contract -------------------- */
+    /*
+     * COVERAGE BOUNDARY, stated so a passing suite is not over-trusted:
+     * this suite compiles ethernet.c, NOT main.c. T2 exercises the helper
+     * and the register's alignment; it does NOT execute main.c's dispatch
+     * case. So it catches an unreachable-by-alignment register -- the
+     * original blocker -- but it would NOT catch a case label that is
+     * missing, deleted, placed in the wrong switch, or shadowed by an
+     * earlier label. Those remain review-only concerns.
+     */
     /* main.c's read dispatch is not compiled into this suite, which is
      * exactly how the original 0x62 blocker got through: a case label for an
      * odd-word register can never match, because the dispatch switches on
