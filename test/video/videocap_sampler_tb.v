@@ -302,6 +302,75 @@ task check_eq;
     end
 endtask
 
+/* #103 vsync drain regression.
+ *
+ * The phase metric is pipelined over three cap_clk stages (A registers the
+ * per-channel |diffs|, B sums them and advances the accumulate strobe, C
+ * does the saturating add).  A contribution sitting in A or B when vsync
+ * zeroes the sums must NOT land in the next frame.
+ *
+ * Load stage A exactly as a maximal-difference pixel would, raise the
+ * accumulate strobe, then assert frame_sync `lead` cycles later and require
+ * both sums to read zero once the pipeline has drained.
+ *
+ * lead == 1 is the case that actually failed before the fix: acc_a is still
+ * high on the vsync cycle, so acc_q latches it and stage C adds frame N's
+ * delta into frame N+1's freshly zeroed sum one cycle after the reset.
+ * lead == 2 puts the contribution in stage B instead, where the reset
+ * already won because it is later in the same always block -- kept so the
+ * regression covers both positions rather than only the broken one.
+ *
+ * This is deliberately white-box: the hazard is internal to the metric
+ * pipeline and is not observable from the sampler's outputs, which is why
+ * the existing 17-config matrix passed both before and after the fix.
+ */
+task check_metric_drain_at_vsync;
+    input [255:0] name_intra;
+    input [255:0] name_cross;
+    input integer lead;
+    integer i;
+    begin
+        /* Start from a quiescent, already-reset metric. */
+        force dut.frame_sync = 1'b1;
+        @(posedge cap_clk);
+        release dut.frame_sync;
+        repeat (4) @(posedge cap_clk);
+
+        force dut.grid_intra_dr_a = 8'hff;
+        force dut.grid_intra_dg_a = 8'hff;
+        force dut.grid_intra_db_a = 8'hff;
+        force dut.grid_cross_dr_a = 8'hff;
+        force dut.grid_cross_dg_a = 8'hff;
+        force dut.grid_cross_db_a = 8'hff;
+        force dut.grid_intra_acc_a = 1'b1;
+        force dut.grid_cross_acc_a = 1'b1;
+        @(posedge cap_clk);
+        /* Release the strobes so the DUT's own vsync clear can reach them;
+         * holding the force would mask exactly what is under test. */
+        release dut.grid_intra_acc_a;
+        release dut.grid_cross_acc_a;
+
+        for (i = 1; i < lead; i = i + 1)
+            @(posedge cap_clk);
+
+        force dut.frame_sync = 1'b1;
+        @(posedge cap_clk);
+        release dut.frame_sync;
+        release dut.grid_intra_dr_a;
+        release dut.grid_intra_dg_a;
+        release dut.grid_intra_db_a;
+        release dut.grid_cross_dr_a;
+        release dut.grid_cross_dg_a;
+        release dut.grid_cross_db_a;
+
+        /* Longer than the whole A->B->C pipeline. */
+        repeat (4) @(posedge cap_clk);
+
+        check_eq(name_intra, dut.grid_intra_sum, 0);
+        check_eq(name_cross, dut.grid_cross_sum, 0);
+    end
+endtask
+
 integer frame_anchor_count = 0;
 reg frame_anchor_seen = 0;
 reg line_toggle_at_previous_sample = 0;
@@ -1249,6 +1318,12 @@ initial begin
     check_eq("width_deferred_legacy",
              legacy_control_applied_effective, (41 << 16) | 290);
     check_eq("width_deferred_rejected", control_rejected, 0);
+
+    /* #103: the metric pipeline must not carry a contribution across the
+     * vsync reset.  Run last, when the raster stimulus is quiescent, so the
+     * sums are not being driven by real pixel activity. */
+    check_metric_drain_at_vsync("drain_lead1_intra", "drain_lead1_cross", 1);
+    check_metric_drain_at_vsync("drain_lead2_intra", "drain_lead2_cross", 2);
 
     if (errors == 0)
         $display("RESULT PASS checks=%0d", checks);
