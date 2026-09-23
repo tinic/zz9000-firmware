@@ -37,8 +37,11 @@ u16 ethernet_send_frame(u16 frame_size);
  * ZZ9000Net.device keeps working.
  */
 #define ETH_TX_ASYNC        0x8000u
+#define ETH_TX_OFFSET2      0x4000u /* frame begins two bytes into its slot */
+#define ETH_TX_RESERVED     0x2000u /* must be zero in this protocol version */
 #define ETH_TX_SLOT_SHIFT   11
 #define ETH_TX_SLOT_MASK    0x3u
+#define ETH_TX_FIELD_MASK   0xfu /* slot, reserved bit, shifted-source bit */
 #define ETH_TX_LEN_MASK     0x7ffu
 #define ETH_TX_STATUS_PRESENT 0x8000u
 #define ETH_TX_STATUS_COUNT   0x7fffu
@@ -57,6 +60,7 @@ u16 ethernet_get_rx_stats();
 /* REG_ZZ_ETH_RX_META: checksum capabilities plus the current RX verdict. */
 #define ETH_RX_META_PRESENT 0x8000u
 #define ETH_TX_CSUM_PRESENT 0x4000u
+#define ETH_TX_OFFSET2_PRESENT 0x2000u
 #define ETH_RX_META_MASK    0x0003u
 #define ETH_RX_META_NONE    0u
 #define ETH_RX_META_IP      1u
