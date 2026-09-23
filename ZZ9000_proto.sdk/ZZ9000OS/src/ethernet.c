@@ -381,6 +381,14 @@ int ethernet_init() {
 		return XST_FAILURE;
 	}
 
+	/* The BSP's CfgInitialize() only selects INCR16 when GEM Version > 2,
+	 * but Zynq-7000 reports version 2 and UG585 recommends INCR16 for its
+	 * AHB packet-data DMA.  Change just that field for the RX A/B test. */
+	XEmacPs_DMABLengthUpdate(EmacPsInstancePtr, XEMACPS_16BYTE_BURST);
+	printf("EMAC: DMA burst field: 0x%lx\n",
+	       XEmacPs_ReadReg(Config->BaseAddress, XEMACPS_DMACR_OFFSET) &
+	       XEMACPS_DMACR_BLENGTH_MASK);
+
 	GemVersion = ((Xil_In32(Config->BaseAddress + 0xFC)) >> 16) & 0xFFF;
 	printf("EMAC: GemVersion: %ld\n", GemVersion);
 
