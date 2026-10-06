@@ -7576,6 +7576,10 @@ static uint32_t    cenc_scratch_len;
 static int         cenc_ready;
 static rfb_u8     *cenc_snap;       /* one coherent whole-frame copy per pass */
 static uint32_t    cenc_snap_len;
+/* The snapshot was taken by a band 0 under the current geometry and covers
+ * it.  Cleared when the geometry changes: a later band of a new geometry
+ * must not encode from a copy of the old, smaller frame. */
+static int         cenc_snap_ok;
 static uint8_t    *cenc_defl;        /* per-message deflate scratch */
 static uint32_t    cenc_defl_len;
 
@@ -7623,6 +7627,10 @@ static int cenc_configure(const rfb_geom *g, rfb_u32 flags)
 	                     cenc_shadow, cenc_shadow_len,
 	                     cenc_scratch, cenc_scratch_len) != 0)
 		return 0;
+	/* A new geometry voids the snapshot; a reset of the same one (the
+	 * viewer's refresh, which may arrive on any band) does not. */
+	if (!cenc_ready || !cenc_geom_same(g, &cenc_geom))
+		cenc_snap_ok = 0;
 	cenc_enc.seq = seq_keep;
 	cenc_geom = *g;
 	cenc_flags = flags;
@@ -7688,6 +7696,15 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	g.height = height;
 	g.bytes_per_row = bpr;
 
+	/* The encoder is handed one plane, the snapshot: only the chunky formats
+	 * are served, and their pixel size must be the framebuffer's.  A planar
+	 * request would make it read planes[1..depth-1], which do not exist. */
+	if (!RFB_FMT_IS_CHUNKY(g.format) || g.depth != 1u ||
+	    RFB_FMT_PIXEL_BYTES(g.format) != surface_format_bytes(fb.format) ||
+	    (uint32_t)width * RFB_FMT_PIXEL_BYTES(g.format) > bpr ||
+	    (uint32_t)height * bpr > fb.length)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
 	if (!cenc_ready || cenc_flags != enc_flags ||
 	    !cenc_geom_same(&g, &cenc_geom) || (rflags & HTTPZZ_F_RESET)) {
 		if (!cenc_configure(&g, enc_flags))
@@ -7718,8 +7735,12 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 		 * invalidate; whole-frame coherency is kept by the per-vblank
 		 * Xil_L1DCacheFlush()/Xil_L2CacheFlush() in video.c's isr_video(). */
 		memcpy(cenc_snap, (const void *)(uintptr_t)fb.address, fb.length);
+		cenc_snap_ok = 1;
 	}
-	if (!cenc_snap)   /* a mid-pass band arrived before any band 0 */
+	/* A band past 0 encodes from the snapshot its pass's band 0 took; with
+	 * none since the last reconfigure there is nothing valid to read. */
+	if (!cenc_snap || !cenc_snap_ok ||
+	    cenc_snap_len < (uint32_t)height * bpr)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 
 	planes[0] = (const rfb_u8 *)cenc_snap;
