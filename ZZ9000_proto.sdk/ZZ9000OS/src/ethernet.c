@@ -914,10 +914,51 @@ int ethernet_receive_frame(u16 acked_serial) {
 	return(frames_backlog_read);
 }
 
-void ethernet_send_frame_async(u16 slot, u16 frame_size) {
+/* A shifted slot is filled by the 68k's ordinary CopyFromBuff callback.  The
+ * ARM can inspect its strongly ordered DDR mapping without making the 68k
+ * read back across Zorro.  Only whole, structurally valid IPv4 TCP/UDP
+ * packets are eligible for the GEM's full checksum insertion.  UDP zero is
+ * the IPv4 "checksum omitted" convention and must stay zero. */
+static void ethernet_tx_prepare_shifted_checksum(volatile u8 *frame, u16 size) {
+	volatile u8 *ip;
+	u16 ihl, total, transport;
+
+	if (!XEmacPs_IsTxCsum(&EmacPsInstance) || size < 34u ||
+	    frame[12] != 0x08u || frame[13] != 0x00u)
+		return;
+	ip = frame + 14;
+	if ((ip[0] & 0xf0u) != 0x40u)
+		return;
+	ihl = (u16)(ip[0] & 0x0fu) << 2;
+	if (ihl < 20u || ihl > size - 14u)
+		return;
+	total = ((u16)ip[2] << 8) | ip[3];
+	if (total < ihl || total > size - 14u ||
+	    (ip[6] & 0x3fu) != 0 || ip[7] != 0)
+		return;
+	transport = total - ihl;
+	if (ip[9] == 6u) {
+		if (transport < 20u || (ip[ihl + 12u] >> 4) < 5u)
+			return;
+		ip[ihl + 16u] = 0;
+		ip[ihl + 17u] = 0;
+	} else if (ip[9] == 17u) {
+		if (transport < 8u ||
+		    (((u16)ip[ihl + 4u] << 8) | ip[ihl + 5u]) != transport ||
+		    (ip[ihl + 6u] == 0 && ip[ihl + 7u] == 0))
+			return;
+		ip[ihl + 6u] = 0;
+		ip[ihl + 7u] = 0;
+	}
+}
+
+void ethernet_send_frame_async(u16 field, u16 frame_size) {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	XEmacPs_Bd *BdTxPtr;
 	LONG Status;
+	u16 slot = field & ETH_TX_SLOT_MASK;
+	u16 csum = field & (ETH_TX_CSUM >> ETH_TX_SLOT_SHIFT);
+	u16 shifted = field & (ETH_TX_OFFSET2 >> ETH_TX_SLOT_SHIFT);
 
 	/* The send handler frees BDs of this ring and retires eth_tx_order from
 	 * the GEM's interrupt; neither is safe against that without the pause
@@ -925,8 +966,12 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	int paused = ethernet_pause_rx_irq();
 
 	if (ethernet_task_state != ETH_TASK_READY || frame_size == 0 ||
-	    frame_size > FRAME_SIZE)
+	    frame_size > (shifted ? FRAME_SIZE - 2u : FRAME_SIZE))
 		goto refused;
+	if (shifted && csum)
+		ethernet_tx_prepare_shifted_checksum(
+			(volatile u8 *)TxFrame + (UINTPTR)slot * FRAME_SIZE + 2u,
+			frame_size);
 
 	/* The TX window's section is strongly ordered and the 68k never reads
 	 * it, so there is no cached line to drop: the bytes are in DDR.  The
@@ -936,7 +981,8 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	if (Status != XST_SUCCESS)
 		goto refused;
 
-	XEmacPs_BdSetAddressTx(BdTxPtr, (UINTPTR)TxFrame + (UINTPTR)slot * FRAME_SIZE);
+	XEmacPs_BdSetAddressTx(BdTxPtr, (UINTPTR)TxFrame +
+		(UINTPTR)slot * FRAME_SIZE + (shifted ? 2u : 0u));
 	XEmacPs_BdSetLength(BdTxPtr, frame_size);
 	XEmacPs_BdClearTxUsed(BdTxPtr);
 	XEmacPs_BdSetLast(BdTxPtr);
@@ -974,7 +1020,7 @@ u16 ethernet_get_rx_meta(void) {
 	if (XEmacPs_IsRxCsum(&EmacPsInstance))
 		capabilities |= ETH_RX_META_PRESENT;
 	if (XEmacPs_IsTxCsum(&EmacPsInstance))
-		capabilities |= ETH_TX_CSUM_PRESENT;
+		capabilities |= ETH_TX_CSUM_PRESENT | ETH_TX_OFFSET2_PRESENT;
 
 	return capabilities | verdict;
 }
