@@ -7576,6 +7576,31 @@ static uint32_t    cenc_scratch_len;
 static int         cenc_ready;
 static rfb_u8     *cenc_snap;       /* one coherent whole-frame copy per pass */
 static uint32_t    cenc_snap_len;
+
+/* A 32-bit screen (BGRA8888: memory bytes B, G, R, A) served as RGB565, the
+ * wire's truecolour format, big-endian.  Converting while the snapshot is
+ * taken costs the ARM about what the copy did; without it the host reads four
+ * bytes a pixel over Zorro and converts every one on the 68k. */
+static void cenc_snap_bgra_rgb565(rfb_u8 *dst, uint32_t dst_pitch,
+                                  const uint8_t *src, uint32_t src_pitch,
+                                  uint32_t width, uint32_t height)
+{
+	uint32_t y;
+
+	for (y = 0u; y < height; y++) {
+		const uint8_t *s = src + y * src_pitch;
+		rfb_u8 *d = dst + y * dst_pitch;
+		uint32_t x;
+
+		for (x = 0u; x < width; x++, s += 4, d += 2) {
+			uint32_t v = ((uint32_t)(s[2] & 0xf8u) << 8) |
+			             ((uint32_t)(s[1] & 0xfcu) << 3) |
+			             ((uint32_t)s[0] >> 3);
+			d[0] = (rfb_u8)(v >> 8);
+			d[1] = (rfb_u8)v;
+		}
+	}
+}
 /* The snapshot was taken by a band 0 under the current geometry and covers
  * it.  Cleared when the geometry changes: a later band of a new geometry
  * must not encode from a copy of the old, smaller frame. */
@@ -7679,6 +7704,7 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	uint32_t out_capacity;
 	uint32_t enc_flags;
 	uint16_t width, height, bpr, ty0, ty1, rflags;
+	uint8_t conv;
 	struct SDKSurface fb;
 	struct SDKSharedBuffer *out;
 	rfb_geom g;
@@ -7721,7 +7747,13 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	/* The host frames bands from the geometry it sent; it must match the real
 	 * surface or the pixel stride and tiling disagree.  Mismatch => let the
 	 * host fall back to its own encode. */
-	if (width != fb.width || height != fb.height || bpr != fb.pitch)
+	/* RGB565 asked of a 32-bit screen is converted into the snapshot, whose
+	 * rows are the host's (bpr), not the card's. */
+	conv = (uint8_t)(g.format == RFB_FMT_RGB565 &&
+	                 fb.format == SDK_SURFACE_FORMAT_BGRA8888);
+	if (width != fb.width || height != fb.height ||
+	    (!conv && bpr != fb.pitch) ||
+	    (conv && (uint32_t)width * 4u > fb.pitch))
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 
 	g.width = width;
@@ -7736,9 +7768,11 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	 * framebuffer's. */
 	if (!RFB_FMT_IS_CHUNKY(g.format) ||
 	    g.depth != 8u * RFB_FMT_PIXEL_BYTES(g.format) ||
-	    RFB_FMT_PIXEL_BYTES(g.format) != surface_format_bytes(fb.format) ||
+	    (!conv &&
+	     RFB_FMT_PIXEL_BYTES(g.format) != surface_format_bytes(fb.format)) ||
 	    (uint32_t)width * RFB_FMT_PIXEL_BYTES(g.format) > bpr ||
-	    (uint32_t)height * bpr > fb.length)
+	    (!conv && (uint32_t)height * bpr > fb.length) ||
+	    (conv && (uint32_t)height * fb.pitch > fb.length))
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 
 	/* ANX-025: one encoder, one owner.  A request through another output
@@ -7763,10 +7797,12 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	 * drag cannot noticeably move, so band 0 copies the frame and every band of
 	 * the pass encodes off the stable copy: clean AND live, no layer lock. */
 	if (ty0 == 0) {
-		if (cenc_snap_len < fb.length) {
+		uint32_t snap_need = conv ? (uint32_t)height * bpr : fb.length;
+
+		if (cenc_snap_len < snap_need) {
 			free(cenc_snap);
-			cenc_snap = (rfb_u8 *)malloc(fb.length);
-			cenc_snap_len = cenc_snap ? fb.length : 0u;
+			cenc_snap = (rfb_u8 *)malloc(snap_need);
+			cenc_snap_len = cenc_snap ? snap_need : 0u;
 		}
 		if (!cenc_snap)
 			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
@@ -7779,7 +7815,13 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 		 * overlay_run_compose(), which reads this exact address with no
 		 * invalidate; whole-frame coherency is kept by the per-vblank
 		 * Xil_L1DCacheFlush()/Xil_L2CacheFlush() in video.c's isr_video(). */
-		memcpy(cenc_snap, (const void *)(uintptr_t)fb.address, fb.length);
+		if (conv)
+			cenc_snap_bgra_rgb565(cenc_snap, bpr,
+			                      (const uint8_t *)(uintptr_t)fb.address,
+			                      fb.pitch, width, height);
+		else
+			memcpy(cenc_snap, (const void *)(uintptr_t)fb.address,
+			       fb.length);
 		cenc_snap_ok = 1;
 	}
 	/* ANX-002: a band past 0 encodes from the snapshot its pass's band 0 took; with
