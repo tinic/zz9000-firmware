@@ -86,7 +86,26 @@ uint8_t* ethernet_current_receive_ptr();
 int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
-/* REG_ZZ_ETH_RX_META: checksum capabilities plus the current RX verdict. */
+/*
+ * REG_ZZ_ETH_RX_META: checksum capabilities plus the current RX verdict.
+ *
+ * Bit 15: the GEM's receive checksum offload is on, so bits 1..0 hold the
+ * verdict for the frame presented in the RX window: 0 none, 1 IP header only,
+ * 2 IP and TCP, 3 IP and UDP checked good (the GEM discards frames whose
+ * checksum it found bad).  A driver can then skip summing the payload.
+ * Bit 14: transmit checksum insertion is on; a driver may zero the TCP/UDP
+ * checksum field of an IPv4 frame and the GEM fills it.  Older firmware
+ * reads the register as 0: no capabilities, no verdict.
+ *
+ * Lifetime (ABI review ANX-023): the verdict belongs to the frame shown in
+ * the RX window and is valid from the read of its header until the host's
+ * REG_ZZ_ETH_RX acknowledge; read it in between.  Bits 1..0 mean a verdict
+ * only while bit 15 is set: with the receive engine off the descriptor bits
+ * mean something else and are reported as 0.  A reset of the receive path
+ * (DMA restart, MAC change) clears every slot's verdict to 0 along with the
+ * frames.  The engines are configured once at start-up and do not change
+ * while the firmware runs, so the capability bits read at attach stay true.
+ */
 #define ETH_RX_META_PRESENT 0x8000u
 #define ETH_TX_CSUM_PRESENT 0x4000u
 /* Shifted TX slots, with explicit per-frame checksum consent (ETH_TX_CSUM). */
