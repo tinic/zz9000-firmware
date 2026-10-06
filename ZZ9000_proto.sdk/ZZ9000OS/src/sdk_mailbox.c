@@ -7607,26 +7607,53 @@ static int cenc_configure(const rfb_geom *g, rfb_u32 flags)
 	if (shadow_len == 0u || scratch_len == 0u)
 		return 0;
 
-	if (shadow_len != cenc_shadow_len) {
-		free(cenc_shadow);
-		cenc_shadow = (rfb_u8 *)malloc(shadow_len);
-		cenc_shadow_len = cenc_shadow ? shadow_len : 0u;
-	}
-	if (scratch_len != cenc_scratch_len) {
-		free(cenc_scratch);
-		cenc_scratch = (rfb_u8 *)malloc(scratch_len);
-		cenc_scratch_len = cenc_scratch ? scratch_len : 0u;
-	}
-	if (!cenc_shadow || !cenc_scratch)
-		return 0;
+	/* ANX-003: build the replacement first and swap only on success.  Freeing
+	 * the old buffers before the new ones existed left cenc_ready and the
+	 * encoder pointing at freed memory when an allocation failed. */
+	{
+		rfb_u8 *shadow = cenc_shadow;
+		rfb_u8 *scratch = cenc_scratch;
+		rfb_encoder enc;
 
-	/* Zeroed shadow => the first band codes as a full frame from the same
-	 * all-zero the viewer starts from. */
-	memset(cenc_shadow, 0, cenc_shadow_len);
-	if (rfb_encoder_init(&cenc_enc, g, flags, &cfg,
-	                     cenc_shadow, cenc_shadow_len,
-	                     cenc_scratch, cenc_scratch_len) != 0)
-		return 0;
+		if (shadow_len != cenc_shadow_len)
+			shadow = (rfb_u8 *)malloc(shadow_len);
+		if (scratch_len != cenc_scratch_len)
+			scratch = (rfb_u8 *)malloc(scratch_len);
+		if (!shadow || !scratch) {
+			if (shadow && shadow != cenc_shadow)
+				free(shadow);
+			if (scratch && scratch != cenc_scratch)
+				free(scratch);
+			cenc_ready = 0;		/* the old state stays allocated, unused */
+			return 0;
+		}
+
+		/* Zeroed shadow => the first band codes as a full frame from the
+		 * same all-zero the viewer starts from. */
+		memset(shadow, 0, shadow_len);
+		if (rfb_encoder_init(&enc, g, flags, &cfg, shadow, shadow_len,
+		                     scratch, scratch_len) != 0) {
+			if (shadow != cenc_shadow)
+				free(shadow);
+			if (scratch != cenc_scratch)
+				free(scratch);
+			cenc_ready = 0;
+			return 0;
+		}
+
+		if (shadow != cenc_shadow) {
+			free(cenc_shadow);
+			cenc_shadow = shadow;
+			cenc_shadow_len = shadow_len;
+		}
+		if (scratch != cenc_scratch) {
+			free(cenc_scratch);
+			cenc_scratch = scratch;
+			cenc_scratch_len = scratch_len;
+		}
+		cenc_enc = enc;
+	}
+
 	/* A new geometry voids the snapshot; a reset of the same one (the
 	 * viewer's refresh, which may arrive on any band) does not. */
 	if (!cenc_ready || !cenc_geom_same(g, &cenc_geom))
@@ -7676,10 +7703,11 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	g.tile_h = p[32];
 	g.format = p[33];
 
-	/* The displayed framebuffer.  Honour the handle the host mapped; fall back
-	 * to the framebuffer sentinel so a stale or ambiguous handle still resolves. */
-	if (!get_surface_info(surface_handle, &fb) &&
-	    !get_surface_info(SDK_SURFACE_HANDLE_FRAMEBUFFER, &fb))
+	/* The surface the host mapped (ZZ9KMapFramebufferSurface).  ANX-026: a
+	 * stale handle is refused rather than quietly replaced by whatever the
+	 * display shows now, so the caller knows which pixels it would get; it
+	 * maps the framebuffer again, or falls back to its own encoder. */
+	if (!get_surface_info(surface_handle, &fb))
 		return complete_status(req, comp, SDK_STATUS_BAD_HANDLE);
 
 	out = find_shared_buffer(out_handle);
@@ -7696,10 +7724,14 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	g.height = height;
 	g.bytes_per_row = bpr;
 
-	/* The encoder is handed one plane, the snapshot: only the chunky formats
-	 * are served, and their pixel size must be the framebuffer's.  A planar
-	 * request would make it read planes[1..depth-1], which do not exist. */
-	if (!RFB_FMT_IS_CHUNKY(g.format) || g.depth != 1u ||
+	/* ANX-001: the encoder is handed one plane, the snapshot, so only the
+	 * chunky formats are served (one plane whatever the depth); a planar
+	 * request would make it read planes[1..depth-1], which do not exist.
+	 * For chunky formats depth is bits per pixel (8 CLUT8, 16 RGB565) and
+	 * must agree with the format, whose pixel size must be the
+	 * framebuffer's. */
+	if (!RFB_FMT_IS_CHUNKY(g.format) ||
+	    g.depth != 8u * RFB_FMT_PIXEL_BYTES(g.format) ||
 	    RFB_FMT_PIXEL_BYTES(g.format) != surface_format_bytes(fb.format) ||
 	    (uint32_t)width * RFB_FMT_PIXEL_BYTES(g.format) > bpr ||
 	    (uint32_t)height * bpr > fb.length)
@@ -7737,7 +7769,7 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 		memcpy(cenc_snap, (const void *)(uintptr_t)fb.address, fb.length);
 		cenc_snap_ok = 1;
 	}
-	/* A band past 0 encodes from the snapshot its pass's band 0 took; with
+	/* ANX-002: a band past 0 encodes from the snapshot its pass's band 0 took; with
 	 * none since the last reconfigure there is nothing valid to read. */
 	if (!cenc_snap || !cenc_snap_ok ||
 	    cenc_snap_len < (uint32_t)height * bpr)
@@ -7746,8 +7778,16 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	planes[0] = (const rfb_u8 *)cenc_snap;
 	outp = (rfb_u8 *)(uintptr_t)out->address;
 	n = rfb_encode_band(&cenc_enc, planes, outp, out_capacity, ty0, ty1);
-	if (n < 0)
+	if (n < 0) {
+		/* ANX-007: the encoder may already have advanced its sequence and
+		 * shadow for bytes that were never delivered.  An error therefore
+		 * ends the session: the next request reconfigures from a zeroed
+		 * shadow, and the caller restarts from band 0 with
+		 * HTTPZZ_F_RESET, which yields a keyframe -- never a retry of the
+		 * same band against a half-applied delta. */
+		cenc_ready = 0;
 		return complete_status(req, comp, SDK_STATUS_INTERNAL_ERROR);
+	}
 
 	/* Deflate the ops payload (everything after the 4-byte header) in place, so
 	 * the wire carries the header raw -- version/flags/seq stay readable for the
