@@ -32,6 +32,8 @@
 #include "interrupt.h"
 #include "memorymap.h"
 #include "mntzorro.h"
+#include "sdk_smp_lock.h"
+#include "xpseudo_asm.h"
 
 #ifndef ETH_DEBUG_VERBOSE
 #define ETH_DEBUG_VERBOSE 0
@@ -467,20 +469,40 @@ static u16 ethernet_backlog_pending()
 	return frames_backlog + frames_backlog_reserved;
 }
 
+/*
+ * Keep the GEM's interrupt out of a main-loop section that changes the RX
+ * backlog accounting or a BD ring.
+ *
+ * Clearing the RX bits in IER is not enough: XEmacPs_IntrHandler dispatches
+ * on the raw ISR, not ISR & IMR, so a GEM interrupt raised for any other
+ * cause -- TX completion, constant since the asynchronous send -- still runs
+ * XEmacPsRecvHandler when a frame has landed.  It then races
+ * ethernet_receive_frame() on frames_backlog, frames_backlog_reserved and the
+ * RX BD ring; a lost update lets ethernet_prepare_rx_bd() or the drained-
+ * backlog clear zero the header of the frame the host is being shown, and
+ * RX wedges for good: the status register says 120 frames wait, the window
+ * shows an empty slot (measured, A3000/TF4060, ZZ9000Net.device and the
+ * upstream driver alike).  Mask the GEM's line at the GIC instead; an
+ * interrupt that arrives meanwhile stays pending and is taken on resume.
+ */
 int ethernet_pause_rx_irq(void)
 {
 	if (ethernet_task_state != ETH_TASK_READY) {
 		return 0;
 	}
 
-	XEmacPs_IntDisable(&EmacPsInstance, ETH_RX_INTERRUPT_MASK);
+	uint32_t irq_state = smp_local_irq_save();
+	XScuGic_Disable(interrupt_get_intc(), EMACPS_IRPT_INTR);
+	dsb();
+	isb();
+	smp_local_irq_restore(irq_state);
 	return 1;
 }
 
 void ethernet_resume_rx_irq(int paused)
 {
 	if (paused) {
-		XEmacPs_IntEnable(&EmacPsInstance, ETH_RX_INTERRUPT_MASK);
+		XScuGic_Enable(interrupt_get_intc(), EMACPS_IRPT_INTR);
 	}
 }
 
@@ -1087,8 +1109,12 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	/* The driver keeps at most TXBD_CNT in flight and reuses a slot only
 	 * after the status count says its frame is done, which the send handler
 	 * counts after freeing the BD: this cannot fail for want of one. */
+	/* The send handler frees BDs of this ring from the GEM's interrupt; the
+	 * ring's counters are not safe against that (see ethernet_pause_rx_irq). */
+	int paused = ethernet_pause_rx_irq();
 	LONG Status = XEmacPs_BdRingAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr);
 	if (Status != XST_SUCCESS) {
+		ethernet_resume_rx_irq(paused);
 		eth_tx_async_dropped++;
 		eth_tx_host_done++;
 		ethernet_log_status("tx-async-bd-alloc-error");
@@ -1104,6 +1130,7 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	Status = XEmacPs_BdRingToHw(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
 	if (Status != XST_SUCCESS) {
 		XEmacPs_BdRingUnAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
+		ethernet_resume_rx_irq(paused);
 		eth_tx_async_dropped++;
 		eth_tx_host_done++;
 		ethernet_log_status("tx-async-bd-to-hw-error");
@@ -1111,6 +1138,7 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	}
 
 	XEmacPs_Transmit(EmacPsInstancePtr);
+	ethernet_resume_rx_irq(paused);
 }
 
 u32 ethernet_get_errors() {
