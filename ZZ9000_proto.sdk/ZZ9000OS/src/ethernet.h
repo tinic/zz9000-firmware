@@ -115,4 +115,16 @@ void ethernet_reset_for_amiga();
 #define RXBD_CNT       64	/* Number of RxBDs to use */
 #define TXBD_CNT       4	/* Number of TxBDs to use: the four slots of the TX window */
 
+/*
+ * REG_ZZ_ETH_RX_FRAMES: how many frames a sender may put on the wire at once.
+ * The descriptors armed for the GEM bound a back-to-back burst (every frame
+ * past them is lost in the GEM), and the frames the host may leave queued
+ * before the firmware pauses the wire bound a sustained one; the smaller of
+ * the two.  A stable build property, unlike the reservation counter in
+ * REG_ZZ_ETH_RX_STATUS.  Older firmware reads 0: assume 32.
+ */
+#define ETH_RX_FRAMES_PRESENT 0x8000u
+#define ETH_RX_FRAMES_COUNT   0x7fffu
+u16 ethernet_get_rx_frames(void);
+
 #endif

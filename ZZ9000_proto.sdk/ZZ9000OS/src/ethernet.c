@@ -974,6 +974,14 @@ u16 ethernet_get_rx_stats() {
 	return (dropped << 8) | pause;
 }
 
+u16 ethernet_get_rx_frames(void) {
+	u16 burst = RXBD_CNT;
+	u16 queued = (u16)(ETH_BACKLOG_HIGH_WATERMARK - RXBD_CNT);
+
+	return (u16)(ETH_RX_FRAMES_PRESENT |
+	             ((burst < queued ? burst : queued) & ETH_RX_FRAMES_COUNT));
+}
+
 u16 ethernet_get_rx_meta() {
 	u16 verdict = ETH_RX_META_NONE;
 	u16 capabilities = 0;
