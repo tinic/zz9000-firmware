@@ -29,6 +29,7 @@
 #include <xemacps.h>
 #include <xscugic.h>
 #include "ethernet.h"
+#include "eth_tx_order.h"
 #include "interrupt.h"
 #include "memorymap.h"
 #include "mntzorro.h"
@@ -97,7 +98,9 @@ typedef char EthernetFrame[XEMACPS_MAX_VLAN_FRAME_SIZE_JUMBO] __attribute__ ((al
  * REG_ZZ_ETH_TX_STATUS.  A u16 that wraps, and the driver counts the
  * difference. */
 static volatile u16 rx_fifo_overruns = 0;
-static volatile u16 eth_tx_host_done = 0;
+/* Asynchronous submissions retired in order; see eth_tx_order.h.  Touched by
+ * the send handler and, under ethernet_pause_rx_irq(), by the main loop. */
+static struct eth_tx_order eth_tx_ord;
 static volatile u16 eth_tx_async_dropped = 0;
 volatile char* TxFrame = (char*)TX_FRAME_ADDRESS;		/* Transmit buffer */
 
@@ -592,6 +595,7 @@ void ethernet_clear_host_state(void) {
 	FramesTx = 0;
 	frames_dropped = 0;
 	frames_backlog_full = 0;
+	eth_tx_order_flush(&eth_tx_ord);
 	eth_tx_async_dropped = 0;
 	rx_backpressure = 0;
 	rx_pause_frames = 0;
@@ -718,7 +722,7 @@ static void XEmacPsSendHandler(void *Callback)
 	    XEmacPs_BdSetStatus(BdTxPtr, XEMACPS_TXBUF_USED_MASK); // XEMACPS_TXBUF_WRAP_MASK
 
 	    FramesTx++;
-	    eth_tx_host_done++;
+	    eth_tx_order_retire_bd(&eth_tx_ord);
 	}
 }
 
@@ -1093,12 +1097,15 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	u16 shifted = slot & (ETH_TX_OFFSET2 >> ETH_TX_SLOT_SHIFT);
 	slot &= ETH_TX_SLOT_MASK;
 
+	/* The send handler frees BDs of this ring and retires eth_tx_ord from the
+	 * GEM's interrupt; neither is safe against that without the pause (see
+	 * ethernet_pause_rx_irq). */
+	int paused = ethernet_pause_rx_irq();
+	LONG Status;
+
 	if (ethernet_task_state != ETH_TASK_READY || frame_size == 0 ||
-	    reserved || (shifted && frame_size > FRAME_SIZE - 2u)) {
-		eth_tx_async_dropped++;
-		eth_tx_host_done++;
-		return;
-	}
+	    reserved || (shifted && frame_size > FRAME_SIZE - 2u))
+		goto refused;
 	if (shifted)
 		ethernet_tx_prepare_shifted_checksum(
 			(volatile u8 *)TxFrame + (UINTPTR)slot * FRAME_SIZE + 2u,
@@ -1111,14 +1118,10 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	 * counts after freeing the BD: this cannot fail for want of one. */
 	/* The send handler frees BDs of this ring from the GEM's interrupt; the
 	 * ring's counters are not safe against that (see ethernet_pause_rx_irq). */
-	int paused = ethernet_pause_rx_irq();
-	LONG Status = XEmacPs_BdRingAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr);
+	Status = XEmacPs_BdRingAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, &BdTxPtr);
 	if (Status != XST_SUCCESS) {
-		ethernet_resume_rx_irq(paused);
-		eth_tx_async_dropped++;
-		eth_tx_host_done++;
 		ethernet_log_status("tx-async-bd-alloc-error");
-		return;
+		goto refused;
 	}
 
 	XEmacPs_BdSetAddressTx(BdTxPtr, (UINTPTR)TxFrame +
@@ -1130,14 +1133,18 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	Status = XEmacPs_BdRingToHw(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
 	if (Status != XST_SUCCESS) {
 		XEmacPs_BdRingUnAlloc(&(XEmacPs_GetTxRing(EmacPsInstancePtr)), 1, BdTxPtr);
-		ethernet_resume_rx_irq(paused);
-		eth_tx_async_dropped++;
-		eth_tx_host_done++;
 		ethernet_log_status("tx-async-bd-to-hw-error");
-		return;
+		goto refused;
 	}
 
+	eth_tx_order_push(&eth_tx_ord, 1);
 	XEmacPs_Transmit(EmacPsInstancePtr);
+	ethernet_resume_rx_irq(paused);
+	return;
+
+refused:
+	eth_tx_async_dropped++;
+	eth_tx_order_push(&eth_tx_ord, 0);
 	ethernet_resume_rx_irq(paused);
 }
 
@@ -1146,7 +1153,7 @@ u32 ethernet_get_errors() {
 }
 
 u16 ethernet_get_tx_status() {
-	return (u16)(ETH_TX_STATUS_PRESENT | (eth_tx_host_done & ETH_TX_STATUS_COUNT));
+	return (u16)(ETH_TX_STATUS_PRESENT | (eth_tx_ord.done & ETH_TX_STATUS_COUNT));
 }
 
 u32 get_frames_received() {
