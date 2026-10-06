@@ -11,9 +11,11 @@
 #include <stdlib.h>
 #include "xil_cache.h"
 #include <aminetxduo/rfb_encode.h>
+#include "xil_mmu.h"
 #include "xtime_l.h"
 #include "sdk_palette.h"
 #include "sdk_mailbox.h"
+#include "sdk_service_catalog.h"
 #include "sdk_compression.h"
 #include <zlib.h>
 #include "lzh/zz9k_lzh.h"
@@ -73,9 +75,12 @@
  * again: a permanent stall. */
 #define SDK_AUDIO_STREAM_MIN_INPUT_BYTES (4U * 1024U)
 
-typedef char SDKMailbox_must_fit_legacy_io_window[
-	((SDK_MAILBOX_WINDOW_OFFSET + SDK_MAILBOX_TOTAL_SIZE) <= 0x00010000U) ?
+typedef char SDKMailbox_must_fit_z2_io_window[
+	((SDK_MAILBOX_Z2_WINDOW_OFFSET + SDK_MAILBOX_TOTAL_SIZE) <= 0x00010000U) ?
 	1 : -1
+];
+typedef char SDKMailbox_must_fit_z3_reservation[
+	(SDK_MAILBOX_TOTAL_SIZE <= SDK_MAILBOX_Z3_RESERVE_SIZE) ? 1 : -1
 ];
 
 struct SDKMailboxDescriptor {
@@ -138,27 +143,6 @@ struct SDKQueryApertureLayoutPayload {
 	uint8_t host_window_size[4];
 	uint8_t audio_base[4];
 	uint8_t audio_size[4];
-};
-
-struct SDKServiceInfoPayload {
-	uint8_t service_id[4];
-	uint8_t version[4];
-	uint8_t capability_bits[4];
-	uint8_t flags[4];
-	uint8_t opcode_base[4];
-	uint8_t opcode_count[4];
-	uint8_t max_inline_payload[4];
-	uint8_t name[20];
-};
-
-struct SDKServiceDescriptor {
-	uint32_t service_id;
-	uint32_t version;
-	uint32_t capability_bits;
-	uint32_t flags;
-	uint32_t opcode_base;
-	uint32_t opcode_count;
-	const char *name;
 };
 
 struct SDKAllocSharedPayload {
@@ -1214,150 +1198,6 @@ static uint32_t mailbox_capability_bits(void)
 	return capabilities;
 }
 
-static const struct SDKServiceDescriptor sdk_services[] = {
-	{
-		SDK_SERVICE_CORE,
-		0x00020000U,
-		SDK_CAP_MAILBOX | SDK_CAP_POLLING_COMPLETION |
-			SDK_CAP_SERVICE_DISCOVERY,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_CORE,
-		6,
-		"core"
-	},
-	{
-		SDK_SERVICE_MEMORY,
-		0x00020000U,
-		SDK_CAP_SHARED_ALLOC | SDK_CAP_MEMORY_OPS,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_MEMORY,
-		4,
-		"memory"
-	},
-	{
-		SDK_SERVICE_SURFACE,
-		0x00020000U,
-		SDK_CAP_SURFACES | SDK_CAP_FRAMEBUFFER_SURFACE |
-			SDK_CAP_SURFACE_OPS,
-		SDK_SERVICE_FLAG_FIRMWARE | SDK_SERVICE_FLAG_ZERO_COPY |
-			SDK_SERVICE_FLAG_SURFACE_PALETTE_QUERY,
-		SDK_SERVICE_SURFACE,
-		6,
-		"surface"
-	},
-	{
-		SDK_SERVICE_IMAGE,
-		0x00020000U,
-		SDK_CAP_IMAGE_SCALE | SDK_CAP_IMAGE_DECODE,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_IMAGE_STREAMING_INPUT |
-			SDK_SERVICE_FLAG_IMAGE_TILE_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_FRAMEBUFFER_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_BILINEAR |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_CLIPPED |
-			SDK_SERVICE_FLAG_IMAGE_PNG_DIRECT_BGRA |
-			SDK_SERVICE_FLAG_IMAGE_RGB888_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_BGRA_TO_RGB555_RGB565,
-		SDK_SERVICE_IMAGE,
-		8,
-		"image"
-	},
-	{
-		SDK_SERVICE_CODEC,
-		0x00020000U,
-		SDK_CAP_COMPRESSION,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_CODEC_DEFLATE_RAW |
-			SDK_SERVICE_FLAG_CODEC_ZLIB |
-			SDK_SERVICE_FLAG_CODEC_GZIP |
-			SDK_SERVICE_FLAG_CODEC_LZMA_ALONE |
-			SDK_SERVICE_FLAG_CODEC_LZMA2 |
-			SDK_SERVICE_FLAG_CODEC_CHECKSUM |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_TEST |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_STREAM |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_FEED |
-			SDK_SERVICE_FLAG_CODEC_DEFLATE_FEED |
-			SDK_SERVICE_FLAG_CODEC_ZLIB_FEED |
-			SDK_SERVICE_FLAG_CODEC_GZIP_FEED |
-			SDK_SERVICE_FLAG_CODEC_LZH |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_BATCH,
-		SDK_SERVICE_CODEC,
-		7,	/* 0x0600..0x0606 incl. SDK_OP_DECOMPRESS_BATCH */
-		"codec"
-	},
-	{
-		SDK_SERVICE_AUDIO,
-		0x00020001U,
-		SDK_CAP_AUDIO_DECODE | SDK_CAP_AUDIO_PLAYBACK |
-			SDK_CAP_AUDIO_CONTROL | SDK_CAP_AUDIO_METERING |
-			SDK_CAP_AUDIO_FABRIC,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_AUDIO_MP3_DECODE |
-			SDK_SERVICE_FLAG_AUDIO_MP3_STREAM |
-			SDK_SERVICE_FLAG_AUDIO_CONTROL |
-			SDK_SERVICE_FLAG_AUDIO_FABRIC |
-			SDK_SERVICE_FLAG_AUDIO_FABRIC_RATE,
-		21,	/* 0x0500..0x0514 incl. audio control plane and the
-			 * fabric lease plane (0x0512-0x0514; 0x050f..0x0511
-			 * reserved gaps); the on-hardware qualification gate
-			 * passed 2026-08-28 (docs/audio-fabric.md), so the
-			 * lease opcodes are counted and advertised */
-		"audio"
-	},
-	{
-		SDK_SERVICE_CRYPTO,
-		0x00020000U,
-		SDK_CAP_CRYPTO,
-		SDK_SERVICE_FLAG_FIRMWARE | SDK_SERVICE_FLAG_CRYPTO_X25519 |
-			SDK_SERVICE_FLAG_CRYPTO_P256 |
-			SDK_SERVICE_FLAG_CRYPTO_P256_KEYGEN |
-			SDK_SERVICE_FLAG_CRYPTO_ECDSA_P256 |
-			SDK_SERVICE_FLAG_CRYPTO_RSA_2048 |
-			SDK_SERVICE_FLAG_CRYPTO_AES_GCM,
-		SDK_SERVICE_CRYPTO,
-		5,
-		"crypto"
-	},
-	{
-		SDK_SERVICE_DIAG,
-		0x00020000U,
-		SDK_CAP_DIAGNOSTICS,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_DIAG,
-		4,
-		"diag"
-	},
-	{
-		SDK_SERVICE_VIDEO,
-		0x00020000U,
-		SDK_CAP_VIDEO_DECODE | SDK_CAP_MEDIA_SESSION,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_ASYNC |
-			SDK_SERVICE_FLAG_VIDEO_MPEG1 |
-			SDK_SERVICE_FLAG_VIDEO_MPEG_PS |
-			SDK_SERVICE_FLAG_VIDEO_DIRECT_OVERLAY |
-			SDK_SERVICE_FLAG_VIDEO_STREAMING_INPUT |
-			SDK_SERVICE_FLAG_VIDEO_CORE1 |
-			SDK_SERVICE_FLAG_VIDEO_MEDIA_SESSION |
-			SDK_SERVICE_FLAG_VIDEO_MEDIA_MP2 |
-			SDK_SERVICE_FLAG_VIDEO_EXPLICIT_PRESENT |
-			SDK_SERVICE_FLAG_VIDEO_TIMELINE_90KHZ |
-			SDK_SERVICE_FLAG_VIDEO_PCM_RING_STATUS,
-		SDK_SERVICE_VIDEO,
-		14,
-		"video"
-	},
-	{
-		SDK_SERVICE_CONSOLE,
-		0x00020000U,
-		SDK_CAP_CONSOLE_ENCODE,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_CONSOLE,
-		1,
-		"console"
-	}
-};
-
 static inline uint16_t get_be16(const volatile void *p)
 {
 	const volatile uint8_t *b = (const volatile uint8_t *)p;
@@ -1443,9 +1283,14 @@ static void record_request_timing(uint32_t opcode, uint32_t elapsed_us)
 	}
 }
 
+/* ARM address of the live mailbox; chosen per bus by sdk_mailbox_init()
+ * (see SDK_MAILBOX_Z3_ADDRESS in memorymap.h) and stable for the lifetime
+ * that init starts. Read/written by core 0 only. */
+static uintptr_t mailbox_base = SDK_MAILBOX_Z2_ADDRESS;
+
 static inline volatile struct SDKMailboxDescriptor *descriptor(void)
 {
-	return (volatile struct SDKMailboxDescriptor *)SDK_MAILBOX_ADDRESS;
+	return (volatile struct SDKMailboxDescriptor *)mailbox_base;
 }
 
 void sdk_mailbox_refresh_capabilities(void)
@@ -1460,13 +1305,13 @@ void sdk_mailbox_refresh_capabilities(void)
 static inline volatile struct SDKMailboxEntry *request_ring(void)
 {
 	return (volatile struct SDKMailboxEntry *)
-		(SDK_MAILBOX_ADDRESS + SDK_MAILBOX_REQUEST_OFFSET);
+		(mailbox_base + SDK_MAILBOX_REQUEST_OFFSET);
 }
 
 static inline volatile struct SDKMailboxEntry *completion_ring(void)
 {
 	return (volatile struct SDKMailboxEntry *)
-		(SDK_MAILBOX_ADDRESS + SDK_MAILBOX_COMPLETION_OFFSET);
+		(mailbox_base + SDK_MAILBOX_COMPLETION_OFFSET);
 }
 
 static uint32_t next_index(uint32_t index)
@@ -1521,30 +1366,6 @@ static void copy_payload(volatile uint8_t *dst, const volatile uint8_t *src,
 	uint32_t i;
 	for (i = 0; i < length; i++)
 		dst[i] = src[i];
-}
-
-static void copy_name(volatile uint8_t *dst, const char *src)
-{
-	uint32_t i;
-
-	for (i = 0; i < 20U; i++) {
-		if (src && src[i] != '\0')
-			dst[i] = (uint8_t)src[i];
-		else
-			dst[i] = 0;
-	}
-}
-
-static const struct SDKServiceDescriptor *find_service(uint32_t service_id)
-{
-	uint32_t i;
-
-	for (i = 0; i < sizeof(sdk_services) / sizeof(sdk_services[0]); i++) {
-		if (sdk_services[i].service_id == service_id)
-			return &sdk_services[i];
-	}
-
-	return 0;
 }
 
 static uint32_t service_flags(const struct SDKServiceDescriptor *service)
@@ -2520,11 +2341,16 @@ static int fill_framebuffer_surface(struct SDKSurface *surface_info)
 	                        state->framebuffer_pan_offset;
 	surface_info->width = state->vmode_hsize ?
 	                      state->vmode_hsize : (uint32_t)mode->hres;
-	surface_info->height = state->vmode_vsize ?
-	                       state->vmode_vsize : (uint32_t)mode->vres;
+	surface_info->height = state->vmode_vdma_rows;
+	if (!surface_info->height) {
+		surface_info->height = state->vmode_vsize ?
+		                       state->vmode_vsize :
+		                       (uint32_t)mode->vres;
+		surface_info->height /=
+			video_vertical_scale_factor(state->scalemode);
+	}
 	if (state->scalemode & 1)
 		surface_info->width /= 2U;
-	surface_info->height /= video_vertical_scale_factor(state->scalemode);
 	if (surface_info->width == 0 || surface_info->height == 0)
 		return 0;
 
@@ -4434,6 +4260,9 @@ static uint16_t handle_audio_ring_acquire(
 	if (gain > 255U ||
 	    (flags & ~SDK_AUDIO_RING_ACQUIRE_FLAG_KNOWN) != 0U)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U &&
+	    (flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) == 0U)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) != 0U) {
 		if (rate != 8000U && rate != 12000U && rate != 24000U &&
 		    rate != 32000U && rate != 44100U && rate != 48000U)
@@ -4452,6 +4281,8 @@ static uint16_t handle_audio_ring_acquire(
 		return complete_status(req, comp, SDK_STATUS_UNSUPPORTED);
 	if (rc != AUDIO_FABRIC_LEASE_OK)
 		return complete_status(req, comp, SDK_STATUS_BUSY);
+	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U)
+		audio_fabric_lease_source_be(slot, 1);
 	write_completion(comp, req, SDK_STATUS_OK, sizeof(*result));
 	memset((void *)comp->payload, 0, sizeof(comp->payload));
 	result = (volatile struct SDKAudioRingAcquireResultPayload *)
@@ -4471,7 +4302,9 @@ static uint16_t handle_audio_ring_acquire(
 	put_be32(result->period_us, SDK_AUDIO_RING_PERIOD_US);
 	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) != 0U) {
 		put_be32(result->sample_contract,
-		         SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16LE);
+		         ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U)
+		             ? SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16BE
+		             : SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16LE);
 		put_be32(result->source_rate, rate);
 	} else {
 		put_be32(result->sample_contract,
@@ -7511,7 +7344,7 @@ static uint16_t handle_diag_read(volatile struct SDKMailboxEntry *req,
 	put_be32(diag->shared_heap_total, SDK_SHARED_HEAP_SIZE);
 	put_be32(diag->shared_heap_free, free_total);
 	put_be32(diag->shared_heap_largest_free, largest_free);
-	put_be32(diag->mailbox_arm_addr, SDK_MAILBOX_ADDRESS);
+	put_be32(diag->mailbox_arm_addr, (uint32_t)mailbox_base);
 	put_be32(diag->mailbox_ring_entries, SDK_MAILBOX_RING_ENTRIES);
 	put_be32(diag->surfaces_used, count_used_surfaces());
 	put_be32(diag->allocator_invalid_slots, invalid_slots);
@@ -7644,6 +7477,7 @@ static uint16_t handle_query_service(volatile struct SDKMailboxEntry *req,
 	volatile struct SDKServiceInfoPayload *info;
 	const struct SDKServiceDescriptor *service;
 	uint32_t service_id;
+	uint32_t capabilities;
 
 	if (payload_len < 4U)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
@@ -7655,25 +7489,16 @@ static uint16_t handle_query_service(volatile struct SDKMailboxEntry *req,
 		return complete_status(req, comp, SDK_STATUS_NOT_FOUND);
 
 	write_completion(comp, req, SDK_STATUS_OK, sizeof(*info));
-	memset((void *)comp->payload, 0, sizeof(comp->payload));
 	info = (volatile struct SDKServiceInfoPayload *)comp->payload;
-	put_be32(info->service_id, service->service_id);
-	put_be32(info->version, service->version);
-	{
-		uint32_t capabilities = service->capability_bits;
-		if (service->service_id == SDK_SERVICE_CORE)
-			capabilities |= mailbox_capability_bits() &
-				SDK_CAP_APERTURE_LAYOUT;
-		if (service->service_id == SDK_SERVICE_MEMORY)
-			capabilities |= mailbox_capability_bits() &
-				SDK_CAP_HOST_WINDOW_HEAP;
-		put_be32(info->capability_bits, capabilities);
-	}
-	put_be32(info->flags, service_flags(service));
-	put_be32(info->opcode_base, service->opcode_base);
-	put_be32(info->opcode_count, service->opcode_count);
-	put_be32(info->max_inline_payload, sizeof(req->payload));
-	copy_name(info->name, service->name);
+	capabilities = service->capability_bits;
+	if (service->service_id == SDK_SERVICE_CORE)
+		capabilities |= mailbox_capability_bits() &
+			SDK_CAP_APERTURE_LAYOUT;
+	if (service->service_id == SDK_SERVICE_MEMORY)
+		capabilities |= mailbox_capability_bits() &
+			SDK_CAP_HOST_WINDOW_HEAP;
+	sdk_service_write_info(info, service, capabilities, service_flags(service),
+			       sizeof(req->payload));
 	return SDK_STATUS_OK;
 }
 
@@ -8122,9 +7947,36 @@ static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
 	}
 }
 
+/* Zorro III keeps the mailbox out of the shared I/O buffer that USB proxy,
+ * zzsd and firmware-update staging overwrite (issue #129). The bus is fixed
+ * by the bitstream, so the placement never changes under a live client. */
+static void select_mailbox_placement(void)
+{
+	static uint8_t z3_section_uncached;
+
+	if (!sdk_aperture_runtime_is_zorro3()) {
+		mailbox_base = SDK_MAILBOX_Z2_ADDRESS;
+		return;
+	}
+	if (!z3_section_uncached) {
+		/* ax.c remaps this same section for the Z3 direct rings when
+		 * audio starts; remapping it twice is harmless. */
+		Xil_SetTlbAttributes((UINTPTR)SDK_MAILBOX_Z3_ADDRESS,
+		                     NORM_NONCACHE);
+		z3_section_uncached = 1U;
+	}
+	mailbox_base = SDK_MAILBOX_Z3_ADDRESS;
+}
+
+int sdk_mailbox_io_staging_reaches(uint32_t staged_bytes)
+{
+	return mailbox_base == SDK_MAILBOX_Z2_ADDRESS &&
+	       staged_bytes > SDK_MAILBOX_Z2_BUFFER_OFFSET;
+}
+
 void sdk_mailbox_init(void)
 {
-	volatile struct SDKMailboxDescriptor *desc = descriptor();
+	volatile struct SDKMailboxDescriptor *desc;
 
 	/* Drain any in-flight core-1 task before we tear the mailbox down. A task
 	 * still executing on core 1 is mid-write into its resolved data buffers;
@@ -8138,7 +7990,9 @@ void sdk_mailbox_init(void)
 	 * queue and will never post their deferred completion */
 	overlay_scheduler_reset();
 
-	memset((void *)SDK_MAILBOX_ADDRESS, 0, SDK_MAILBOX_TOTAL_SIZE);
+	select_mailbox_placement();
+	desc = descriptor();
+	memset((void *)mailbox_base, 0, SDK_MAILBOX_TOTAL_SIZE);
 	put_be32(desc->magic, SDK_MAILBOX_MAGIC);
 	put_be16(desc->abi_major, SDK_MAILBOX_ABI_MAJOR);
 	put_be16(desc->abi_minor, SDK_MAILBOX_ABI_MINOR);
@@ -8225,7 +8079,7 @@ void sdk_mailbox_init(void)
 	sdk_media_session_init();
 	amiga_interrupt_clear(AMIGA_INTERRUPT_SDK);
 
-	Xil_DCacheFlushRange(SDK_MAILBOX_ADDRESS, SDK_MAILBOX_TOTAL_SIZE);
+	Xil_DCacheFlushRange(mailbox_base, SDK_MAILBOX_TOTAL_SIZE);
 	__asm__ __volatile__("dsb" ::: "memory");
 }
 
@@ -8290,7 +8144,7 @@ void sdk_mailbox_task(void)
 	 * completion ring appear full. ARM-owned descriptor/completion writes
 	 * are flushed at their write sites.
 	 */
-	Xil_DCacheInvalidateRange(SDK_MAILBOX_ADDRESS, SDK_MAILBOX_TOTAL_SIZE);
+	Xil_DCacheInvalidateRange(mailbox_base, SDK_MAILBOX_TOTAL_SIZE);
 	__asm__ __volatile__("dsb" ::: "memory");
 
 	if (!descriptor_valid(desc)) {
@@ -8501,5 +8355,5 @@ uint16_t sdk_mailbox_status(void)
 
 uint32_t sdk_mailbox_address(void)
 {
-	return SDK_MAILBOX_ADDRESS;
+	return (uint32_t)mailbox_base;
 }

@@ -44,8 +44,8 @@ SECTIONS
 .text : {
    KEEP (*(.vectors))
    KEEP (*(.boot))
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text)
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text.*)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_fabric_lease.o *usb_proxy.o *ehci-iso.o *sdk_audio_control.o *usb_proxy_iso.o *video.o *hdmi.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_fabric_lease.o *usb_proxy.o *ehci-iso.o *sdk_audio_control.o *usb_proxy_iso.o *video.o *hdmi.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .text.*)
    *(.gnu.linkonce.t.*)
    *(.plt)
    *(.gnu_warning)
@@ -67,8 +67,8 @@ SECTIONS
 
 .rodata : {
    __rodata_start = .;
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata)
-   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *usb_proxy.o *ehci-iso.o *usb_proxy_iso.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata.*)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *audio_fabric_lease.o *usb_proxy.o *ehci-iso.o *sdk_audio_control.o *usb_proxy_iso.o *video.o *hdmi.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata)
+   *(EXCLUDE_FILE (*LzmaDec.o *Lzma2Dec.o *sdk_compression.o *sdk_image_stream.o *sdk_video_stream.o *sdk_video_plmpeg.o *sdk_video_yuy2.o *audio_convert_tables.o *audio_scene.o *audio_fabric_lease.o *usb_proxy.o *ehci-iso.o *sdk_audio_control.o *usb_proxy_iso.o *video.o *hdmi.o *bearssl/*.o *sdk_crypto.o *lzh/*.o) .rodata.*)
    *(.gnu.linkonce.r.*)
    __rodata_end = .;
 } > ps7_ddr_0
@@ -343,6 +343,48 @@ ASSERT(__z2_direct_ring_end <= (ORIGIN(ps7_ddr_0) + LENGTH(ps7_ddr_0)),
    __audio_tables_end = .;
 } > ps7_ddr_hi
 
+/* Lease poll and ISR catch-up are not boot-path code. The catch-up
+ * handoff grew this object past the low-DDR framebuffer boundary. */
+.audio_lease_text : {
+   . = ALIGN(16);
+   __audio_lease_text_start = .;
+   *audio_fabric_lease.o(.text)
+   *audio_fabric_lease.o(.text.*)
+   *audio_fabric_lease.o(.rodata)
+   *audio_fabric_lease.o(.rodata.*)
+   . = ALIGN(16);
+   __audio_lease_text_end = .;
+} > ps7_ddr_hi
+/* Mailbox audio-control requests run after startup. Keeping this small
+ * control-plane handler in high DDR preserves the fixed low framebuffer. */
+.audio_control_text : {
+   . = ALIGN(16);
+   __audio_control_text_start = .;
+   *sdk_audio_control.o(.text)
+   *sdk_audio_control.o(.text.*)
+   *sdk_audio_control.o(.rodata)
+   *sdk_audio_control.o(.rodata.*)
+   . = ALIGN(16);
+   __audio_control_text_end = .;
+} > ps7_ddr_hi
+
+/* Video/HDMI control growth must not consume the fixed low-DDR
+ * framebuffer. Follow the existing cached high-DDR code placement;
+ * keep mutable control state in the normal data/BSS sections. */
+.video_text : {
+   . = ALIGN(16);
+   __video_text_start = .;
+   *video.o(.text)
+   *video.o(.text.*)
+   *video.o(.rodata)
+   *video.o(.rodata.*)
+   *hdmi.o(.text)
+   *hdmi.o(.text.*)
+   *hdmi.o(.rodata)
+   *hdmi.o(.rodata.*)
+   . = ALIGN(16);
+   __video_text_end = .;
+} > ps7_ddr_hi
 /* USB proxy dispatch and the isochronous scheduler are not boot-path code.
  * Keep them in high DDR so feature growth cannot consume the fixed low-DDR
  * framebuffer boundary. */

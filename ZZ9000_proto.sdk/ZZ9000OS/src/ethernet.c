@@ -39,6 +39,11 @@
 
 static XEmacPs EmacPsInstance;
 
+u32 ethernet_emac_base(void)
+{
+	return EmacPsInstance.Config.BaseAddress;
+}
+
 // could also be 55, 77 (eth1), see interrupts.pdf last page
 // XPS_GEM0_INT_ID == 54
 #define EMACPS_IRPT_INTR	XPS_GEM0_INT_ID
@@ -76,6 +81,7 @@ static volatile int rx_pause_frames = 0;
 static volatile int rx_slot_mismatch = 0;
 static volatile int frames_ack_rejected = 0;	/* issue #29: RX-accept handshake rejects */
 
+
 #define ETH_PHY_TYPE_MICREL 0
 #define ETH_PHY_TYPE_MOTORCOMM 1
 static int eth_phy_type = ETH_PHY_TYPE_MICREL;
@@ -111,7 +117,7 @@ static void XEmacPsRecvHandler(void *Callback);
 static void XEmacPsErrorHandler(void *Callback, u8 direction, u32 word);
 LONG setup_phy(XEmacPs * EmacPsInstancePtr);
 static LONG EmacPsSetupIntrSystem(XEmacPs *EmacPsInstancePtr, u16 EmacPsIntrId);
-static void ethernet_clear_host_state();
+void ethernet_clear_host_state(void);
 static int ethernet_prepare_rx_bd(XEmacPs_BdRing *rxring, XEmacPs_Bd *rxbd);
 
 #define XEMACPS_BD_TO_INDEX(ringptr, bdptr)				\
@@ -434,14 +440,12 @@ int ethernet_init() {
 	return XST_SUCCESS;
 }
 
-enum {
-	ETH_TASK_SETUP,
-	ETH_TASK_NEGOTIATE,
-	ETH_TASK_INIT,
-	ETH_TASK_READY
-};
 
 int ethernet_task_state = ETH_TASK_SETUP;
+/* Set only when init_ethernet_buffers() (which also starts the EMAC)
+ * succeeded; the task state machine reaches READY regardless, so the
+ * link-ready register bit requires both. */
+int ethernet_hw_ready = 0;
 
 #define ETH_RX_INTERRUPT_MASK (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RX_ERR_MASK)
 /*
@@ -463,7 +467,7 @@ static u16 ethernet_backlog_pending()
 	return frames_backlog + frames_backlog_reserved;
 }
 
-static int ethernet_pause_rx_irq()
+int ethernet_pause_rx_irq(void)
 {
 	if (ethernet_task_state != ETH_TASK_READY) {
 		return 0;
@@ -473,7 +477,7 @@ static int ethernet_pause_rx_irq()
 	return 1;
 }
 
-static void ethernet_resume_rx_irq(int paused)
+void ethernet_resume_rx_irq(int paused)
 {
 	if (paused) {
 		XEmacPs_IntEnable(&EmacPsInstance, ETH_RX_INTERRUPT_MASK);
@@ -495,7 +499,7 @@ static void ethernet_send_pause_frame()
 	}
 }
 
-static void ethernet_log_status(const char *reason) {
+void ethernet_log_status(const char *reason) {
 #if ETH_DEBUG_VERBOSE
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	u32 BaseAddress = EmacPsInstancePtr->Config.BaseAddress;
@@ -554,7 +558,7 @@ static void ethernet_log_status(const char *reason) {
 #endif
 }
 
-static void ethernet_clear_host_state() {
+void ethernet_clear_host_state(void) {
 	frames_backlog = 0;
 	frames_backlog_read = 0;
 	frames_backlog_write = 0;
@@ -582,7 +586,7 @@ static void ethernet_clear_host_state() {
 	mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG4, 0);
 }
 
-static int ethernet_restart_dma(const char *reason) {
+int ethernet_restart_dma(const char *reason) {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	u32 BaseAddress = EmacPsInstancePtr->Config.BaseAddress;
 
@@ -615,28 +619,21 @@ static int ethernet_restart_dma(const char *reason) {
 	return XST_SUCCESS;
 }
 
-void ethernet_reset_for_amiga() {
-	ethernet_log_status("amiga-reset-before");
-
-	if (ethernet_task_state == ETH_TASK_READY) {
-		ethernet_restart_dma("amiga-reset");
-	} else {
-		int paused = ethernet_pause_rx_irq();
-		ethernet_clear_host_state();
-		ethernet_resume_rx_irq(paused);
-	}
-
-	ethernet_log_status("amiga-reset-after");
-}
 
 void ethernet_task() {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 
 	if (ethernet_task_state == ETH_TASK_SETUP) {
-		// FIXME
-		EmacPsSetupIntrSystem(EmacPsInstancePtr, EMACPS_IRPT_INTR);
+		LONG intr_status = EmacPsSetupIntrSystem(EmacPsInstancePtr,
+		                                          EMACPS_IRPT_INTR);
 
-		ethernet_task_state = ETH_TASK_NEGOTIATE;
+		/* Without the EMAC interrupt connected, RX/TX cannot work and
+		 * a later successful init_ethernet_buffers() must not make
+		 * the link-ready register claim a usable interface. Stay in
+		 * SETUP instead; the task retries on its next pass. */
+		if (intr_status == XST_SUCCESS) {
+			ethernet_task_state = ETH_TASK_NEGOTIATE;
+		}
 	} else if (ethernet_task_state == ETH_TASK_NEGOTIATE) {
 		int complete = micrel_auto_negotiate_step2(EmacPsInstancePtr, PhyAddr);
 
@@ -650,6 +647,8 @@ void ethernet_task() {
 		u16 status = init_ethernet_buffers();
 		if (status != XST_SUCCESS) {
 			printf("EMAC: init_ethernet_buffers() error\n");
+		} else {
+			ethernet_hw_ready = 1;
 		}
 
 		ethernet_task_state = ETH_TASK_READY;

@@ -7,7 +7,7 @@
 #   zz9000-firmware-<tag>-<variant>/ZZ9000.CFG
 #
 # CI can only package variants that already have a committed bitstream.
-# All seven committed bitstreams contain the current hardware ABI, including
+# All nine committed bitstreams contain the current hardware ABI, including
 # the native overlay and ZZ9000AX capture paths, so every archive uses the
 # same current firmware ELF. The separately built legacy-bitstream ELF remains
 # available for manual compatibility packages that retain an older bitstream.
@@ -102,8 +102,8 @@ if [ ! -f ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf ]; then
 fi
 
 variant_defs=(
-    "zorro3|bootimage_work/zz9000_ps_wrapper.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|Zorro III, A3000/A4000"
-    "zorro3-nofast|bootimage_work/variants/zz9000_ps_wrapper-zorro3-nofast.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|Zorro III, A3000/A4000, no Zorro RAM"
+    "zorro3|bootimage_work/zz9000_ps_wrapper.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|Zorro III, A3000/A4000, E7M capture"
+    "zorro3-aga|bootimage_work/variants/zz9000_ps_wrapper-zorro3-aga.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|A4000/A4000T AGA video-slot capture, Zorro III Fast RAM"
     "zorro2|bootimage_work/variants/zz9000_ps_wrapper-zorro2.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|Zorro II 4MB, A2000"
     "zorro2-2mb|bootimage_work/variants/zz9000_ps_wrapper-zorro2-2mb.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|Zorro II 2MB, A2000"
     "a500|bootimage_work/variants/zz9000_ps_wrapper-a500.bit|ZZ9000_proto.sdk/ZZ9000OS/build/ZZ9000OS.elf|A500 4MB, ZZ9500CX Denise adapter"

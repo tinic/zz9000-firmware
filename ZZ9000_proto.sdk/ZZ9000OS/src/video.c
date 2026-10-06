@@ -17,6 +17,7 @@
 /* kept after the Xilinx headers: overlay.h pulls in gfx.h (see the
  * pack note on struct GFXData) */
 #include "overlay.h"
+#include "overlay_hw.h"
 
 #define VDMA_DEVICE_ID	XPAR_AXIVDMA_0_DEVICE_ID
 
@@ -47,19 +48,49 @@ int sprite_request_pos_x = 0;
 int sprite_request_pos_y = 0;
 
 static uint32_t output_source_sync;
+static uint32_t output_scale_control;
+static uint32_t output_viewport_pos;
+static uint32_t output_viewport_size;
+static int output_viewport_explicit;
+static int videocap_rows_applied = -1;
+static int videocap_words_applied = -1;
 void _update_hw_sprite_pos(int16_t x, int16_t y);
 void _clip_hw_sprite(int16_t offset_x, int16_t offset_y);
 static int video_mode_init_internal(int mode, int scalemode, int colormode,
 		int skip_vdma, int output_profile, int transactional);
+static int videocap_geometry_valid(uint16_t width, uint16_t height)
+{
+	return (!width || video_videocap_width_valid(width)) &&
+		(!height || video_videocap_height_valid(height));
+}
+
+static void videocap_geometry_commit(uint16_t width, uint16_t height)
+{
+	vs.videocap_geometry_applied_width = width;
+	vs.videocap_geometry_applied_height = height;
+	vs.videocap_geometry_applied_serial =
+		vs.videocap_geometry_request_serial;
+	vs.videocap_geometry_applied_valid = 1;
+}
 
 /* Capture-area scanout origin for the detected standard and requested
  * base mode. One derivation for every capture-area VDMA start, so a
  * stale legacy native-pan write from the host driver (its constant is
  * tuned for PAL 800x600 only) can never wrap NTSC lines (#84). */
-static uint32_t videocap_scanout_pan_offset(int ntsc, int full_width)
+static uint32_t videocap_scanout_pan_offset(int ntsc, int full_width,
+		int source_class)
 {
+	uint32_t base_mode = (uint32_t)vs.videocap_video_mode;
+
+	/* The tuned pre-row origin belongs only to a 15 kHz filtered
+	 * 800x600 canvas. A short-line source is shown on 720x480/576
+	 * even when the configured base stays 800x600, and that origin
+	 * would prepend the previous capture row. */
+	if (source_class & VIDEO_VIDEOCAP_SOURCE_SHORT)
+		base_mode = ntsc ? ZZVMODE_720x480 : ZZVMODE_720x576;
+
 	return video_videocap_scanout_pan_base((uint32_t)ntsc,
-		(uint32_t)full_width, (uint32_t)vs.videocap_video_mode);
+		(uint32_t)full_width, base_mode);
 }
 
 static int isr_flush_count = 0;
@@ -76,12 +107,16 @@ static void videocap_detection_reset() {
 		video_formatter_write(0, MNTVF_OP_SOURCE_SYNC);
 	vs.videocap_ntsc_old = -1;
 	vs.videocap_shres_old = -1;
+	vs.videocap_source_class_old = -1;
 	vs.interlace_old = -1;
 	vs.videocap_video_mode_applied = -1;
 	vs.videocap_output_profile_applied = -1;
+	vs.videocap_ns_vsync_applied = -1;
 	/* Unknown again: the sampler may have been reconfigured while the
 	 * videocap area was not being viewed. */
 	vs.videocap_full_width_applied = -1;
+	videocap_rows_applied = -1;
+	videocap_words_applied = -1;
 	video_videocap_detection_reset(&vs.videocap_detection);
 }
 
@@ -135,6 +170,28 @@ struct ZZ_VIDEO_STATE* video_init() {
 		vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC] = cfg->ns_vsync;
 		vs.scandoubler_mode_adjust = (cfg->ns_vsync == 2) ? 2 : 0;
 	}
+	/* The persisted override needs the viewport path exactly like the
+	 * runtime setter: on a legacy bitstream the formatter keeps its
+	 * implicit full-canvas layout, so a narrowed VDMA window would
+	 * scan rows capture never refreshed. The calibration UI is not
+	 * advertised there either (capability bits 8/10 follow REG3 bit
+	 * 15), so the automatic window is the documented fallback. */
+	if ((mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3) &
+			MNTZORRO_STATUS_VCAP_VIEWPORT) != 0U) {
+		if (cfg->videocap_width_present &&
+				video_videocap_width_valid(cfg->videocap_width))
+			vs.videocap_width_override = cfg->videocap_width;
+		if (cfg->videocap_height_present &&
+				video_videocap_height_valid(cfg->videocap_height))
+			vs.videocap_height_override = cfg->videocap_height;
+	}
+	/* Treat the boot configuration as the first request. It remains pending
+	 * until a stable native vblank has successfully programmed the VDMA. */
+	vs.videocap_geometry_requested_width =
+		(uint16_t)vs.videocap_width_override;
+	vs.videocap_geometry_requested_height =
+		(uint16_t)vs.videocap_height_override;
+	vs.videocap_geometry_request_serial = 1;
 
 	vs.colormode = 0;
 
@@ -163,8 +220,55 @@ void video_reset() {
 
 uint8_t stride_div = 1;
 
+/* Runtime scanout-geometry snapshot for the config-key diagnostics
+ * (keys 21-25): what the last video_mode_init actually programmed.
+ * Written in video_mode_init_internal; read via video_rtg_diag_value. */
+static struct {
+	uint16_t line_bytes;
+	uint16_t stride;
+	uint16_t pan_width;
+	uint16_t mode;
+	uint16_t colormode;
+	uint16_t scalemode;
+	uint16_t hsize;
+	uint16_t hdiv;
+	uint16_t stride_div;
+	uint8_t valid;
+} video_geom_diag;
+
+uint16_t video_rtg_diag_value(uint16_t key, uint8_t *present)
+{
+	if (present)
+		*present = 0;
+	if (!video_geom_diag.valid)
+		return 0;
+	switch (key) {
+	case ZZ_CONFIG_KEY_RTG_GEOM_LINE:
+		if (present) *present = 1;
+		return video_geom_diag.line_bytes;
+	case ZZ_CONFIG_KEY_RTG_GEOM_STRIDE:
+		if (present) *present = 1;
+		return video_geom_diag.stride;
+	case ZZ_CONFIG_KEY_RTG_GEOM_PAN:
+		if (present) *present = 1;
+		return video_geom_diag.pan_width;
+	case ZZ_CONFIG_KEY_RTG_GEOM_INFO:
+		if (present) *present = 1;
+		return (uint16_t)(((video_geom_diag.hdiv & 7U) << 13) |
+		                  ((video_geom_diag.stride_div & 3U) << 11) |
+		                  (video_geom_diag.hsize & 0x7FFU));
+	case ZZ_CONFIG_KEY_RTG_GEOM_MODESEL:
+		if (present) *present = 1;
+		return (uint16_t)(((video_geom_diag.colormode & 0x3FU) << 10) |
+		                  ((video_geom_diag.scalemode & 3U) << 8) |
+		                  (video_geom_diag.mode & 0xFFU));
+	default:
+		return 0;
+	}
+}
+
 // 32bit: hdiv=1, 16bit: hdiv=2, 8bit: hdiv=4, ...
-int init_vdma(int hsize, int vsize, int hdiv, int vdiv, u32 bufpos) {
+int init_vdma(int hsize, int source_rows, int hdiv, u32 bufpos) {
 	int status;
 	XAxiVdma_Config *Config;
 
@@ -183,7 +287,7 @@ int init_vdma(int hsize, int vsize, int hdiv, int vdiv, u32 bufpos) {
 	if (status != XST_SUCCESS) {
 		printf("VDMA Configuration Initialization failed, status: 0x%X\r\n",
 				status);
-		//return status;
+		return status;
 	}
 
 	//printf("VDMA MM2S DRE: %d\n", vdma.HasMm2SDRE);
@@ -196,9 +300,9 @@ int init_vdma(int hsize, int vsize, int hdiv, int vdiv, u32 bufpos) {
 
 	XAxiVdma_DmaSetup ReadCfg;
 
-	//printf("VDMA HDIV: %d VDIV: %d\n", hdiv, vdiv);
+	//printf("VDMA HDIV: %d ROWS: %d\n", hdiv, source_rows);
 
-	ReadCfg.VertSizeInput = vsize / vdiv;
+	ReadCfg.VertSizeInput = source_rows;
 	ReadCfg.HoriSizeInput = line_bytes; // note: changing this breaks the output
 	ReadCfg.Stride = stride; // note: changing this is not a problem
 	ReadCfg.FrameDelay = 0; /* This example does not test frame delay */
@@ -279,9 +383,82 @@ int video_set_videocap_vsync(uint32_t setting)
 
 	vs.scandoubler_mode_adjust = setting == 2U ? 2 : 0;
 	vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC] = setting;
+	/* The ISR's mode predicate does not otherwise see this flag, so a
+	 * stable 15 kHz picture would keep the previous cadence. */
+	vs.videocap_ns_vsync_applied = -1;
 	vs.videocap_output_profile_requested = ZZ_VIDEOCAP_OUTPUT_FULL_60;
 	return 1;
 }
+
+int video_set_videocap_geometry(uint16_t width, uint16_t height)
+{
+	if ((mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3) &
+			MNTZORRO_STATUS_VCAP_VIEWPORT) == 0U ||
+			!videocap_geometry_valid(width, height)) {
+		vs.videocap_geometry_rejected = 1;
+		return 0;
+	}
+
+	uint32_t irq_state = smp_local_irq_save();
+
+	vs.videocap_geometry_requested_width = width;
+	vs.videocap_geometry_requested_height = height;
+	vs.videocap_width_override = width;
+	vs.videocap_height_override = height;
+	vs.videocap_geometry_rejected = 0;
+	/* Every accepted request invalidates the ACK: the 16-bit serial
+	 * wraps after 65536 updates and can alias the applied value, so
+	 * validity — not the serial alone — must gate the reconfigure. */
+	vs.videocap_geometry_applied_valid = 0;
+	/* Serial last: the ISR must not ACK a mixed width/height pair. */
+	vs.videocap_geometry_request_serial++;
+	smp_local_irq_restore(irq_state);
+	return 1;
+}
+
+uint16_t video_videocap_geometry_value(uint16_t key, uint16_t *present)
+{
+	uint16_t value = 0;
+
+	if (present)
+		*present = 1;
+	switch (key) {
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_REQUEST_WIDTH:
+		value = vs.videocap_geometry_requested_width;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_REQUEST_HEIGHT:
+		value = vs.videocap_geometry_requested_height;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_APPLIED_WIDTH:
+		value = vs.videocap_geometry_applied_width;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_APPLIED_HEIGHT:
+		value = vs.videocap_geometry_applied_height;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_REQUEST_SERIAL:
+		value = vs.videocap_geometry_request_serial;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_APPLIED_SERIAL:
+		value = vs.videocap_geometry_applied_serial;
+		break;
+	case ZZ_CONFIG_KEY_VCAP_GEOMETRY_STATUS:
+		if (vs.videocap_geometry_applied_valid)
+			value |= ZZ_VCAP_GEOMETRY_STATUS_APPLIED_VALID;
+		if (!vs.videocap_geometry_applied_valid ||
+		    vs.videocap_geometry_applied_serial !=
+			vs.videocap_geometry_request_serial)
+			value |= ZZ_VCAP_GEOMETRY_STATUS_PENDING;
+		if (vs.videocap_geometry_rejected)
+			value |= ZZ_VCAP_GEOMETRY_STATUS_REJECTED;
+		break;
+	default:
+		if (present)
+			*present = 0;
+		break;
+	}
+	return value;
+}
+
 
 uint32_t video_firmware_capabilities(void)
 {
@@ -291,6 +468,11 @@ uint32_t video_firmware_capabilities(void)
 	uint32_t fullrate_capable =
 		!!(zstate & MNTZORRO_STATUS_VCAP_FULLRATE);
 	uint32_t capabilities = ZZ_FW_CAPABILITIES;
+	if (viewport_layout_capable)
+		capabilities |= ZZ_FW_CAP_VIDEOCAP_GEOMETRY |
+		                ZZ_FW_CAP_VIDEOCAP_GEOMETRY_ACK;
+	if (videocap_stats_hw_present())
+		capabilities |= ZZ_FW_CAP_VIDEOCAP_STATS;
 
 	if (video_videocap_centered_eligible(viewport_layout_capable,
 			fullrate_capable)) {
@@ -306,8 +488,19 @@ uint32_t video_firmware_capabilities(void)
 	return capabilities;
 }
 
-static void init_filtered_videocap_video_mode(int ntsc) {
+static void init_filtered_videocap_video_mode(int ntsc, int source_class) {
 	int mode;
+
+	/* A doubled-scan or 24 kHz source has its rows already: 720x576 (or
+	 * 720x480 when the woven frame fits 480) at x1, no line doubling.
+	 * The non-standard-VSync 50 / 60 Hz variants are 15 kHz cadences and
+	 * are not offered for it. */
+	if (source_class & VIDEO_VIDEOCAP_SOURCE_SHORT) {
+		mode = ntsc ? ZZVMODE_720x480 : ZZVMODE_720x576;
+		video_mode_init_internal(mode, 0, MNTVA_COLOR_32BIT, 1,
+			ZZ_VIDEOCAP_OUTPUT_FULL_60, 0);
+		return;
+	}
 
 	if (ntsc) {
 		mode = ZZVMODE_720x480;
@@ -327,8 +520,9 @@ static void init_filtered_videocap_video_mode(int ntsc) {
 }
 
 static void init_videocap_video_mode(int ntsc, int full_width,
-		int output_profile) {
+		int output_profile, int source_class) {
 	int mode = ZZVMODE_1280x1024_NATIVE_60;
+	int scalemode = 4;
 
 	if (video_videocap_output_profile_centered(output_profile)) {
 		if (output_profile == ZZ_VIDEOCAP_OUTPUT_CENTERED_1080P_MATCH) {
@@ -348,15 +542,21 @@ static void init_videocap_video_mode(int ntsc, int full_width,
 		return;
 	}
 	if (!full_width) {
-		init_filtered_videocap_video_mode(ntsc);
+		init_filtered_videocap_video_mode(ntsc, source_class);
 		return;
 	}
-	if (vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC]) {
+	if (source_class & VIDEO_VIDEOCAP_SOURCE_SHORT) {
+		/* 1280x1024 at 60 Hz for every short-line source: pixel-doubled
+		 * on the doubled-scan ones, rows x2 while they fit (see
+		 * video_videocap_scalemode). */
+		scalemode = (int)video_videocap_scalemode(1U, 0U,
+			(uint32_t)source_class);
+	} else if (vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC]) {
 		mode = ntsc ? ZZVMODE_1280x1024_NS_NTSC :
 		              ZZVMODE_1280x1024_NS_PAL;
 	}
 
-	video_mode_init_internal(mode, 4, MNTVA_COLOR_32BIT, 1,
+	video_mode_init_internal(mode, scalemode, MNTVA_COLOR_32BIT, 1,
 		ZZ_VIDEOCAP_OUTPUT_FULL_60, 0);
 }
 
@@ -402,6 +602,17 @@ void video_formatter_write(uint32_t data, uint16_t op) {
 	VF_DLY;
 	if (op == MNTVF_OP_SOURCE_SYNC)
 		output_source_sync = data;
+	if (op == MNTVF_OP_SCALE)
+		output_scale_control = data;
+	if (op == MNTVF_OP_VIEWPORT_POS)
+		output_viewport_pos = data;
+	if (op == MNTVF_OP_VIEWPORT_SIZE_COMMIT) {
+		output_viewport_size = data;
+		output_viewport_explicit = 1;
+	}
+	if (op == MNTVF_OP_DIMENSIONS &&
+			(data & MNTVF_DIMENSIONS_VIEWPORT_CONTAINER_FLAG) == 0U)
+		output_viewport_explicit = 0;
 	smp_local_irq_restore(irq_state);
 }
 
@@ -417,12 +628,35 @@ void video_set_dpms(uint8_t level) {
 // vblank + raster position interrupt
 void isr_video(void *dummy) {
 	u32 zstate = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3);
+	u32 live_raw = mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG2);
+	uint32_t videocap_live_rows = 0U;
+	uint32_t videocap_live_words = 0U;
+
+	if ((live_raw & MNTZORRO_REG2_LIVE_GEOMETRY_MASK) ==
+	    MNTZORRO_REG2_LIVE_GEOMETRY_MAGIC) {
+		videocap_live_rows = live_raw &
+			MNTZORRO_REG2_LIVE_GEOMETRY_ROWS_MASK;
+		videocap_live_words = (live_raw >>
+			MNTZORRO_REG2_LIVE_GEOMETRY_WORDS_SHIFT) &
+			MNTZORRO_REG2_LIVE_GEOMETRY_WORDS_MASK;
+	}
 
 	int vblank = !!(zstate & (1 << 21));
 	int videocap_enabled = !!(zstate & (1 << 23));
 	int videocap_ntsc = !!(zstate & (1 << 22));
 	int interlace = !!(zstate & (1 << 24));
 	int videocap_shres = !!(zstate & (1 << 17));
+	/* [12] doubled scan, [11] short line, [10] tall frame: the line class
+	 * the sampler measured (bitstreams before this change read zero
+	 * here and keep the 15 kHz behaviour). */
+	int videocap_source_class =
+		((zstate & (1 << 11)) ? VIDEO_VIDEOCAP_SOURCE_SHORT : 0) |
+		((zstate & (1 << 12)) ? VIDEO_VIDEOCAP_SOURCE_DOUBLED : 0) |
+		((zstate & (1 << 10)) ? VIDEO_VIDEOCAP_SOURCE_TALL : 0) |
+		/* [9:8] row-count class: the woven frame shape, so the scanout
+		 * picks a canvas-filling power-of-two (0 on pre-class
+		 * bitstreams - handled as the x2 fallback). */
+		(int)(((zstate >> 8) & 3U) << VIDEO_VIDEOCAP_ROWS_CLASS_SHIFT);
 	int videocap_full_width = videocap_full_width_enabled(zstate);
 	int videocap_output_profile = videocap_effective_output_profile(zstate);
 
@@ -436,7 +670,7 @@ void isr_video(void *dummy) {
 				if (vs.card_feature_enabled[CARD_FEATURE_SECONDARY_PALETTE]) {
 					video_formatter_write(1, MNTVF_OP_PALETTE_SEL);
 				}
-				init_vdma(vs.vmode_hsize, vs.vmode_vsize, vs.vmode_hdiv, vs.vmode_vdiv,
+				init_vdma(vs.vmode_hsize, vs.vmode_vdma_rows, vs.vmode_hdiv,
 						(u32)vs.framebuffer + vs.bgbuf_offset);
 			}
 		} else {
@@ -447,7 +681,7 @@ void isr_video(void *dummy) {
 			// P96 video overlay: present a composited shadow buffer
 			// instead of the framebuffer while the overlay is active
 			// (returns the regular pan address otherwise)
-			init_vdma(vs.vmode_hsize, vs.vmode_vsize, vs.vmode_hdiv, vs.vmode_vdiv,
+			init_vdma(vs.vmode_hsize, vs.vmode_vdma_rows, vs.vmode_hdiv,
 					overlay_present_bufpos(&vs));
 		}
 		vs.videocap_enabled_old = 0;
@@ -472,10 +706,10 @@ void isr_video(void *dummy) {
 				vs.framebuffer_pan_offset =
 					videocap_scanout_pan_offset(
 						videocap_ntsc,
-						videocap_full_width);
+						videocap_full_width,
+						videocap_source_class);
 			}
-			init_vdma(vs.vmode_hsize, vs.vmode_vsize, vs.vmode_hdiv,
-					vs.vmode_vdiv,
+			init_vdma(vs.vmode_hsize, vs.vmode_vdma_rows, vs.vmode_hdiv,
 					(u32)vs.framebuffer + vs.framebuffer_pan_offset);
 			overlay_scanout_released();
 		}
@@ -501,14 +735,19 @@ void isr_video(void *dummy) {
 						video_videocap_detection_stable(
 								&vs.videocap_detection, videocap_ntsc, interlace,
 								videocap_shres, vs.videocap_video_mode,
-								videocap_output_profile);
+								videocap_output_profile,
+								videocap_source_class);
 
 				if (videocap_detection_stable &&
 						(videocap_ntsc != vs.videocap_ntsc_old ||
+						 videocap_source_class !=
+							 vs.videocap_source_class_old ||
 						 vs.videocap_video_mode !=
 							 vs.videocap_video_mode_applied ||
 						 videocap_output_profile !=
 							 vs.videocap_output_profile_applied ||
+						 vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC] !=
+							 (uint8_t)vs.videocap_ns_vsync_applied ||
 						 videocap_reset)) {
 					// change between ntsc+pal
 					videocap_area_clear();
@@ -535,36 +774,75 @@ void isr_video(void *dummy) {
 
 					vs.framebuffer_pan_width = 0;
 					vs.framebuffer_pan_offset = videocap_scanout_pan_offset(
-						videocap_ntsc, videocap_full_width);
+						videocap_ntsc, videocap_full_width,
+						videocap_source_class);
 					if (videocap_ntsc) {
 						// NTSC
-						printf("videocap: ntsc\n");
+						printf("videocap: ntsc (class %d)\n",
+							videocap_source_class);
 						init_videocap_video_mode(1, videocap_full_width,
-							videocap_output_profile);
+							videocap_output_profile,
+							videocap_source_class);
 					} else {
 						// PAL
-						printf("videocap: pal\n");
+						printf("videocap: pal (class %d)\n",
+							videocap_source_class);
 						init_videocap_video_mode(0, videocap_full_width,
-							videocap_output_profile);
+							videocap_output_profile,
+							videocap_source_class);
 					}
 					vs.videocap_video_mode_applied =
 						vs.videocap_video_mode;
 					vs.videocap_output_profile_applied =
 						videocap_output_profile;
+					vs.videocap_ns_vsync_applied =
+						vs.card_feature_enabled[CARD_FEATURE_NONSTANDARD_VSYNC];
 					videocap_reset = 1;
 				}
 
+				uint32_t videocap_source_rows =
+						video_videocap_source_rows(
+							vs.vmode_vsize,
+							(uint32_t)videocap_full_width,
+							(uint32_t)videocap_ntsc,
+							(uint32_t)interlace,
+							(uint32_t)videocap_source_class,
+							vs.videocap_height_override,
+							videocap_live_rows);
+				/* Compare the resolved DMA height, not the raw field
+				 * count. Interlaced short fields alternate N/N+1,
+				 * which resolves to heights two rows apart; both
+				 * the clamped bucket and that alternation must
+				 * stay quiet, or a stable picture blanks every
+				 * field. A real source change moves tens of rows
+				 * or crosses a class bucket. */
+				int videocap_rows_delta =
+					(int)videocap_source_rows -
+					videocap_rows_applied;
+				int videocap_rows_changed = interlace
+					? (videocap_rows_delta > 2 ||
+					   videocap_rows_delta < -2)
+					: (videocap_rows_delta != 0);
 				if (videocap_detection_stable &&
-						(interlace != vs.interlace_old || videocap_reset)) {
+						(interlace != vs.interlace_old || videocap_reset ||
+						 !vs.videocap_geometry_applied_valid ||
+						 vs.videocap_geometry_applied_serial !=
+							vs.videocap_geometry_request_serial ||
+						 (videocap_live_rows != 0U &&
+						  videocap_rows_changed) ||
+						 (videocap_live_words != 0U &&
+						  (int)videocap_live_words !=
+							videocap_words_applied))) {
 					if (videocap_output_profile ==
 					    ZZ_VIDEOCAP_OUTPUT_CENTERED_1080P_MATCH)
 						video_formatter_write(0, MNTVF_OP_SOURCE_SYNC);
 					// interlace has changed, we need to reconfigure vdma for the new screen height
 					uint32_t videocap_scalemode = video_videocap_scalemode(
 							(uint32_t)videocap_full_width,
-							(uint32_t)interlace);
+							(uint32_t)interlace,
+							(uint32_t)videocap_source_class);
 					vs.scalemode = (int)videocap_scalemode;
-					vs.vmode_vdiv = (int)video_vertical_scale_factor(videocap_scalemode);
+					vs.vmode_vdma_rows = videocap_source_rows;
 					/* The mode-change trigger above may have run
 					 * several vblanks earlier; a host driver pan
 					 * write that landed since then must not leak
@@ -579,12 +857,86 @@ void isr_video(void *dummy) {
 					vs.framebuffer_pan_offset =
 						videocap_scanout_pan_offset(
 							videocap_ntsc,
-							videocap_full_width);
+							videocap_full_width,
+							videocap_source_class);
 					videocap_area_clear();
-					video_formatter_write(video_formatter_scale_control(videocap_scalemode),
-					                      MNTVF_OP_SCALE);
-					init_vdma(vs.vmode_hsize, vs.vmode_vsize, 1, vs.vmode_vdiv,
-							(u32)vs.framebuffer + vs.framebuffer_pan_offset);
+					{
+						/* Fullscan scales vertically by an
+						 * integer factor: publish the exact
+						 * content rectangle so the formatter
+						 * duplicates rows uniformly and
+						 * letterboxes the remainder. Every
+						 * fullscan transition rewrites it, so
+						 * PAL also restores the full raster
+						 * after an NTSC letterbox without
+						 * relying on mode-change side
+						 * effects. A filtered override is
+						 * centered in the active mode canvas
+						 * (800x600 / 720x480 / 720x576), not
+						 * the 1280x1024 fullscan box. */
+						struct video_videocap_scanout_rect rect =
+							video_videocap_fullscan_rect(
+								(uint32_t)videocap_output_profile,
+								(uint32_t)videocap_full_width,
+								(uint32_t)videocap_ntsc,
+								(uint32_t)interlace,
+								(uint32_t)videocap_source_class,
+								vs.videocap_width_override,
+								vs.videocap_height_override,
+								videocap_source_rows,
+								videocap_live_words,
+								videocap_full_width ? 0U :
+									(uint32_t)vs.vmode_hsize,
+								videocap_full_width ? 0U :
+									(uint32_t)vs.vmode_vsize);
+
+						video_formatter_write(
+								(rect.y << 16) | rect.x,
+								MNTVF_OP_VIEWPORT_POS);
+						video_formatter_write(
+								(rect.height << 16) |
+									rect.width,
+								MNTVF_OP_VIEWPORT_SIZE_COMMIT);
+					}
+					video_formatter_write(
+							video_videocap_scale_control(
+								(uint32_t)videocap_full_width,
+								(uint32_t)videocap_ntsc,
+								(uint32_t)interlace,
+								(uint32_t)videocap_source_class),
+							MNTVF_OP_SCALE);
+					/* hdiv is the color-depth divider (32-bit: 1).
+					 * SCALEX repeats pixels in the formatter without
+					 * changing source-row pitch, so fullscan VDMA reads
+					 * complete 32-bit rows.
+					 *
+					 * A short source without pixel repeat completes its
+					 * lines before the 1280-word pitch: the writeback
+					 * row keeps the fixed pitch, so both the fetch and
+					 * the shown viewport must stop at the measured
+					 * width or the tail shows the previous line. */
+					uint16_t geometry_width = (uint16_t)vs.vmode_hsize;
+					if (videocap_full_width &&
+							(videocap_source_class &
+							 VIDEO_VIDEOCAP_SOURCE_SHORT) &&
+							!(videocap_source_class &
+							 VIDEO_VIDEOCAP_SOURCE_DOUBLED) &&
+							videocap_live_words != 0U &&
+							videocap_live_words < geometry_width)
+						geometry_width = (uint16_t)videocap_live_words;
+					if (vs.videocap_geometry_requested_width &&
+					    vs.videocap_geometry_requested_width < geometry_width)
+						geometry_width = vs.videocap_geometry_requested_width;
+					uint16_t geometry_height = (uint16_t)vs.vmode_vdma_rows;
+					vs.framebuffer_pan_width = (uint32_t)vs.vmode_hsize;
+					if (init_vdma(geometry_width, geometry_height, 1,
+							(u32)vs.framebuffer + vs.framebuffer_pan_offset) ==
+						XST_SUCCESS) {
+						videocap_geometry_commit(geometry_width, geometry_height);
+						videocap_rows_applied = (int)videocap_source_rows;
+						videocap_words_applied = (int)videocap_live_words;
+					}
+					vs.framebuffer_pan_width = 0;
 					video_formatter_valign();
 					/* Both first entry and x2/x4 transitions must finish
 					 * VDMA setup before acquisition can show content. */
@@ -598,6 +950,7 @@ void isr_video(void *dummy) {
 					vs.interlace_old = interlace;
 					vs.videocap_ntsc_old = videocap_ntsc;
 					vs.videocap_shres_old = videocap_shres;
+					vs.videocap_source_class_old = videocap_source_class;
 				}
 			}
 		} else {
@@ -778,7 +1131,6 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 	 * output word for word. */
 	static struct zz_video_mode output_mode;
 	static uint32_t output_dimensions_control;
-	static uint32_t output_viewport_pos, output_viewport_size;
 	static int output_colormode;
 	static int output_mode_valid;
 	int prev_mode = vs.video_mode;
@@ -787,6 +1139,10 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 	int prev_interlace_old = vs.interlace_old;
 	uint8_t prev_stride_div = stride_div;
 	uint32_t prev_source_sync = output_source_sync;
+	uint32_t prev_scale_control = output_scale_control;
+	uint32_t prev_viewport_pos = output_viewport_pos;
+	uint32_t prev_viewport_size = output_viewport_size;
+	int prev_viewport_explicit = output_viewport_explicit;
 	uint8_t prev_dpms = vs.card_feature_enabled[CARD_FEATURE_DPMS];
 	printf("video_mode_init: %d color: %d scale: %d\n", mode, colormode, scalemode);
 
@@ -801,7 +1157,9 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 	int vdiv = (int)video_vertical_scale_factor((uint32_t)scalemode);
 	stride_div = 1;
 
-	if (scalemode & 1) {
+	/* Native capture repeats pixels in the formatter; its VDMA must keep
+	 * the 32-bit content pitch. RTG modes still use SCALEX to halve fetch. */
+	if ((scalemode & 1) && !skip_vdma) {
 		hdiv = 2;
 		stride_div = 2;
 	}
@@ -896,10 +1254,15 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 				MNTVF_OP_MAX);
 			video_formatter_write(output_dimensions_control,
 				MNTVF_OP_DIMENSIONS);
-			if (output_dimensions_control & MNTVF_DIMENSIONS_VIEWPORT_CONTAINER_FLAG) {
-				video_formatter_write(output_viewport_pos,
+			/* Replay an explicit viewport only when the previous
+			 * mode installed one. Ordinary RTG leaves the formatter
+			 * on the implicit full-canvas rectangle; writing the
+			 * last native rectangle (or the zero boot value) clips
+			 * that picture. */
+			if (prev_viewport_explicit) {
+				video_formatter_write(prev_viewport_pos,
 					MNTVF_OP_VIEWPORT_POS);
-				video_formatter_write(output_viewport_size,
+				video_formatter_write(prev_viewport_size,
 					MNTVF_OP_VIEWPORT_SIZE_COMMIT);
 			}
 			video_formatter_write(
@@ -910,9 +1273,7 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 				MNTVF_OP_VS);
 			video_formatter_write(output_mode.polarity,
 				MNTVF_OP_POLARITY);
-			video_formatter_write(video_formatter_scale_control(
-					(uint32_t)prev_scalemode),
-				MNTVF_OP_SCALE);
+			video_formatter_write(prev_scale_control, MNTVF_OP_SCALE);
 			video_formatter_write(output_colormode,
 				MNTVF_OP_COLORMODE);
 			pixelclock_program(&output_mode);
@@ -923,6 +1284,10 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 			video_set_dpms(prev_dpms);
 			hdmi_ctrl_enable_output();
 		}
+		/* The forward DIMENSIONS write clears the explicit flag.
+		 * Put back the value this call observed, whether or not a
+		 * previous output existed to replay. */
+		output_viewport_explicit = prev_viewport_explicit;
 		/* Undo the state this call staged before touching hardware. */
 		vs.video_mode = prev_mode;
 		vs.scalemode = prev_scalemode;
@@ -933,9 +1298,22 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 	}
 
 	if (!skip_vdma) {
-		init_vdma(content_hres, content_vres, hdiv, vdiv,
+		init_vdma(content_hres, content_vres / (uint32_t)vdiv, hdiv,
 				(u32)vs.framebuffer + vs.framebuffer_pan_offset);
 	}
+	video_geom_diag.line_bytes =
+		(uint16_t)video_vdma_line_bytes(content_hres, (uint32_t)hdiv);
+	video_geom_diag.stride = (uint16_t)video_vdma_stride_bytes(
+		content_hres, (uint32_t)hdiv, vs.framebuffer_pan_width,
+		stride_div);
+	video_geom_diag.pan_width = (uint16_t)vs.framebuffer_pan_width;
+	video_geom_diag.mode = (uint16_t)mode;
+	video_geom_diag.colormode = (uint16_t)colormode;
+	video_geom_diag.scalemode = (uint16_t)scalemode;
+	video_geom_diag.hsize = (uint16_t)content_hres;
+	video_geom_diag.hdiv = (uint16_t)hdiv;
+	video_geom_diag.stride_div = (uint16_t)stride_div;
+	video_geom_diag.valid = 1;
 
 	// Re-sync input state machine with the now-stable output timing.
 	video_formatter_valign();
@@ -959,7 +1337,7 @@ static int video_mode_init_internal(int mode, int scalemode, int colormode,
 
 	vs.vmode_hsize = content_hres;
 	vs.vmode_vsize = content_vres;
-	vs.vmode_vdiv = vdiv;
+	vs.vmode_vdma_rows = content_vres / (uint32_t)vdiv;
 	vs.vmode_hdiv = hdiv;
 	return 0;
 }

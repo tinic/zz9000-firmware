@@ -35,7 +35,7 @@ coprocessor platform. These are the highest-value differences for an owner:
 | **Hardware-assisted images, archives, audio and secure networking** | Firmware services accelerate JPEG/PNG work, MP3/audio streaming, LHA/LZH decompression, and selected cryptography used by the accelerated AmiSSL build. Applications fall back safely when a service is unavailable. |
 | **Settings without special firmware builds** | One readable `ZZ9000.CFG` file on the microSD card now controls native-video profiles, framing, scanlines, INT2, MAC address, PIP/off-screen features, and the boot HDF. The old separate `ns-pal` firmware flavor is no longer needed. |
 | **Updates and recovery from AmigaOS** | `ZZFwUpdate` can install firmware files without removing the microSD card, keeps a `.bak` copy when replacing a file, and can restore that backup if an update boots but misbehaves. |
-| **More supported machines and card configurations** | Releases maintain seven FPGA images covering Zorro III, Zorro II, A500/ZZ9500CX, 2 MB, no-Fast-RAM, and Super Denise configurations. |
+| **More supported machines and card configurations** | Releases maintain nine FPGA images covering AGA (video-slot) and E7M capture, Zorro III, Zorro II, A500/ZZ9500CX, 2 MB, no-Fast-RAM, and Super Denise configurations. |
 
 The less visible work matters too: USB 2.0/Poseidon support, gigabit Ethernet,
 SD-card HDF boot, on-board audio improvements, safer Zorro II memory sharing,
@@ -84,28 +84,43 @@ Use the ZIP whose board/bitstream variant matches the target machine:
 
 | Variant | Use for |
 |---|---|
-| `zorro3` | A3000/A4000 with Zorro III FastRAM enabled |
-| `zorro3-nofast` | A3000/A4000 without the extra Zorro RAM advertisement |
+| `zorro3` | A3000/A4000 with optional Zorro III FastRAM; E7M capture |
+| `zorro3-aga` | A4000/A4000T AGA with the 28 MHz video-slot connection, optional Zorro III FastRAM; AGA capture (renamed from `zorro3-a4000-c28`) |
 | `zorro2` | A2000, Zorro II, 4 MB window |
 | `zorro2-2mb` | A2000, Zorro II, 2 MB window |
 | `a500` | A500 with ZZ9500CX Denise adapter, 4 MB window |
 | `a500-2mb` | A500 with ZZ9500CX Denise adapter, 2 MB window |
 | `a500plus` | A500+ or Super Denise with ZZ9500CX Denise adapter |
 
-These are hardware/autoconfig bitstream variants. Current releases use
-one firmware flavor across all of them; settings that used to require a
+These are hardware/autoconfig bitstream variants; they use one ARM firmware.
+Zorro III FastRAM is no longer a bitstream choice: it is off by default and
+enabled with `fast_ram = on` in [`ZZ9000.CFG`](ZZ9000.CFG) (fail-closed —
+absent, malformed, unreadable, or too-slow configuration boots without it,
+which is the old `zorro3-nofast` behavior). Former `zorro3-nofast` /
+`zorro3-nofast-aga` (former name) users need no CFG key; former `zorro3` /
+`zorro3-aga` (formerly `zorro3-a4000-c28`) users add `fast_ram = on` to keep their RAM. Changes
+take effect at the next reboot (a warm reset re-reads the card). If the
+card is unusually slow at a warm reset, the re-read can finish after the
+Amiga has already passed the Fast-RAM slot in autoconfig; the card then
+boots without Fast RAM for that one pass (never wrongly enabled) and the
+next reset picks it up again.
+
+The AGA (formerly A4000 C28) images require the video-slot C28 connection. Do not install
+them on an A3000 or Denise-adapter machine. Keep the E7M Zorro III images as
+the A3000 builds and as an A4000 fallback. Settings that used to require a
 separate firmware flavor or ENV: variables now live in the optional
-[`ZZ9000.CFG`](ZZ9000.CFG) config file (see below). Older releases also
+`ZZ9000.CFG` config file (see below). Older releases also
 shipped an `ns-pal` firmware flavor; its behavior is now the
 `filtered_pal_exact` native-video profile in `ZZ9000.CFG`.
 
 ## Configuration File (ZZ9000.CFG)
 
 `ZZ9000.CFG` is an optional text file stored beside `BOOT.bin` in the root of
-the FAT32 microSD card. Firmware reads it once at power-on; a soft reset does
-not reload it. The easiest way to manage it is **ZZTop → Project → Settings**.
-Release ZIPs also include a fully commented [sample file](ZZ9000.CFG) for
-manual editing.
+the FAT32 microSD card. Firmware reads it at power-on; a soft reset does not
+reload it, except `fast_ram`, which every reset re-reads to re-derive the
+Fast-RAM advertisement. The easiest way to manage it is **ZZTop → Project →
+Settings**. Release ZIPs also include a fully commented
+[sample file](ZZ9000.CFG) for manual editing.
 
 The file controls these boot-time defaults:
 
@@ -113,26 +128,38 @@ The file controls these boot-time defaults:
 |---|---|
 | `videocap_profile` | Native output: `full_60`, `full_exact`, `filtered_60` (default), `filtered_pal`, `filtered_pal_exact`, `filtered_ntsc_exact`, `centered_1080p_60`, `centered_1080p_50`, `centered_1080p_match` |
 | `videocap_sample` | Native-video capture sampling |
+| `videocap_phase` | Legacy E7M diagnostic phase, signed fine steps (`-255..255`); omit unless calibrated |
+| `videocap_c28_phase` | A4000 C28 diagnostic phase, independent fine steps (`-896..895`); requires matching AGA (video-slot C28) bitstream |
 | `videocap_crop_h` | Horizontal picture position; omit for Automatic |
 | `videocap_crop_v` | Vertical picture position; omit for Automatic |
+| `videocap_width` | Manual capture window width, 16-aligned words (`256..1280`); omit for Automatic |
+| `videocap_height` | Manual capture window height in source lines (`100..1024`); omit for Automatic |
 | `scanline_mode` | Scanline style, or off |
 | `scanline_parity` | Which line is darkened |
 | `int2` | Use INT2 instead of INT6 |
+| `fast_ram` | Zorro III Fast RAM (Z3 images only), off by default and fail-closed; see [Board / Bitstream Variants](#board--bitstream-variants) |
 | `offscreen_bitmaps` | Enable or disable Picasso96 off-screen bitmaps |
 | `video_overlay` | Enable or disable the Picasso96 video window |
 | `mac` | Ethernet MAC-address override |
-| `hdf` | Root-level HDF image used for SD-card boot |
+| `hdf` | Root-level HDF image used for SD-card boot (default `zz9000.hdf`); `off` disables SD boot |
 
 The audio control plane (ZZ9000AX) adds one group of keys per scene,
 the active selection, operator baseline and per-card clean ceilings.
 Values are plain decimals; band pairs and prefactor/volume pack two
 0-100 fields as `hi*128+lo`, and baseline packs mixer legs as
-`paula*256+ax` (0-255 each, 127 = 0 dB). The ceiling keys are measured
-clean combined levels (1-4095): firmware weights Paula by
-`audio_ceiling_ax/audio_ceiling_paula`, admits each leg up to its own
-measured ceiling, and enforces the weighted sum of both ceilings as
-the AX-equivalent boundary (the post-mix limiter bounds the summed
-output). Name keys pack two ASCII characters as `c1*256+c2`.
+`paula*256+ax` (0-255 each, 127 = 0 dB). The ceiling keys store
+**measured** clean single-source levels (1-4095): firmware weights
+Paula by `audio_ceiling_ax/audio_ceiling_paula`, caps each leg at its
+configured ceiling, then bounds the combined output with a limiter.
+With no saved calibration the conservative fallback ceilings are
+Paula 48 / AX 80, based on one R1 card's measurements; with no saved
+baseline, parity selects Paula 36 / AX 72 (weighted Level 132/160).
+These are not verified clean limits for every board. Existing saved
+`audio_ceiling_*` and `audio_baseline` values take precedence, including
+older 256/256 or 192/255 settings; remove or recalibrate those keys
+to adopt the new fallback. Do not increase ceilings to mask distortion.
+LPF, EQ, prefactor and volume process the **shared** Paula/AX output.
+Name keys pack two ASCII characters as `c1*256+c2`.
 
 | Key | Purpose |
 |---|---|
@@ -276,7 +303,7 @@ reset, before any application can allocate the audio device.
 Both save mechanisms — ZZTop's Settings/Scandoubler **Save** and the
 firmware-backed Audio **Save** — regenerate the file from settings they
 know and keep the previous copy as `ZZ9000.bak`: hand-written comments
-are not preserved. The file parser reads at most 4 KiB; a larger file
+are not preserved. The file parser reads at most 8 KiB; a larger file
 has its tail ignored, which the drivers can observe through the
 config-query key `ZZ_CONFIG_KEY_AUDIO_TRUNCATED` (the audio keys
 serialize last, so they are the first casualty of an oversized file).
@@ -293,9 +320,30 @@ scanline_parity = 0
 With no valid profile, `filtered_60` provides filtered 60 Hz output:
 800x600 for PAL input or 720x480 for NTSC input. Explicit `full_60` and
 `full_exact` selections preserve full SuperHires detail in a 1280x1024 output.
-On supported full-rate variants, `centered_1080p_60` and `centered_1080p_50`
-place the unchanged 1280x1024 native picture in a 1920x1080 signal with
-320-pixel side borders and 28-line top/bottom borders. Their nominal 60/50 Hz
+Fullscan scales vertically by an integer factor on the classic power-of-two
+paths, so every source row is duplicated uniformly: PAL's 256 progressive or
+512 interlaced source rows fill the 1024-line raster at x4/x2, while 15 kHz
+NTSC letterboxes the same 800 lines for both 200 progressive rows at x4 and
+400 interlaced rows at x2 (112-line black bars, centered). Short-line
+NTSC-class sources such as Euro72 and DblNTSC do not take that letterbox:
+their row-class factor already shows the captured rows, and an 800-line
+viewport would clip the bottom. Progressive and interlaced 15 kHz pictures
+therefore render at one physical size per standard, matching a real monitor.
+
+On full-rate doubled sources such as DblPAL and Euro72, the measured
+640-pixel line is repeated 2x horizontally and the existing row-class
+factor scales vertically. A 640x512 class-2 source fills the 1280x1024
+capture raster; centered 1080p places that raster at (320,28). Class-1 and
+tall class-3 sources retain vertical x4 and x1 respectively. Filtered capture
+and short-line, non-doubled Super72 keep their existing horizontal sampling.
+SCALEX affects displayed pixels only; 32-bit VDMA rows retain their full
+content pitch.
+
+On supported full-rate variants,
+`centered_1080p_60` and `centered_1080p_50`
+place the native picture in a 1920x1080 signal with 320-pixel side borders
+and 28-line top/bottom borders; a 15 kHz NTSC source letterboxes inside
+that viewport with the same integer scaling. Their nominal 60/50 Hz
 timings run at approximately 60.03/50.02 Hz. Both use the closest legal
 100 MHz integer-PLL setting to 148.5 MHz: 52/5/7 = 148.5714286 MHz, with
 standard blanking unchanged. They are free-running, not input-genlocked.
@@ -310,6 +358,29 @@ and substitutes `full_60` when loading an unsupported selection; that
 fallback also applies when another configuration window saves a stored
 unsupported profile. Older firmware ignores an unknown profile token,
 which is not a guaranteed `full_60` fallback for hand-edited old stacks.
+Capture-window overrides use `videocap_width` and `videocap_height`; set either
+axis to 0 (or omit its CFG key) to retain that axis's automatic dimension.
+On a filtered profile the override is centered in the active mode canvas
+(800x600, 720x576, or 720x480), not in the 1280x1024 fullscan box.
+Firmware capability bit 8 accepts the live `CARD_FEATURE_VIDEOCAP_GEOMETRY`
+request; bit 10 adds the acknowledgement contract. The `REG_ZZ_CONFIG_KEY`
+runtime queries 28--34 report requested/applied width and height,
+request/applied serials, and status bits `APPLIED_VALID`, `PENDING`,
+and `REJECTED`. Requested values retain the override pair, including 0;
+applied values are the resolved/clipped VDMA word width and source-row count,
+not output pixels or necessarily the same numbers as the request. A request
+remains pending until stable native-vblank VDMA programming succeeds with
+that serial. RTG vblanks and VDMA configuration/address/start failures do
+not acknowledge it; a failed pending request retries on a stable native
+vblank. Tools must not treat a successful feature write as an applied window.
+
+Live calibration reads the capture-domain resolved automatic crop at
+`VCAP_LIVE_EFFECTIVE_CROP` (host offset `0x140c`), including doubled/short-line
+crop replacement and PAL/NTSC vertical changes. Crop axes and the live line
+count cross coherently into the AXI domain; a crop commit is acknowledged
+only after its resolved pair is visible there. `REG_ZZ_VIDEOCAP_STATS`
+(`0x4e`) returns the ten-bit frame line count with reserved bits zero in
+both word halves, including the upper half used by Zorro II reads.
 
 RTG/native switches keep the HDMI signal running when the complete output
 timing is unchanged; framebuffer layout, scaling and pixel format still update.
@@ -365,6 +436,48 @@ Keep these rules in mind:
 
 See the commented [ZZ9000.CFG sample](ZZ9000.CFG) for every accepted value and
 additional notes.
+
+## AGA video-slot capture clock (formerly A4000 C28)
+
+The separate AGA (`zorro3-aga`, formerly A4000 C28) bitstreams capture AGA pixels from the 28 MHz
+video-slot signal. They run the capture MMCM at approximately 908-916 MHz,
+with one capture clock per source pixel. E7M bitstreams remain available
+for A3000, other machines, and A4000 fallback; the clock source cannot be
+changed by ZZ9000.CFG alone. Other machines and adapter routes require
+separate clock qualification.
+
+Build the AGA (video-slot C28) release bitstream with Vivado 2018.3 using
+`build_variant_bitstreams.sh zorro3-aga`;
+see [BUILD.md](BUILD.md). For a separate single-image diagnostic build
+on Windows:
+
+```powershell
+.\build_bitstream.ps1 -CaptureC28
+```
+
+Its default output is `bootimage_work/capture-c28/zz9000_ps_wrapper.bit`,
+not the release bitstream. Package any diagnostic build with the matching
+ARM firmware using `build_bootimage.sh --bitstream` and a separate
+`--output` path. A missing or out-of-range C28 signal holds native
+capture inactive; independent host diagnostics remain available.
+
+Use the matching `ZZCapture` tool from the
+[drivers repository](https://github.com/BlitterStudio/zz9000-drivers)
+(`ZZCapture/README.md`) to inspect clocks and calibrate a still SuperHires pattern. It checks exact
+raw RGB values and frame stability, sweeps the complete phase circle, refines
+the clean boundaries, and retests their midpoint. On failure it attempts and
+checks entry-phase restoration, reporting any failure. On success it prints
+`videocap_c28_phase`; saving is explicit. Run `Stack 32768` in the Amiga Shell
+before applying a phase or starting calibration.
+This key is independent of the legacy diagnostic `videocap_phase` because
+the clocks use different phase units. Matching firmware and ZZTop preserve
+both values when saving other settings.
+
+Qualification needs cold and warm tests on affected PAL and NTSC machines,
+then lores, hires, SuperHires, progressive/interlaced and filtered/full-detail
+checks. Calibration samples raw input pixels; it does not qualify vertical
+geometry or the complete HDMI path. Keep the previous working BOOT image
+for comparison and restoration.
 
 ## Custom Picasso96 Modelines
 
@@ -439,7 +552,7 @@ unstable with `Writethrough`, fall back to `Data NoCache` /
 cache enabled. 68030 systems do not need this workaround.
 
 If a 68040/68060 machine remains unstable with Zorro III FastRAM enabled,
-use the `zorro3-nofast` firmware variant.
+remove `fast_ram` from (or set `fast_ram = off` in) `ZZ9000.CFG` and reboot.
 
 ## Building
 

@@ -21,41 +21,24 @@ GLBL="$VIVADO_BIN/../data/verilog/src/glbl.v"
 mkdir -p "$SIMDIR"
 cd "$SIMDIR"
 cp "$ROOT/videocap_sampler.v" .
+cp "$ROOT/videocap_calibration_capture.v" .
 cp "$ROOT/videocap_writeback_layout.v" .
 
 if [ "$ON_WINDOWS" = 1 ]; then
     TB="$(cygpath -w "$HERE/videocap_sampler_tb.v")"
-    cmd //c "$(cygpath -w "$VIVADO_BIN/xvlog.bat") videocap_sampler.v videocap_writeback_layout.v $TB $(cygpath -w "$GLBL")" > xvlog.log 2>&1 \
+    cmd //c "$(cygpath -w "$VIVADO_BIN/xvlog.bat") videocap_sampler.v videocap_calibration_capture.v videocap_writeback_layout.v $TB $(cygpath -w "$GLBL")" > xvlog.log 2>&1 \
         || { cat xvlog.log; exit 1; }
     cmd //c "$(cygpath -w "$VIVADO_BIN/xelab.bat") -L xpm work.videocap_sampler_tb work.glbl -s tb" > xelab.log 2>&1 \
         || { cat xelab.log; exit 1; }
 else
-    "$VIVADO_BIN/xvlog" videocap_sampler.v videocap_writeback_layout.v "$HERE/videocap_sampler_tb.v" "$GLBL" > xvlog.log 2>&1 \
+    "$VIVADO_BIN/xvlog" videocap_sampler.v videocap_calibration_capture.v videocap_writeback_layout.v "$HERE/videocap_sampler_tb.v" "$GLBL" > xvlog.log 2>&1 \
         || { cat xvlog.log; exit 1; }
     "$VIVADO_BIN/xelab" -L xpm work.videocap_sampler_tb work.glbl -s tb > xelab.log 2>&1 \
         || { cat xelab.log; exit 1; }
 fi
 
 # PIXSPAN SAMPLEMODE FULLWIDTH CROPH CROPV JITTER GRIDSHIFT
-CONFIGS="
-4 0 0 188 26 0 0
-2 0 0 188 26 0 0
-2 0 0 189 26 0 0
-2 0 0 288 26 0 0
-2 0 0 188 40 0 0
-1 0 0 188 26 0 0
-4 0 1 188 26 0 0
-2 0 1 188 26 0 0
-2 0 1 189 26 0 0
-1 0 1 188 26 0 0
-1 0 1 288 40 0 0
-1 1 0 188 26 0 0
-1 2 0 188 26 0 0
-2 1 0 188 26 0 0
-2 2 0 188 26 0 0
-2 0 0 188 26 1 0
-2 0 0 188 26 0 1
-"
+CONFIGS="$(cat "$HERE/videocap_cases.txt")"
 
 rm -f run_*.log
 EXPECTED=$(echo "$CONFIGS" | grep -c '[0-9]')

@@ -23,6 +23,7 @@ module video_formatter(
   output m_axis_vid_tready,
   input [0:0]  m_axis_vid_tuser,
   input m_axis_vid_tvalid,
+  (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF m_axis_vid:overlay_axis" *)
   input m_axis_vid_aclk,
   input aresetn,
 
@@ -101,6 +102,7 @@ reg [11:0] screen_width;
 reg [11:0] screen_height;
 reg scale_x = 0;
 reg [1:0] scale_y = 2'd1; // amiga boots in 640x256, so double the resolution vertically
+reg [11:0] scale_source_rows = 0;
 reg [23:0] palette[511:0];
 reg [2:0] colormode = CMODE_32BIT;
 reg vsync_request;
@@ -177,12 +179,14 @@ wire [31:0] overlay_div_result_quotient =
   overlay_div_quotient |
   (overlay_div_subtract ? (32'b1 << overlay_div_bit) : 32'b0);
 
-reg [15:0] screen_h_max;
-reg [15:0] screen_v_max;
-reg [15:0] screen_h_sync_start;
-reg [15:0] screen_h_sync_end;
-reg [15:0] screen_v_sync_start;
-reg [15:0] screen_v_sync_end;
+// VGA timing consumers are 12-bit; the control words carry them in [27:16]
+// and [11:0], so the upper nibbles were never observable.
+reg [11:0] screen_h_max;
+reg [11:0] screen_v_max;
+reg [11:0] screen_h_sync_start;
+reg [11:0] screen_h_sync_end;
+reg [11:0] screen_v_sync_start;
+reg [11:0] screen_v_sync_end;
 
 localparam MAXWIDTH=2560;              // line buffer capacity in 32-bit words
 localparam LINE_BUFFER_BEATS=1280;     // 64-bit words used in each bank
@@ -236,12 +240,11 @@ localparam SPRITE_W = 32;
 localparam SPRITE_H = 48;
 localparam SPRITE_SIZE = SPRITE_W*SPRITE_H;
 reg [23:0] sprite_buffer[SPRITE_SIZE-1:0];
-reg [11:0] sprite_addr_in;
+reg [10:0] sprite_addr_in; // sprite_buffer has 1536 = 2^11 entries
 reg [11:0] sprite_x;
 reg [11:0] sprite_y;
 reg sprite_dbl;
 reg [11:0] report_y = 0;
-reg vga_sprite_dbl; // vga_domain
 reg [11:0] vga_sprite_x; // vga domain
 reg [11:0] vga_sprite_y; // vga domain
 reg [11:0] vga_sprite_x2; // vga domain
@@ -259,8 +262,10 @@ reg [1:0]  vga_scanline_width;
 reg        vga_scanline_parity;
 reg vga_scanlines_en;
 reg [31:0] pixout_sl;
-reg [11:0] counter_y_d1;
-reg [11:0] counter_y_d2;
+// Only the two low scanline-parity bits of counter_y are consumed (see
+// scanline_content_y); pipeline just those bits.
+reg [1:0] counter_y_d1;
+reg [1:0] counter_y_d2;
 
 always @(posedge m_axis_vid_aclk)
   begin
@@ -273,7 +278,9 @@ always @(posedge m_axis_vid_aclk)
 
     need_frame_sync_reg <= need_frame_sync;
     need_line_fetch_reg  <= need_line_fetch; // sync to clock domain
-    need_line_fetch_reg2 <= need_line_fetch_reg>>scale_y_effective; // line duplication
+    need_line_fetch_reg2 <= scale_source_rows != 0
+      ? need_line_fetch_reg : need_line_fetch_reg >> scale_y_effective;
+    need_line_fetch_reg3 <= need_line_fetch_reg2;
 
     scale_y_effective <= scale_y;
 
@@ -301,8 +308,7 @@ always @(posedge m_axis_vid_aclk)
             next_input_state <= 4'h4;
         end
       4'h1: begin
-          // reading from vdma
-          last_line_fetch <= need_line_fetch_reg2;
+          // reading from vdma; request changes remain pending until EOL
 
           if (pixin_valid && pixin_end_of_line) begin
             ready_for_vdma <= 0;
@@ -316,9 +322,11 @@ always @(posedge m_axis_vid_aclk)
           if (vsync_request) begin
             next_input_state <= 4'h0;
           end
-          else if (need_line_fetch_reg2!=last_line_fetch) begin
-            // time to read the next line
+          else if (need_line_fetch_reg2 == need_line_fetch_reg3 &&
+                   need_line_fetch_reg3 != last_line_fetch) begin
+            // time to read the next line after a coherent CDC sample
             next_input_state <= 4'h1;
+            last_line_fetch <= need_line_fetch_reg3;
             //ready_for_vdma <= 1; // from here
           end
         end
@@ -343,7 +351,6 @@ reg [7:0] control_op_in = 0;
 reg control_interlace_in = 0;
 reg [31:0] control_data_in2 = 0;
 reg [7:0] control_op_in2 = 0;
-reg control_interlace_in2 = 0;
 
 /* Viewport position and size form one mode transaction.  The source-side
  * bundle is held unchanged for the complete XPM handshake.  A second slot
@@ -499,7 +506,6 @@ begin
   control_interlace_in <= control_interlace;
   control_op_in2        <= control_op_in;
   control_data_in2      <= control_data_in;
-  control_interlace_in2 <= control_interlace_in;
 
   if (next_input_state==0) begin
     vsync_request <= 0;
@@ -526,21 +532,22 @@ begin
     OP_SCALE: begin
         scale_x  <= control_data_in[0];
         scale_y  <= control_data_in[2:1];
+        scale_source_rows <= control_data_in[27:16];
         sprite_dbl <= control_data_in[3];
       end
     OP_COLORMODE: colormode  <= control_data_in[1:0]; // FIXME
     OP_VSYNC: vsync_request <= 1; //control_data[0];
     OP_MAX: begin
-        screen_v_max <= control_data_in[31:16];
-        screen_h_max <= control_data_in[15:0];
+        screen_v_max <= control_data_in[27:16];
+        screen_h_max <= control_data_in[11:0];
       end
     OP_HS: begin
-        screen_h_sync_start <= control_data_in[31:16];
-        screen_h_sync_end <= control_data_in[15:0];
+        screen_h_sync_start <= control_data_in[27:16];
+        screen_h_sync_end <= control_data_in[11:0];
       end
     OP_VS: begin
-        screen_v_sync_start <= control_data_in[31:16];
-        screen_v_sync_end <= control_data_in[15:0];
+        screen_v_sync_start <= control_data_in[27:16];
+        screen_v_sync_end <= control_data_in[11:0];
       end
     OP_THRESH: begin
       end
@@ -555,7 +562,7 @@ begin
         sprite_x <= control_data_in[15:0];
       end
     OP_SPRITE_ADDR: begin
-        sprite_addr_in <= control_data_in[11:0];
+        sprite_addr_in <= control_data_in[10:0];
       end
     OP_SPRITE_DATA: begin
         sprite_buffer[sprite_addr_in] <= control_data_in[23:0];
@@ -714,6 +721,7 @@ reg viewport_geometry_ready = 0;
 
 reg vga_scale_x = 0;
 reg [1:0] vga_scale_y = 2'd0;
+reg [11:0] vga_scale_source_rows = 0;
 wire [11:0] vga_scale_y_factor = 12'd1 << vga_scale_y;
 reg [31:0] pixout;
 reg [7:0]  pixout8;
@@ -742,8 +750,6 @@ reg signed [15:0] vga_overlay_x = 0;
 reg signed [15:0] vga_overlay_y = 0;
 reg [15:0] vga_overlay_width = 0;
 reg [15:0] vga_overlay_height = 0;
-reg [15:0] vga_overlay_source_width = 0;
-reg [15:0] vga_overlay_source_height = 0;
 reg [15:0] vga_overlay_x_step_integer = 0;
 reg [15:0] vga_overlay_x_step_remainder = 0;
 reg [15:0] vga_overlay_y_step_integer = 0;
@@ -759,7 +765,9 @@ reg [31:0] vga_overlay_frame_generation = 0;
 reg [11:0] overlay_fetch_line = 0;
 reg overlay_fetch_request = 0;
 reg [15:0] overlay_scale_read_x = 0;
-reg [15:0] overlay_scale_read_x_d1 = 0;
+/* Only the luma-phase bit of the delayed scale read position is consumed
+ * (see overlay_selected_luma_phase). */
+reg overlay_scale_read_x_d1 = 0;
 reg [15:0] overlay_scale_x_error = 0;
 reg [15:0] overlay_scale_source_y = 0;
 reg [15:0] overlay_scale_y_error = 0;
@@ -805,7 +813,7 @@ wire signed [16:0] overlay_read_x = overlay_read_x_position;
 wire [15:0] overlay_selected_read_x =
   vga_overlay_scaling ? overlay_scale_read_x : overlay_read_x[15:0];
 wire overlay_selected_luma_phase =
-  vga_overlay_scaling ? overlay_scale_read_x_d1[0] : overlay_local_x[0];
+  vga_overlay_scaling ? overlay_scale_read_x_d1 : overlay_local_x[0];
 wire [10:0] overlay_read_addr = overlay_selected_read_x[11:1];
 wire overlay_scale_x_carry =
   overlay_scale_x_error >= vga_overlay_x_step_threshold;
@@ -837,8 +845,17 @@ wire overlay_scheduler_line_ready;
  * bit for bit; every vertical wrap consumer below is muxed on this one
  * wire, which is why the hmax-1 line-bank prefetch decision and the
  * actual counter_y wrap can never disagree. */
-wire [12:0] source_sync_active_end =
-  {1'b0, vga_v_rez} + {1'b0, vga_scale_y_factor};
+/* Quasi-static geometry.  A combinational 13-bit add here lands on the
+ * 150 MHz compare that clocks good_intervals and misses timing on the
+ * 2MB Zorro II placement.  One pixel of delay is inside the frame-boundary
+ * bounds pipeline. */
+reg [12:0] source_sync_active_end = 13'd0;
+always @(posedge dvi_clk) begin
+  if (!aresetn)
+    source_sync_active_end <= 13'd0;
+  else
+    source_sync_active_end <= {1'b0, vga_v_rez} + {1'b0, vga_scale_y_factor};
+end
 wire source_sync_line_advance = counter_x >= vga_h_max;
 wire [63:0] source_sync_diag_bus;
 wire source_sync_line_uses_sync;
@@ -868,11 +885,108 @@ wire frame_wrap_this_line = source_sync_line_uses_sync
   : counter_y >= vga_v_max;
 wire [11:0] next_raster_y = frame_wrap_this_line
   ? 12'b0 : counter_y + 1'b1;
-wire [11:0] next_scanout_content_y = next_raster_y - vga_viewport_y;
-wire [11:0] next_scanout_source_line =
-  (next_raster_y >= vga_viewport_y + vga_scale_y_factor)
-    ? ((next_scanout_content_y - vga_scale_y_factor) >> vga_scale_y)
+reg [11:0] next_raster_y_staged = 0;
+wire [11:0] staged_next_scanout_content_y =
+  next_raster_y_staged - vga_viewport_y;
+wire [11:0] power_of_two_next_source_line =
+  (next_raster_y_staged >= vga_viewport_y + vga_scale_y_factor)
+    ? ((staged_next_scanout_content_y - vga_scale_y_factor) >> vga_scale_y)
     : 12'b0;
+
+/* Full-width NTSC has 200 progressive (400 woven) source rows, which do
+ * not divide the 1024-row output by a power of two.  Advance at most one
+ * source row per displayed row with an exact line-rate accumulator. */
+wire fractional_scale_y = vga_scale_source_rows != 0;
+reg [12:0] fractional_content_start = 0;
+reg [12:0] fractional_content_end = 0;
+reg [11:0] fractional_source_line = 0;
+reg [12:0] fractional_y_error = 0;
+wire [12:0] fractional_y_sum =
+  fractional_y_error + {1'b0, vga_scale_source_rows};
+wire fractional_y_advance =
+  fractional_y_sum >= {1'b0, vga_viewport_height};
+wire [11:0] fractional_next_source_line =
+  fractional_source_line + fractional_y_advance;
+wire [12:0] fractional_next_y_error = fractional_y_advance
+  ? fractional_y_sum - {1'b0, vga_viewport_height}
+  : fractional_y_sum;
+wire fractional_next_row_active =
+  {1'b0, next_raster_y_staged} >= fractional_content_start &&
+  {1'b0, next_raster_y_staged} < fractional_content_end;
+wire fractional_next_row_advances =
+  {1'b0, next_raster_y_staged} > fractional_content_start &&
+  {1'b0, next_raster_y_staged} < fractional_content_end;
+reg fractional_next_row_advances_latched = 0;
+wire fractional_current_row_active =
+  {1'b0, counter_y} >= fractional_content_start &&
+  {1'b0, counter_y} < fractional_content_end;
+wire [12:0] fractional_prefetch_source_line =
+  {1'b0, fractional_source_line} + 1'b1;
+reg fractional_current_row_active_latched = 0;
+reg [11:0] fractional_prefetch_source_line_latched = 0;
+reg fractional_prefetch_valid_latched = 0;
+wire [11:0] next_scanout_source_line =
+  fractional_scale_y
+    ? ({1'b0, next_raster_y_staged} == fractional_content_start
+        ? 12'b0
+        : (fractional_next_row_active
+            ? fractional_next_source_line : 12'b0))
+    : power_of_two_next_source_line;
+reg [11:0] next_scanout_source_line_latched = 0;
+
+/* Pipeline the viewport bounds and next-row decision: deriving them on the
+ * line-wrap edge otherwise puts multiple carry chains in the 150 MHz
+ * accumulator reset path. */
+always @(posedge dvi_clk) begin
+  if (!aresetn) begin
+    fractional_content_start <= 0;
+    fractional_content_end <= 0;
+    next_raster_y_staged <= 0;
+    next_scanout_source_line_latched <= 0;
+    fractional_next_row_advances_latched <= 0;
+    fractional_current_row_active_latched <= 0;
+    fractional_prefetch_source_line_latched <= 0;
+    fractional_prefetch_valid_latched <= 0;
+  end else begin
+    fractional_content_start <=
+      {1'b0, vga_viewport_y} + {1'b0, vga_scale_y_factor};
+    fractional_content_end <=
+      fractional_content_start + {1'b0, vga_viewport_height};
+    if (counter_x == 0) begin
+      /* Stage the wrap decision before the accumulator/comparison stage.
+       * This keeps vga_v_max and source-sync wrap logic off the 150 MHz
+       * scanout-row update path. */
+      next_raster_y_staged <= next_raster_y;
+      fractional_current_row_active_latched <=
+        fractional_current_row_active;
+      fractional_prefetch_source_line_latched <=
+        fractional_prefetch_source_line[11:0];
+    end else if (counter_x == 1) begin
+      fractional_next_row_advances_latched <=
+        fractional_next_row_advances;
+      next_scanout_source_line_latched <= next_scanout_source_line;
+      fractional_prefetch_valid_latched <=
+        fractional_current_row_active_latched &&
+        {1'b0, fractional_prefetch_source_line_latched} <
+          {1'b0, vga_scale_source_rows};
+    end
+  end
+end
+
+always @(posedge dvi_clk) begin
+  if (!aresetn || !fractional_scale_y) begin
+    fractional_source_line <= 0;
+    fractional_y_error <= 0;
+  end else if (counter_x + 1'b1 == vga_h_max) begin
+    if (!fractional_next_row_advances_latched) begin
+      fractional_source_line <= 0;
+      fractional_y_error <= 0;
+    end else begin
+      fractional_source_line <= fractional_next_source_line;
+      fractional_y_error <= fractional_next_y_error;
+    end
+  end
+end
 
 /* ------------------------------------------------------------------ */
 /* Source-sync diagnostic transport (dvi_clk -> m_axis_vid_aclk)       */
@@ -1032,7 +1146,7 @@ wire viewport_output_active = viewport_geometry_ready &&
   viewport_output_x < $signed({1'b0, viewport_output_x_end}) &&
   viewport_output_y >= vga_viewport_y &&
   viewport_output_y < vga_viewport_y + vga_viewport_height;
-wire [11:0] scanline_content_y = counter_y_d2 - vga_viewport_y;
+wire [1:0] scanline_content_y = counter_y_d2 - vga_viewport_y[1:0];
 
 wire [11:0] scanout_source_line = scanout_source_line_row;
 
@@ -1141,6 +1255,9 @@ always @(posedge dvi_clk) begin
   vga_v_rez <= screen_height;
   vga_h_max <= screen_h_max - 1'b1;
   vga_v_max <= screen_v_max - 1'b1;
+  /* screen_h_sync_start/end are quasi-static mode config written once per
+   * mode change on m_axis_vid_aclk (OP_HS); this continuous resample on
+   * dvi_clk is a snapshot crossing, not a 2-flop CDC - by design. */
   vga_h_sync_start <= screen_h_sync_start;
   vga_h_sync_end <= screen_h_sync_end;
 
@@ -1155,6 +1272,7 @@ always @(posedge dvi_clk) begin
   vga_v_sync_end <= screen_v_sync_end;
   vga_scale_x <= scale_x;
   vga_scale_y <= scale_y;
+  vga_scale_source_rows <= scale_source_rows;
   vga_colormode <= colormode;
   vga_sync_polarity <= sync_polarity;
   vga_dpms_level <= dpms_level;
@@ -1167,8 +1285,6 @@ always @(posedge dvi_clk) begin
     vga_overlay_y <= overlay_y;
     vga_overlay_width <= overlay_width;
     vga_overlay_height <= overlay_height;
-    vga_overlay_source_width <= overlay_source_width;
-    vga_overlay_source_height <= overlay_source_height;
     vga_overlay_x_step_integer <= overlay_x_step_integer;
     vga_overlay_x_step_remainder <= overlay_x_step_remainder;
     vga_overlay_y_step_integer <= overlay_y_step_integer;
@@ -1217,10 +1333,10 @@ always @(posedge dvi_clk) begin
     overlay_local_y < $signed({1'b0, vga_overlay_height});
   overlay_scheduler_screen_y_nonnegative <= overlay_screen_y >= 0;
   overlay_scheduler_next_source_y <= overlay_scale_next_source_y[11:0];
-  overlay_scale_read_x_d1 <= overlay_scale_read_x;
+  overlay_scale_read_x_d1 <= overlay_scale_read_x[0];
   if (counter_x == 0) begin
     overlay_scale_read_x <= vga_overlay_x_start_source;
-    overlay_scale_read_x_d1 <= vga_overlay_x_start_source;
+    overlay_scale_read_x_d1 <= vga_overlay_x_start_source[0];
     overlay_scale_x_error <= vga_overlay_x_start_remainder;
   end else if (vga_overlay_scaling &&
                overlay_screen_x >= overlay_visible_x0_minus_one &&
@@ -1255,7 +1371,6 @@ always @(posedge dvi_clk) begin
   end
   vga_sprite_x2 <= vga_sprite_x+(SPRITE_W<<sprite_dbl);
   vga_sprite_y2 <= vga_sprite_y+(SPRITE_H<<sprite_dbl);
-  vga_sprite_dbl <= sprite_dbl;
   vga_report_y_next <= report_y;
   vga_selected_palette <= selected_palette;
   vga_scanline_width      <= scanline_width;
@@ -1368,7 +1483,7 @@ always @(posedge dvi_clk) begin
   sprite_on_d3 <= sprite_on_d2;
   sprite_on_d4 <= sprite_on_d3;
 
-counter_y_d1 <= counter_y;
+counter_y_d1 <= counter_y[1:0];
 counter_y_d2 <= counter_y_d1;
 
 if (!vga_scanlines_en || vga_scanline_width == 2'b00) begin
@@ -1429,7 +1544,7 @@ endcase
    * wrap so that stale-bank data has cleared the registered pixel pipeline
    * before active column zero. */
   if (counter_x + 1'b1 == vga_h_max)
-    scanout_source_line_row <= next_scanout_source_line;
+    scanout_source_line_row <= next_scanout_source_line_latched;
 
   /* These registered coordinates advance on the same edge as counter_x/y.
    * Their values therefore retain the existing pixel/row phase while
@@ -1489,9 +1604,23 @@ endcase
   need_line_fetch_row_valid <= need_line_fetch_lower_valid &&
     counter_y < need_line_fetch_upper_bound;
 
-  if (counter_x==vga_h_rez)
-    need_line_fetch <= need_line_fetch_row_valid
-      ? need_line_fetch_candidate : 12'b0;
+  if (counter_x==vga_h_rez) begin
+    if (!fractional_scale_y) begin
+      need_line_fetch <= need_line_fetch_row_valid
+        ? need_line_fetch_candidate : 12'b0;
+    end else if ({1'b0, counter_y} < fractional_content_start) begin
+      need_line_fetch <= 0;
+    end else if (fractional_prefetch_valid_latched) begin
+      /* Once source row N is on screen its opposite bank is free. Start
+       * filling N+1 during the first duplicate of N, not its last. */
+      need_line_fetch <= fractional_prefetch_source_line_latched;
+    end else begin
+      /* Reset the request label in bottom blanking before frame resync.
+       * Holding the final row here leaves the restarted MM2S stream parked
+       * behind the prior frame's last label. */
+      need_line_fetch <= 0;
+    end
+  end
 
   /* Display selection follows the current PIP row while this independent
    * fetch selector advances as soon as that row is known ready. MM2S can then

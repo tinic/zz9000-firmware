@@ -23,17 +23,15 @@ module videocap_control_source #(
     input  wire        request_token_valid,
     input  wire        control_received,
     output reg         control_send = 0,
-    output reg  [26:0] control_payload =
-        {12'd26, 12'd188, 1'b0, 2'd0},
+    output reg  [28:0] control_payload =
+        {1'b0, 1'b0, 12'd26, 12'd188, 1'b0, 2'd0},
     output wire        busy,
     output reg  [7:0]  request_sequence = 0,
     output reg  [7:0]  applied_sequence = 0,
     output reg         last_commit_rejected = 0,
     output reg         applied_valid = 0,
     output reg  [31:0] applied_raw =
-        {2'b00, 1'b0, 1'b0, 12'd26, 12'd188, 1'b0, 1'b0, 2'd0},
-    output reg  [31:0] applied_effective_crop =
-        {4'b0000, 12'd26, 4'b0000, 12'd188}
+        {2'b00, 1'b0, 1'b0, 12'd26, 12'd188, 1'b0, 1'b0, 2'd0}
 );
 
 localparam [1:0] CONTROL_IDLE   = 2'd0;
@@ -43,8 +41,14 @@ localparam [1:0] CONTROL_RETURN = 2'd3;
 
 localparam [11:0] CROP_H_COMPAT = 12'd188;
 localparam [11:0] CROP_V_COMPAT = 12'd26;
-localparam [11:0] CROP_H_FULLRATE = 12'd279;
-localparam [11:0] CROP_V_FULLRATE = 12'd40;
+/* Calibrated full-rate auto defaults (2026-09-29, C28 A4000 + A3000):
+ * H 278 centers both standards; PAL needs V 40 while NTSC needs V 39
+ * (V 39 on PAL cuts the bottom line). The commit-time vertical value is
+ * the PAL default — the capture domain re-resolves the standard-dependent
+ * vertical crop while the automatic flag is set. */
+localparam [11:0] CROP_H_FULLRATE = 12'd278;
+localparam [11:0] CROP_V_FULLRATE_PAL = 12'd40;
+localparam [11:0] CROP_V_FULLRATE_NTSC = 12'd39;
 
 reg [1:0] control_state = CONTROL_IDLE;
 reg [31:0] pending_raw =
@@ -72,7 +76,7 @@ wire [11:0] request_crop_h_effective = request_effective_raw[28] ?
     (request_fullrate_path ? CROP_H_FULLRATE : CROP_H_COMPAT) :
     request_effective_raw[15:4];
 wire [11:0] request_crop_v_effective = request_effective_raw[29] ?
-    (request_fullrate_path ? CROP_V_FULLRATE : CROP_V_COMPAT) :
+    (request_fullrate_path ? CROP_V_FULLRATE_PAL : CROP_V_COMPAT) :
     request_effective_raw[27:16];
 wire request_raw_valid =
     request_width_only ||
@@ -97,7 +101,9 @@ always @(posedge source_clk) begin
             if (width_pending || request_event) begin
                 if (width_pending || (request_token_valid && request_raw_valid)) begin
                     pending_raw <= request_effective_raw;
-                    control_payload <= {request_crop_v_effective,
+                    control_payload <= {request_effective_raw[29],
+                                        request_effective_raw[28],
+                                        request_crop_v_effective,
                                         request_crop_h_effective,
                                         request_effective_raw[2],
                                         request_effective_raw[1:0]};
@@ -121,10 +127,6 @@ always @(posedge source_clk) begin
         CONTROL_SEND: begin
             if (control_received) begin
                 applied_raw <= pending_raw;
-                applied_effective_crop <= {
-                    4'b0000, control_payload[26:15],
-                    4'b0000, control_payload[14:3]
-                };
                 applied_sequence <= request_sequence;
                 applied_valid <= 1'b1;
                 control_send <= 1'b0;
@@ -235,6 +237,108 @@ end
 
 endmodule
 
+/* Publish the resolved crop, frame line count, and the capture class
+ * flags as one coherent AXI snapshot.  The class bits (interlace, line
+ * class, NTSC/PAL) change only at field boundaries, so the payload -
+ * held through the complete four-phase handshake - is the only capture
+ * -> AXI crossing for them: AXI logic must never sample those regs
+ * directly.  Hold the payload until the handshake completes; settled
+ * lets the control ACK wait until its crop is visible to readers. */
+module videocap_live_publish (
+    input  wire        cap_clk,
+    input  wire [11:0] crop_h,
+    input  wire [11:0] crop_v,
+    input  wire [9:0]  line_count,
+    /* Completed words of the frame's last captured line: the writeback
+     * pitch is fixed, so short-not-doubled lines must be sized from it. */
+    input  wire [11:0] line_words,
+    input  wire        interlace,
+    input  wire        doubled,
+    input  wire        short_l,
+    input  wire        tall,
+    input  wire        ntsc,
+    input  wire        axi_clk,
+    output wire        settled,
+    output reg  [31:0] live_effective_crop =
+        {4'b0000, 12'd26, 4'b0000, 12'd188},
+    output reg  [9:0]  live_line_count = 0,
+    output reg  [11:0] live_line_words = 12'd1280,
+    /* {interlace, doubled, short, tall, ntsc} in the AXI domain. */
+    output reg  [4:0]  live_frame_class = 5'd0
+);
+    localparam [1:0] LIVE_IDLE   = 2'd0;
+    localparam [1:0] LIVE_LOAD   = 2'd1;
+    localparam [1:0] LIVE_SEND   = 2'd2;
+    localparam [1:0] LIVE_RETURN = 2'd3;
+
+    wire [50:0] live_cap = {interlace, doubled, short_l, tall, ntsc,
+                            line_count, line_words, crop_v, crop_h};
+    reg [50:0] live_sent = {5'd0, 10'd0, 12'd1280, 12'd26, 12'd188};
+    reg [50:0] live_payload = {5'd0, 10'd0, 12'd1280, 12'd26, 12'd188};
+    reg [1:0] live_state = LIVE_IDLE;
+    reg live_send = 1'b0;
+    wire live_received;
+    wire [50:0] live_dest_payload;
+    wire live_dest_req;
+
+    assign settled = live_state == LIVE_IDLE && live_sent == live_cap;
+
+    xpm_cdc_handshake #(
+        .DEST_EXT_HSK(0),
+        .DEST_SYNC_FF(4),
+        .INIT_SYNC_FF(1),
+        .SIM_ASSERT_CHK(0),
+        .SRC_SYNC_FF(4),
+        .WIDTH(51)
+    ) videocap_live_handshake (
+        .src_clk(cap_clk),
+        .src_in(live_payload),
+        .src_send(live_send),
+        .src_rcv(live_received),
+        .dest_clk(axi_clk),
+        .dest_out(live_dest_payload),
+        .dest_req(live_dest_req),
+        .dest_ack(1'b0)
+    );
+
+    always @(posedge cap_clk) begin
+        case (live_state)
+            LIVE_IDLE: begin
+                if (live_cap != live_sent) begin
+                    live_payload <= live_cap;
+                    live_state <= LIVE_LOAD;
+                end
+            end
+            LIVE_LOAD: begin
+                live_send <= 1'b1;
+                live_state <= LIVE_SEND;
+            end
+            LIVE_SEND: begin
+                if (live_received) begin
+                    live_send <= 1'b0;
+                    live_sent <= live_payload;
+                    live_state <= LIVE_RETURN;
+                end
+            end
+            LIVE_RETURN: begin
+                if (!live_received)
+                    live_state <= LIVE_IDLE;
+            end
+        endcase
+    end
+
+    always @(posedge axi_clk) begin
+        if (live_dest_req) begin
+            live_effective_crop <= {4'b0, live_dest_payload[23:12],
+                                    4'b0, live_dest_payload[11:0]};
+            live_line_count <= live_dest_payload[45:36];
+            live_line_words <= live_dest_payload[35:24];
+            live_frame_class <= live_dest_payload[50:46];
+        end
+    end
+endmodule
+
+
 module videocap_sampler #(
     parameter integer BUF_DEPTH   = 2048,
     parameter integer RGB_MODE    = 0,
@@ -244,6 +348,8 @@ module videocap_sampler #(
     parameter integer PROBE_SOURCE_X = 928
 ) (
     input  wire        cap_clk,
+    input  wire        cap_reset,
+    output wire        capture_ready,
     input  wire        vcap_vsync,
     input  wire        vcap_hsync,
     input  wire [7:0]  vcap_r,
@@ -252,16 +358,32 @@ module videocap_sampler #(
     input  wire        grid_ref,
 
     input  wire        ctl_send,
-    input  wire [26:0] ctl_payload,
+    input  wire [28:0] ctl_payload,
     output wire        ctl_received,
     input  wire        ctl_read_full_width,
     output wire [1:0]  detected_standard,
+    /* AXI-domain coherent snapshot of the actual capture configuration. */
+    output wire [31:0] live_effective_crop,
+    output wire [9:0]  live_line_count,
+    /* Coherent AXI snapshot of the frame's completed line width. */
+    output wire [11:0] live_line_words,
+    /* Coherent AXI snapshot {interlace, doubled, short, tall, ntsc}. */
+    output wire [4:0]  live_frame_class,
 
     output reg  [10:0] cap_x,
     output reg  [10:0] cap_y,
     output reg  [10:0] cap_ymax,
     output reg         cap_interlace,
     output reg         cap_ntsc,
+    /* Doubled-scan source (DblPAL, DblNTSC, Euro72, Multiscan: a line of
+     * 900..1100 capture clocks at 28 MHz, one pixel per clock) and a
+     * 24 kHz one (Super72, ~1230 clocks, two clocks a pixel), decided
+     * per frame from the measured line period like the standard is from
+     * the line count.  cap_tall: the woven frame holds more than 512 rows
+     * (the ARM picks x1 instead of x2 for full-width output). */
+    output reg         cap_doubled = 0,
+    output reg         cap_short = 0,
+    output reg         cap_tall = 0,
     output reg         cap_x_done,
     output reg         cap_shres,
     output reg         cap_line_toggle = 0,
@@ -282,12 +404,22 @@ module videocap_sampler #(
     output reg  [11:0] probe_source_x = 0,
     output reg  [31:0] probe_context = 0,
     output reg  [31:0] probe_config = 0,
+    /* Frozen timing/geometry snapshot for the first complete field after
+     * each shared probe arm.  The payload is stable before diag_valid rises. */
+    output reg         diag_valid = 0,
+    output reg  [383:0] diag_data = 0,
     output reg         probe_precrop_valid = 0,
     output reg  [31:0] probe_precrop_context = 0,
     input  wire [5:0]  probe_precrop_raddr,
     output wire [31:0] probe_precrop_rdata,
 
     input  wire        axi_clk,
+    input  wire        axi_resetn,
+    input  wire        cal_arm,
+    input  wire [9:0]  cal_address,
+    input  wire [3:0]  cal_metadata_address,
+    output wire [31:0] cal_status, cal_data, cal_geometry,
+    output wire [31:0] cal_metadata_data,
     input  wire        buf_rbank,
     input  wire [11:0] buf_raddr,
     output wire [31:0] buf_rdata
@@ -296,9 +428,11 @@ module videocap_sampler #(
 /* The source holds this bundled payload for the complete four-phase XPM
  * transaction.  External destination acknowledgement delays completion
  * until the next capture frame boundary. */
-wire [26:0] ctl_dest_payload;
+wire [28:0] ctl_dest_payload;
 wire ctl_dest_req;
 reg ctl_dest_ack = 0;
+reg ctl_apply_pending = 0;
+wire live_publish_settled;
 
 xpm_cdc_handshake #(
     .DEST_EXT_HSK(1),
@@ -306,7 +440,7 @@ xpm_cdc_handshake #(
     .INIT_SYNC_FF(1),
     .SIM_ASSERT_CHK(0),
     .SRC_SYNC_FF(4),
-    .WIDTH(27)
+    .WIDTH(29)
 ) videocap_control_handshake (
     .src_clk(axi_clk),
     .src_in(ctl_payload),
@@ -318,10 +452,99 @@ xpm_cdc_handshake #(
     .dest_ack(ctl_dest_ack)
 );
 
+localparam [11:0] CROP_V_AUTO_PAL = 12'd40;
+localparam [11:0] CROP_V_AUTO_NTSC = 12'd39;
+
 reg [1:0] ctl_sample_mode_cap = 2'd0;
+reg cap_prev_ymax_par = 0;   /* last frame's cap_ymax parity: laced
+                               * doubled fields alternate it */
+reg cap_prev_ymax_valid = 0; /* set by the first ready frame; guards the
+                               * parity compare against power-on X state */
+/* Completed words of each line (latched at its sync) and of the frame
+ * (its last line), so full-width short-not-doubled sources can size
+ * scanout from the words capture actually produced. */
+reg [10:0] cap_line_words = 0;
+reg [10:0] cap_xmax = 0;
 reg ctl_full_width_cap = 1'b0;
 reg [11:0] ctl_crop_h_cap = 12'd188;
 reg [11:0] ctl_crop_v_cap = 12'd26;
+/* Mirrors the request's automatic-vertical flag: while set, the applied
+ * vertical crop follows the detected standard (PAL 40, NTSC 39). The
+ * commit payload carries the PAL-resolved value because the source domain
+ * cannot see the detector; the re-resolution below owns the difference. */
+reg ctl_crop_v_auto_cap = 1'b0;
+/* The horizontal twin of the flag above: while set, the applied crop
+ * follows the measured line class (the doubled-scan and 24 kHz modes
+ * have their own measured origins), with the committed value as the
+ * 15 kHz fallback. */
+reg ctl_crop_h_auto_cap = 1'b0;
+
+/* THE LINE CLASS, from the measured line period (phase_line_period, in
+ * capture clocks): the 15 kHz standards run 1800..1830 clocks at 28 MHz,
+ * Super72 about 1232, the AGA/ECS doubled modes 912..1040.  Frozen at
+ * frame_sync so the pairing and the crop cannot move inside a frame.
+ * Thresholds in 28 MHz clocks; a 14 MHz front end counts half as many. */
+localparam [11:0] LINE_SHORT_MAX   = (FULLRATE != 0) ? 12'd1400 : 12'd700;
+localparam [11:0] LINE_DOUBLED_MAX = (FULLRATE != 0) ? 12'd1100 : 12'd550;
+/* Below the floor (~12.4 us at 28 MHz, twice that at the Denise front
+ * end's halved counts) no physical source line exists: input-resolution
+ * glitches at power-on measure a handful of clocks and must classify as
+ * nothing, or the first real field runs with the pairing and the SHR
+ * metric gated off (the one-frame-late class latch). */
+localparam [11:0] LINE_CLASS_FLOOR  = (FULLRATE != 0) ? 12'd350 : 12'd175;
+/* A VSYNC-burst-spanning interval (the filtered path has no line_sync
+ * in the burst, so the first line after it carries the whole burst in
+ * phase_x) must not set the class.  Every valid source line - 15 kHz
+ * 1830 at 28 MHz, 915 at 14 MHz - is below this cap. */
+localparam [11:0] LINE_PERIOD_CAP   = (FULLRATE != 0) ? 12'd2048 : 12'd1024;
+/* Where the doubled and 24 kHz pictures start, measured on an A4000
+ * against the BigBox's tables (ZZ9000_CAPTURE_TABLES.md, 29 Sep 2026):
+ * the sync pulse of these modes is 2.5 us (71 clocks), not 4.7.  The
+ * full-width path starts at the picture's first pixel, as 278 / 40 does
+ * for a 15 kHz line; the filtered path keeps the margin 188 / 26 gives
+ * a 15 kHz picture in 720 columns - 45 pixels and 14 lines before it
+ * (91 samples of pairs, 45 of a doubled-scan line).  AGA numbers; the
+ * ECS origins (145 / 30 and 193 / 25 full width) are per machine and
+ * stay explicit-commit territory. */
+/* 28 MHz control units, same as the commit payload.  crop_h_local is the
+ * only Denise halving; pre-halving these constants would apply it twice. */
+localparam [11:0] CROP_H_DOUBLED   = 12'd213;
+localparam [11:0] CROP_H_DOUBLED_F = 12'd168;
+localparam [11:0] CROP_H_SHORT     = 12'd261;
+localparam [11:0] CROP_H_SHORT_F   = 12'd171;
+localparam [11:0] CROP_V_CLASS     = 12'd16;
+localparam [11:0] CROP_V_CLASS_F   = 12'd2;
+wire [11:0] crop_h_eff = (ctl_crop_h_auto_cap && cap_doubled) ?
+                             (ctl_full_width_cap ? CROP_H_DOUBLED :
+                                                   CROP_H_DOUBLED_F) :
+                         (ctl_crop_h_auto_cap && cap_short) ?
+                             (ctl_full_width_cap ? CROP_H_SHORT :
+                                                   CROP_H_SHORT_F) :
+                         ctl_crop_h_cap;
+wire [11:0] crop_v_eff = (ctl_crop_v_auto_cap &&
+                          (cap_doubled || cap_short)) ?
+                             (ctl_full_width_cap ? CROP_V_CLASS :
+                                                   CROP_V_CLASS_F) :
+                         ctl_crop_v_cap;
+
+videocap_live_publish videocap_live_publish_inst (
+    .cap_clk(cap_clk),
+    .crop_h(crop_h_eff),
+    .crop_v(crop_v_eff),
+    .line_count(cap_ymax[9:0]),
+    .line_words({1'b0, cap_xmax}),
+    .axi_clk(axi_clk),
+    .settled(live_publish_settled),
+    .live_effective_crop(live_effective_crop),
+    .interlace(cap_interlace),
+    .doubled(cap_doubled),
+    .short_l(cap_short),
+    .tall(cap_tall),
+    .ntsc(cap_ntsc),
+    .live_line_count(live_line_count),
+    .live_line_words(live_line_words),
+    .live_frame_class(live_frame_class)
+);
 
 reg [6:0] hs = 0;
 reg [6:0] vs = 0;
@@ -345,6 +568,12 @@ wire [23:0] rgbin =
                        vcap_b_iob[7:4], vcap_b_iob[7:4]} :
                       {vcap_r_iob, vcap_g_iob, vcap_b_iob};
 reg [10:0] sample_x = 0;
+reg [10:0] window_x = 0;
+reg window_x_hold = 0;
+reg [1:0] window_phase_ref = 0;
+reg window_phase_valid = 0;
+reg [1:0] cap_grid = 0;
+reg grid_seen = 0;
 reg [10:0] raw_y = 0;
 reg lace_field = 0;
 reg next_lace_field = 0;
@@ -352,7 +581,14 @@ reg [3:0] shortlines = 0;
 reg [7:0] hs_pulse_width = 0;
 reg [11:0] phase_x = 0;
 reg [11:0] phase_line_period = 0;
+reg [11:0] field_max_period = 0;
 reg [11:0] vsync_phase_x = 0;
+reg [15:0] line_cycle = 0;
+reg [15:0] previous_line_cycle = 0;
+reg line_history_valid = 0;
+reg [31:0] line_meta_identity = 0;
+reg [31:0] line_meta_timing = 0;
+reg [31:0] line_meta_context = 0;
 
 /* Both capture paths use a two-bank line buffer.  Full-rate variants bank
  * only in full-width mode as before; filtered (Denise-adapter) variants
@@ -423,15 +659,47 @@ wire frame_sync = (CSYNC_VSYNC != 0) ?
     (hs[6:1] == 6'b000111 && hs_pulse_width >= 8'd128) :
     (vs[6:1] == 6'b111000);
 wire line_sync = (hs[6:1] == 6'b000111);
-wire completed_frame_ntsc = (raw_y >= 11'h190) ?
-    ((raw_y >= 11'h23a) ? 1'b0 : 1'b1) :
-    ((raw_y >= ((CSYNC_VSYNC != 0) ? 11'h130 : 11'h138)) ?
-        1'b0 : 1'b1);
+/* The class is set from the field's longest line period, not the last
+ * sync-edge interval: a composite 15 kHz source's equalisation burst
+ * ends on a half-line, which would misread as doubled / short.  The
+ * max over the field is the video-line period for 15 kHz (the burst's
+ * half-lines are shorter) and the only period for doubled / 24 kHz
+ * sources (no burst half-lines).  Falls back to phase_line_period when
+ * no line has been seen (first field after reset). */
+wire [11:0] class_period = (field_max_period != 0) ?
+    field_max_period : phase_line_period;
+// After a clock reset, discard two field boundaries while timing and the
+// pixel-pair grid settle. Clock loss invalidates readiness even if cap_clk stops.
+reg [1:0] recovery_fields = 0;
+/* Readiness must drop on clock loss without any capture-clock edge
+ * (behavioral contract, videocap_recovery_tb), so the pin stays
+ * combinational even though it feeds the ACLK-domain vcap_ready_sync
+ * synchronizer in mntzorro.v. */
+assign capture_ready = !cap_reset && recovery_fields == 0;
+always @(posedge cap_clk) begin
+    if (cap_reset) recovery_fields <= 2;
+    else if (frame_sync && recovery_fields != 0)
+        recovery_fields <= recovery_fields - 1'b1;
+end
+
+/* The standard the publisher carries must agree with cap_ntsc (what the
+ * ARM applies): short-line (doubled / 24 kHz) sources classify by the
+ * woven frame - 480 rows fits (DblNTSC 478, Euro72 427) - PAL needs 576
+ * (DblPAL 574, Multiscan 507, Super72 658).  15 kHz sources keep the
+ * line-count rule.  At frame_sync raw_y is the just-completed field's
+ * count - the value the cap_ntsc register latches on this boundary - so
+ * both paths compare the same quantity and cannot drift apart. */
+wire completed_frame_ntsc = cap_short ?
+    ((cap_interlace ? {raw_y[9:0], 1'b0} : raw_y) <= 11'd480) :
+    ((raw_y >= 11'h190) ?
+        ((raw_y >= 11'h23a) ? 1'b0 : 1'b1) :
+        ((raw_y >= ((CSYNC_VSYNC != 0) ? 11'h130 : 11'h138)) ?
+            1'b0 : 1'b1));
 
 videocap_standard_cdc videocap_standard_publish (
     .cap_clk(cap_clk),
     .axi_clk(axi_clk),
-    .frame_complete(frame_sync && raw_y != 0),
+    .frame_complete(frame_sync && raw_y != 0 && capture_ready),
     .frame_ntsc(completed_frame_ntsc),
     .standard_axi(detected_standard)
 );
@@ -443,13 +711,36 @@ videocap_standard_cdc videocap_standard_publish (
  * to the historical 94-clock crop without requiring a firmware variant.
  */
 wire [11:0] crop_h_local = (FULLRATE != 0) ?
-    ctl_crop_h_cap : {1'b0, ctl_crop_h_cap[11:1]};
+    crop_h_eff : {1'b0, crop_h_eff[11:1]};
+wire use_grid_window = (FULLRATE != 0) && grid_seen && window_phase_valid;
+wire [11:0] capture_window_x = use_grid_window ?
+    {1'b0, window_x} : {1'b0, sample_x};
+wire [1:0] window_phase_delta = cap_grid - window_phase_ref;
 wire [11:0] probe_precrop_start = crop_h_local - 12'd64;
+
+videocap_calibration_capture calibration_capture (
+    .cap_clk(cap_clk), .cap_reset(!capture_ready), .frame_sync(frame_sync),
+    .raw_x(capture_window_x[10:0]), .raw_y(raw_y), .crop_h(crop_h_local),
+    .crop_v(crop_v_eff), .rgb(rgbin), .interlace(cap_interlace),
+    .field_parity(lace_field), .ntsc(cap_ntsc),
+    .line_meta_identity(line_meta_identity),
+    .line_meta_timing(line_meta_timing),
+    .line_meta_context(line_meta_context),
+    .axi_clk(axi_clk), .axi_resetn(axi_resetn), .arm_toggle(cal_arm),
+    .read_addr(cal_address), .read_data(cal_data), .status(cal_status),
+    .metadata_read_addr(cal_metadata_address),
+    .metadata_read_data(cal_metadata_data), .geometry(cal_geometry)
+);
 
 reg half = 0;
 
 reg [23:0] rgb_prev = 0;
-wire filter_pairs = (FULLRATE != 0) && !ctl_full_width_cap;
+/* A doubled-scan line carries one pixel per 28 MHz clock (640 in 640),
+ * so pairing would keep every other pixel: the filtered path stores
+ * every sample there and the line comes out 640 wide, as a paired
+ * 15 kHz HiRes line does after pairing.  Denise-adapter (14 MHz)
+ * variants cannot: half the pixels never reach them. */
+wire filter_pairs = (FULLRATE != 0) && !ctl_full_width_cap && !cap_doubled;
 
 /* E7M-locked sample grid (#96).  The capture clock is 4x the E7M
  * reference, so a 4-phase counter anchored to grid_ref marks the two
@@ -460,17 +751,27 @@ wire filter_pairs = (FULLRATE != 0) && !ctl_full_width_cap;
 reg grid_ref_meta = 0;
 reg grid_ref_sync = 0;
 reg grid_ref_prev = 0;
-reg [1:0] cap_grid = 0;
-reg grid_seen = 0;
 /* Which grid phase starts a stored pair.  The detected reference edge
  * keeps a fixed but implementation-set phase against real pixel
  * boundaries, so a per-frame content measurement selects between the
  * two pairings: on hires content the aligned pairing shows far smaller
  * intra-pair than cross-pair differences. */
 reg pair_parity = 0;
-reg [26:0] grid_intra_sum = 0;
-reg [26:0] grid_cross_sum = 0;
+reg [29:0] grid_intra_sum = 0;
+reg [29:0] grid_cross_sum = 0;
 reg [23:0] grid_prev_second = 0;
+reg [7:0] grid_intra_r_delta = 0;
+reg [7:0] grid_intra_g_delta = 0;
+reg [7:0] grid_intra_b_delta = 0;
+reg [7:0] grid_cross_r_delta = 0;
+reg [7:0] grid_cross_g_delta = 0;
+reg [7:0] grid_cross_b_delta = 0;
+reg grid_intra_channels_valid = 0;
+reg grid_cross_channels_valid = 0;
+reg [9:0] grid_intra_delta_pending = 0;
+reg [9:0] grid_cross_delta_pending = 0;
+reg grid_intra_delta_valid = 0;
+reg grid_cross_delta_valid = 0;
 /* The cross-pair metric must never compare against the previous
  * line's blanking tail: at the first stored pair after line sync
  * that stale sample would inject a blank-to-content edge (PR
@@ -479,28 +780,31 @@ reg [23:0] grid_prev_second = 0;
 reg grid_prev_second_valid = 0;
 wire grid_pair_first = (cap_grid[0] == pair_parity);
 
-/* Alignment metric across all three channels: edges that change
- * only green or blue while red stays constant must still move the
- * phase measurement, or such content would never adapt. */
-function [9:0] grid_rgb_delta;
-    input [23:0] a;
-    input [23:0] b;
+/* Alignment metric across all three channels: edges that change only green
+ * or blue while red stays constant must still move the phase measurement.
+ * Register each channel difference before adding the three channels; the
+ * direct input path otherwise exceeds one 114 MHz capture cycle. */
+function [7:0] grid_channel_delta;
+    input [7:0] a;
+    input [7:0] b;
     begin
-        grid_rgb_delta =
-            (a[23:16] > b[23:16] ? a[23:16] - b[23:16] : b[23:16] - a[23:16]) +
-            (a[15:8] > b[15:8] ? a[15:8] - b[15:8] : b[15:8] - a[15:8]) +
-            (a[7:0] > b[7:0] ? a[7:0] - b[7:0] : b[7:0] - a[7:0]);
+        grid_channel_delta = (a > b) ? a - b : b - a;
     end
 endfunction
-wire [9:0] grid_intra_delta = grid_rgb_delta(rgbin, rgb_prev);
-wire [9:0] grid_cross_delta = grid_prev_second_valid ?
-    grid_rgb_delta(rgbin, grid_prev_second) : 10'd0;
-/* Margin comparison in a widened domain: both sums saturate
- * at 27 bits on max-activity frames, where a 27-bit add would
- * wrap and misread equal metrics as misaligned (PR review).
- */
-wire [29:0] grid_intra_w = {3'b0, grid_intra_sum};
-wire [29:0] grid_margin_w = {6'd0, grid_intra_sum[26:3]};
+wire [7:0] grid_intra_r = grid_channel_delta(rgbin[23:16],
+                                             rgb_prev[23:16]);
+wire [7:0] grid_intra_g = grid_channel_delta(rgbin[15:8],
+                                             rgb_prev[15:8]);
+wire [7:0] grid_intra_b = grid_channel_delta(rgbin[7:0],
+                                             rgb_prev[7:0]);
+wire [7:0] grid_cross_r = grid_channel_delta(rgbin[23:16],
+                                             grid_prev_second[23:16]);
+wire [7:0] grid_cross_g = grid_channel_delta(rgbin[15:8],
+                                             grid_prev_second[15:8]);
+wire [7:0] grid_cross_b = grid_channel_delta(rgbin[7:0],
+                                             grid_prev_second[7:0]);
+wire [29:0] grid_intra_w = grid_intra_sum;
+wire [29:0] grid_margin_w = {3'd0, grid_intra_sum[29:3]};
 /* SuperHires changes within a 28 MHz sample pair; hires and lores do not.
  * Keep classification independent of whether that pair is stored separately
  * or filtered into one output pixel. */
@@ -550,6 +854,37 @@ reg probe_precrop_publish_pending = 0;
 reg [31:0] probe_precrop_mem [0:63];
 assign probe_precrop_rdata = probe_precrop_mem[probe_precrop_raddr];
 
+reg diag_waiting = 0;
+reg diag_field_started = 0;
+reg diag_publish_pending = 0;
+reg diag_seen_rise = 0;
+reg diag_seen_fall = 0;
+wire [15:0] diag_field_sequence = diag_data[351:336];
+reg [15:0] diag_rise_count = 0;
+reg [15:0] diag_fall_count = 0;
+reg [15:0] diag_transition_age = 0;
+reg [15:0] diag_rise_age = 0;
+reg [15:0] diag_fall_age = 0;
+reg [15:0] diag_low_min = 16'hffff;
+reg [15:0] diag_low_max = 0;
+reg [15:0] diag_high_min = 16'hffff;
+reg [15:0] diag_high_max = 0;
+reg [15:0] diag_rise_period_min = 16'hffff;
+reg [15:0] diag_rise_period_max = 0;
+reg [15:0] diag_fall_period_min = 16'hffff;
+reg [15:0] diag_fall_period_max = 0;
+reg [10:0] diag_cap_x_max = 0;
+reg [10:0] diag_completed_y_max = 0;
+wire diag_hsync_rise = (hs[6:5] == 2'b01);
+wire diag_hsync_fall = (hs[6:5] == 2'b10);
+wire [15:0] diag_transition_interval =
+    (diag_transition_age == 16'hffff) ? 16'hffff :
+    diag_transition_age + 1'b1;
+wire [15:0] diag_rise_period =
+    (diag_rise_age == 16'hffff) ? 16'hffff : diag_rise_age + 1'b1;
+wire [15:0] diag_fall_period =
+    (diag_fall_age == 16'hffff) ? 16'hffff : diag_fall_age + 1'b1;
+
 xpm_cdc_single #(
     .DEST_SYNC_FF(3),
     .INIT_SYNC_FF(1),
@@ -564,20 +899,85 @@ xpm_cdc_single #(
 
 reg [15:0] diff_count = 0;
 
+// Keep the RGB input registers reset-free so all 24 fit in input ILOGIC.
 always @(posedge cap_clk) begin
-    if (!ctl_dest_req)
+    vcap_r_iob <= vcap_r;
+    vcap_g_iob <= vcap_g;
+    vcap_b_iob <= vcap_b;
+end
+
+always @(posedge cap_clk) begin
+    if (!ctl_dest_req) begin
         ctl_dest_ack <= 1'b0;
-    else if (!ctl_dest_ack && frame_sync) begin
+        ctl_apply_pending <= 1'b0;
+    end else if (!ctl_dest_ack && !ctl_apply_pending &&
+                 frame_sync && !cap_reset) begin
         ctl_sample_mode_cap <= ctl_dest_payload[1:0];
         ctl_full_width_cap <= ctl_dest_payload[2];
         ctl_crop_h_cap <= ctl_dest_payload[14:3];
+        ctl_crop_v_auto_cap <= ctl_dest_payload[28];
+        ctl_crop_h_auto_cap <= ctl_dest_payload[27];
         ctl_crop_v_cap <= ctl_dest_payload[26:15];
+        ctl_apply_pending <= 1'b1;
+    end else if (ctl_apply_pending && live_publish_settled && !cap_reset) begin
         ctl_dest_ack <= 1'b1;
     end
 
+    /* Automatic vertical crop follows the detected standard. The boot
+     * commit resolves before NTSC detection settles (the source domain
+     * cannot see the detector), so re-resolve at every frame boundary
+     * while automatic. Full-rate only: the Denise path's compatible
+     * crop is 26 lines, and 40/39 would over-crop it. A short-line
+     * source's cap_ntsc means "fits 480 rows", not the 15 kHz crop, so
+     * it must not clobber the register the 15 kHz path reads next.
+     * An explicit commit arriving in the same cycle clears the flag
+     * and wins. */
+    if (frame_sync && !cap_reset && ctl_crop_v_auto_cap &&
+            FULLRATE != 0 && !cap_short &&
+            !(ctl_dest_req && !ctl_dest_ack)) begin
+        ctl_crop_v_cap <= cap_ntsc ?
+            CROP_V_AUTO_NTSC : CROP_V_AUTO_PAL;
+    end
+
+    if (cap_reset) begin
+        hs <= 0; vs <= 0;
+        sample_x <= 0; window_x <= 0; window_x_hold <= 0;
+        window_phase_ref <= 0; window_phase_valid <= 0; raw_y <= 0;
+        cap_x <= 0; cap_y <= 0; cap_ymax <= 0;
+        cap_line_words <= 0; cap_xmax <= 0;
+        cap_prev_ymax_par <= 0;
+        cap_prev_ymax_valid <= 0;
+        cap_interlace <= 0; cap_ntsc <= 0; cap_shres <= 0;
+        cap_doubled <= 0; cap_short <= 0; cap_tall <= 0;
+        cap_x_done <= 0;
+        lace_field <= 0; next_lace_field <= 0;
+        shortlines <= 0; hs_pulse_width <= 0;
+        phase_x <= 0; phase_line_period <= 0; vsync_phase_x <= 0;
+        field_max_period <= 0;
+        line_cycle <= 0; previous_line_cycle <= 0;
+        line_history_valid <= 0;
+        line_meta_identity <= 0; line_meta_timing <= 0;
+        line_meta_context <= 0;
+        grid_ref_meta <= 0; grid_ref_sync <= 0; grid_ref_prev <= 0;
+        grid_seen <= 0; cap_grid <= 0;
+        pair_parity <= 0; grid_intra_sum <= 0; grid_cross_sum <= 0;
+        grid_intra_channels_valid <= 0; grid_cross_channels_valid <= 0;
+        grid_intra_delta_pending <= 0; grid_cross_delta_pending <= 0;
+        grid_intra_delta_valid <= 0; grid_cross_delta_valid <= 0;
+        grid_prev_second_valid <= 0;
+        half <= 0; shres_half <= 0; diff_count <= 0;
+        cap_token_pending <= 0; cap_frame_anchor_sent <= 0;
+        // Keep event toggles monotonic; resetting them would create fake tokens.
+        probe_valid <= 0; probe_waiting <= 0; probe_publish_pending <= 0;
+        probe_arm_seen <= probe_arm_toggle_cap;
+        probe_precrop_valid <= 0; probe_precrop_waiting <= 0;
+        probe_precrop_publish_pending <= 0;
+        diag_valid <= 0; diag_waiting <= 0; diag_field_started <= 0;
+        diag_publish_pending <= 0;
+    end else begin
     /* Publish the completed-line token one capture clock after its payload
      * was latched, so it is stable across the line-CDC toggle edge. */
-    if (cap_token_pending) begin
+    if (cap_token_pending && capture_ready) begin
         cap_token_pending <= 0;
         cap_line_toggle <= ~cap_line_toggle;
     end
@@ -588,18 +988,153 @@ always @(posedge cap_clk) begin
      * cover that latency and the formatter's early line-zero prefetch. */
     if (frame_sync)
         cap_frame_anchor_sent <= 0;
-    else if (cap_token_pending && FULLRATE != 0 &&
+    else if (cap_token_pending && capture_ready && FULLRATE != 0 &&
             ctl_full_width_cap && !cap_frame_anchor_sent) begin
         cap_frame_anchor_toggle <= ~cap_frame_anchor_toggle;
         cap_frame_anchor_sent <= 1;
     end
 
+    line_cycle <= line_cycle + 1'b1;
     if (line_sync) begin
+        /* Freeze the accepted edge that establishes the next raw row's
+         * coordinate origin. A free-running timestamp exposes missed or
+         * displaced edges independently of the counters reset below. */
+        line_meta_identity <= {
+            line_history_valid, grid_seen, pair_parity, cap_grid,
+            raw_y + 1'b1, hs_pulse_width, shortlines, 4'b0
+        };
+        line_meta_timing <= {
+            line_cycle, line_cycle - previous_line_cycle
+        };
+        line_meta_context <= {
+            1'b0, sample_x, phase_x, grid_pair_first,
+            ctl_full_width_cap, ctl_sample_mode_cap,
+            (FULLRATE != 0), (CSYNC_VSYNC != 0), RGB_MODE[1:0]
+        };
+        previous_line_cycle <= line_cycle;
+        line_history_valid <= 1;
         if (phase_x != 0)
             phase_line_period <= phase_x;
+        if (phase_x > field_max_period && phase_x < LINE_PERIOD_CAP)
+            field_max_period <= phase_x;
         phase_x <= 0;
     end else if (phase_x != 12'hfff) begin
         phase_x <= phase_x + 1'b1;
+    end
+
+    /* Measure only after an armed frame boundary.  This excludes partial
+     * intervals at the arm edge and leaves the capture pipeline untouched. */
+    if (diag_waiting && diag_field_started) begin
+        if (diag_hsync_rise) begin
+            if (diag_rise_count != 16'hffff)
+                diag_rise_count <= diag_rise_count + 1'b1;
+            if (diag_seen_fall) begin
+                if (diag_transition_interval < diag_low_min)
+                    diag_low_min <= diag_transition_interval;
+                if (diag_transition_interval > diag_low_max)
+                    diag_low_max <= diag_transition_interval;
+            end
+            if (diag_seen_rise) begin
+                if (diag_rise_period < diag_rise_period_min)
+                    diag_rise_period_min <= diag_rise_period;
+                if (diag_rise_period > diag_rise_period_max)
+                    diag_rise_period_max <= diag_rise_period;
+            end
+            diag_seen_rise <= 1;
+        end
+
+        if (diag_hsync_fall) begin
+            if (diag_fall_count != 16'hffff)
+                diag_fall_count <= diag_fall_count + 1'b1;
+            if (diag_seen_rise) begin
+                if (diag_transition_interval < diag_high_min)
+                    diag_high_min <= diag_transition_interval;
+                if (diag_transition_interval > diag_high_max)
+                    diag_high_max <= diag_transition_interval;
+            end
+            if (diag_seen_fall) begin
+                if (diag_fall_period < diag_fall_period_min)
+                    diag_fall_period_min <= diag_fall_period;
+                if (diag_fall_period > diag_fall_period_max)
+                    diag_fall_period_max <= diag_fall_period;
+            end
+            diag_seen_fall <= 1;
+        end
+
+        if (diag_hsync_rise || diag_hsync_fall)
+            diag_transition_age <= 0;
+        else if (diag_transition_age != 16'hffff)
+            diag_transition_age <= diag_transition_age + 1'b1;
+
+        if (diag_hsync_rise)
+            diag_rise_age <= 0;
+        else if (diag_rise_age != 16'hffff)
+            diag_rise_age <= diag_rise_age + 1'b1;
+
+        if (diag_hsync_fall)
+            diag_fall_age <= 0;
+        else if (diag_fall_age != 16'hffff)
+            diag_fall_age <= diag_fall_age + 1'b1;
+
+        if (cap_x > diag_cap_x_max)
+            diag_cap_x_max <= cap_x;
+        if (line_sync && !ctl_full_width_cap &&
+                capture_output_line_valid &&
+                capture_output_y > diag_completed_y_max)
+            diag_completed_y_max <= capture_output_y;
+        if (ctl_full_width_cap && FULLRATE != 0 && !cap_x_done &&
+                cap_x >= 11'd1279 && capture_output_line_valid &&
+                capture_output_y > diag_completed_y_max)
+            diag_completed_y_max <= capture_output_y;
+    end
+
+    if (frame_sync && probe_arm_seen == probe_arm_toggle_cap &&
+            diag_waiting) begin
+        if (diag_field_started) begin
+            diag_data[31:0] <= {16'b0, diag_rise_count};
+            diag_data[63:32] <= {16'b0, diag_fall_count};
+            diag_data[95:64] <= {diag_low_max, diag_low_min};
+            diag_data[127:96] <= {diag_high_max, diag_high_min};
+            diag_data[159:128] <=
+                {diag_rise_period_max, diag_rise_period_min};
+            diag_data[191:160] <=
+                {diag_fall_period_max, diag_fall_period_min};
+            diag_data[223:192] <= {diag_rise_age, diag_fall_age};
+            diag_data[255:224] <=
+                {5'b0, diag_cap_x_max, 5'b0, diag_completed_y_max};
+            diag_data[287:256] <= {5'b0, raw_y, 5'b0, cap_y};
+            diag_data[319:288] <=
+                {4'b0, ctl_full_width_cap, ctl_sample_mode_cap, 1'b0,
+                 crop_v_eff, crop_h_eff};
+            diag_data[351:320] <=
+                {diag_field_sequence + 1'b1, lace_field, next_lace_field,
+                 cap_interlace, cap_ntsc, ctl_full_width_cap,
+                 ctl_sample_mode_cap, (FULLRATE != 0),
+                 (CSYNC_VSYNC != 0), RGB_MODE[1:0], 1'b0, shortlines};
+            diag_data[383:352] <=
+                {4'b0, phase_line_period, 4'b0, vsync_phase_x};
+            diag_publish_pending <= 1;
+            diag_field_started <= 0;
+        end else begin
+            diag_field_started <= 1;
+            diag_seen_rise <= 0;
+            diag_seen_fall <= 0;
+            diag_rise_count <= 0;
+            diag_fall_count <= 0;
+            diag_transition_age <= 0;
+            diag_rise_age <= 0;
+            diag_fall_age <= 0;
+            diag_low_min <= 16'hffff;
+            diag_low_max <= 0;
+            diag_high_min <= 16'hffff;
+            diag_high_max <= 0;
+            diag_rise_period_min <= 16'hffff;
+            diag_rise_period_max <= 0;
+            diag_fall_period_min <= 16'hffff;
+            diag_fall_period_max <= 0;
+            diag_cap_x_max <= 0;
+            diag_completed_y_max <= 0;
+        end
     end
 
     if (probe_arm_seen != probe_arm_toggle_cap) begin
@@ -611,12 +1146,23 @@ always @(posedge cap_clk) begin
         probe_precrop_valid <= 0;
         probe_precrop_waiting <= 1;
         probe_precrop_publish_pending <= 0;
+        diag_valid <= 0;
+        diag_waiting <= 1;
+        diag_field_started <= 0;
+        diag_publish_pending <= 0;
     end else if (probe_publish_pending) begin
         /* The complete 512-bit snapshot has been stable for one capture
          * clock before valid crosses back to AXI. */
         probe_valid <= 1;
         probe_waiting <= 0;
         probe_publish_pending <= 0;
+    end
+
+    if (probe_arm_seen == probe_arm_toggle_cap && diag_publish_pending) begin
+        /* The complete diagnostic bundle was frozen on the prior clock. */
+        diag_valid <= 1;
+        diag_waiting <= 0;
+        diag_publish_pending <= 0;
     end
 
     if (probe_arm_seen == probe_arm_toggle_cap &&
@@ -638,12 +1184,37 @@ always @(posedge cap_clk) begin
         cap_grid <= cap_grid + 2'd1;
     end
 
+    if (grid_intra_channels_valid) begin
+        grid_intra_delta_pending <=
+            {2'd0, grid_intra_r_delta} +
+            {2'd0, grid_intra_g_delta} +
+            {2'd0, grid_intra_b_delta};
+        grid_intra_delta_valid <= 1;
+        grid_intra_channels_valid <= 0;
+    end
+    if (grid_cross_channels_valid) begin
+        grid_cross_delta_pending <=
+            {2'd0, grid_cross_r_delta} +
+            {2'd0, grid_cross_g_delta} +
+            {2'd0, grid_cross_b_delta};
+        grid_cross_delta_valid <= 1;
+        grid_cross_channels_valid <= 0;
+    end
+
+    if (grid_intra_delta_valid) begin
+        grid_intra_sum <=
+            grid_intra_sum + {20'd0, grid_intra_delta_pending};
+        grid_intra_delta_valid <= 0;
+    end
+    if (grid_cross_delta_valid) begin
+        grid_cross_sum <=
+            grid_cross_sum + {20'd0, grid_cross_delta_pending};
+        grid_cross_delta_valid <= 0;
+    end
+
     vs <= {vs[5:0], vcap_vsync};
     hs <= {hs[5:0], vcap_hsync};
 
-    vcap_r_iob <= vcap_r;
-    vcap_g_iob <= vcap_g;
-    vcap_b_iob <= vcap_b;
 
     if (hs == 0) begin
         if (hs_pulse_width < 8'hff)
@@ -654,14 +1225,38 @@ always @(posedge cap_clk) begin
     end
 
     if (frame_sync) begin
-        cap_x_done <= 0;
-        if (cap_ymax >= 11'h190)
+        /* The line class for the frame now starting.  class_period is
+         * the field's longest line (the video line for 15 kHz, the only
+         * line for doubled / 24 kHz), not the last sync-edge interval,
+         * which a composite equalisation burst would leave at a half
+         * line and misread as doubled / short. */
+        cap_doubled <= (class_period >= LINE_CLASS_FLOOR) &&
+                       (class_period < LINE_DOUBLED_MAX);
+        cap_short   <= (class_period >= LINE_CLASS_FLOOR) &&
+                       (class_period < LINE_SHORT_MAX);
+        field_max_period <= 0;
+        /* Interlace detection.  15 kHz keeps its hardware-proven rules
+         * (400+ lines a field is progressive; otherwise the VSYNC
+         * phase).  Doubled/24 kHz sources use the field line-count
+         * PARITY instead: laced fields alternate N/N+1 lines (287/288
+         * DblPAL, 213/214 Euro72) while a no-lace frame is constant
+         * (574 DblPAL NoLace) - and a doubled VSYNC can alternate its
+         * horizontal phase every frame even without lacing, which the
+         * phase test misreads as interlace (comb: rows written with
+         * stride 2, every other output line stale). */
+        if (cap_short && capture_ready) begin
+            if (cap_prev_ymax_valid)
+                cap_interlace <= cap_ymax[0] != cap_prev_ymax_par;
+            cap_prev_ymax_par <= cap_ymax[0];
+            cap_prev_ymax_valid <= 1;
+        end else if (cap_ymax >= 11'h190)
             cap_interlace <= 0;
         else if (CSYNC_VSYNC != 0)
             cap_interlace <= (next_lace_field != lace_field);
         else
             cap_interlace <=
                 vsync_phase_changed;
+        cap_prev_ymax_par <= cap_ymax[0];
 
         if (CSYNC_VSYNC != 0)
             lace_field <= next_lace_field;
@@ -670,11 +1265,21 @@ always @(posedge cap_clk) begin
             lace_field <= cap_ymax[0];
         end
 
-        if (cap_ymax >= 11'h190)
+        /* On a doubled or 24 kHz source "NTSC" means "the woven frame
+         * fits 480 rows" - DblNTSC (478), Euro72 (427) - and PAL that it
+         * needs 576 - DblPAL (574), Multiscan (507), Super72 (658): the
+         * flag picks the 720x480 / 720x576 output and nothing else there.
+         * A 15 kHz source keeps the line-count rule. */
+        if (cap_short)
+            cap_ntsc <= (cap_interlace ? {cap_ymax[9:0], 1'b0} : cap_ymax)
+                        <= 11'd480;
+        else if (cap_ymax >= 11'h190)
             cap_ntsc <= (cap_ymax >= 11'h23a) ? 1'b0 : 1'b1;
         else
             cap_ntsc <= (cap_ymax >=
                 ((CSYNC_VSYNC != 0) ? 11'h130 : 11'h138)) ? 1'b0 : 1'b1;
+        cap_tall <= (cap_interlace ? {cap_ymax[9:0], 1'b0} : cap_ymax)
+                    > 11'd512;
 
         raw_y <= 0;
         cap_y <= cap_interlace ?
@@ -691,23 +1296,63 @@ always @(posedge cap_clk) begin
          * patterns) from oscillating, and flat content accumulates too
          * little difference to clear it. */
         if (grid_seen &&
-                ({3'b0, grid_cross_sum} + grid_margin_w) < grid_intra_w)
+                (grid_cross_sum + grid_margin_w) < grid_intra_w)
             pair_parity <= ~pair_parity;
         grid_intra_sum <= 0;
         grid_cross_sum <= 0;
+        grid_intra_delta_valid <= 0;
+        grid_cross_delta_valid <= 0;
+        grid_intra_channels_valid <= 0;
+        grid_cross_channels_valid <= 0;
 
-        if (raw_y != 0)
+        if (raw_y != 0) begin
             cap_ymax <= raw_y;
+            cap_xmax <= cap_line_words;
+        end
     end else if (line_sync) begin
         grid_prev_second_valid <= 0;
         cap_x <= 0;
+        cap_line_words <= cap_x;
         sample_x <= 0;
+        /* Keep horizontal window placement independent of a one-tick move
+         * in the accepted HSYNC edge.  Learn the normal absolute grid phase
+         * on the first post-recovery crop boundary, preserving each full-rate
+         * topology's existing crop semantics instead of assuming phase zero.
+         * Later lines start their window coordinate at the signed circular
+         * displacement from that phase.  Phase 3 represents -1 and therefore
+         * holds the coordinate for one tick; phases 1/2 start at +1/+2.
+         * sample_x remains edge-relative for vertical/framing and diagnostics. */
+        if ((FULLRATE != 0) && grid_seen) begin
+            if (!window_phase_valid) begin
+                window_x <= 0;
+                window_x_hold <= 0;
+                if (capture_ready && raw_y == crop_v_eff[10:0]) begin
+                    window_phase_ref <= cap_grid;
+                    window_phase_valid <= 1;
+                end
+            end else begin
+                case (window_phase_delta)
+                    2'd0: begin window_x <= 0; window_x_hold <= 0; end
+                    2'd1: begin window_x <= 1; window_x_hold <= 0; end
+                    2'd2: begin window_x <= 2; window_x_hold <= 0; end
+                    default: begin window_x <= 0; window_x_hold <= 1; end
+                endcase
+            end
+        end else begin
+            window_x <= 0;
+            window_x_hold <= 0;
+        end
         half <= 0;
         shres_half <= 0;
         cap_x_done <= 0;
         if (capture_banking_cap)
             capture_bank <= ~capture_bank;
-        if (!ctl_full_width_cap && capture_output_line_valid) begin
+        /* A full-width line that ended before its 1280th sample - every
+         * line of a doubled or 24 kHz source - is complete now, and is
+         * published here; a 15 kHz line published itself at sample 1279
+         * (cap_x_done) and is not published twice. */
+        if ((!ctl_full_width_cap || (!cap_x_done && cap_x != 0)) &&
+                capture_output_line_valid && capture_ready) begin
             /* Completed visible line (filtered, any FULLRATE): publish
              * its normalized number and bank as a token one capture
              * clock later, exactly as the full-width path does (PR #88
@@ -730,7 +1375,7 @@ always @(posedge cap_clk) begin
             end
         end
 
-        if (raw_y > ctl_crop_v_cap[10:0]) begin
+        if (raw_y > crop_v_eff[10:0]) begin
             if (cap_interlace)
                 cap_y <= cap_y + 2'b10;
             else
@@ -739,6 +1384,10 @@ always @(posedge cap_clk) begin
         raw_y <= raw_y + 1'b1;
     end else begin
         sample_x <= sample_x + 1'b1;
+        if (window_x_hold)
+            window_x_hold <= 0;
+        else
+            window_x <= window_x + 1'b1;
 
         /* Snapshot the 64 raw RGB samples immediately before the configured
          * crop origin.  The preceding post-window probe found only blanking,
@@ -747,15 +1396,15 @@ always @(posedge cap_clk) begin
         if (capture_banking_cap && crop_h_local >= 12'd64 &&
                 probe_precrop_waiting &&
                 !probe_precrop_publish_pending && cap_y == PROBE_LINE &&
-                {1'b0, sample_x} >= probe_precrop_start &&
-                {1'b0, sample_x} < crop_h_local) begin
-            probe_precrop_mem[{1'b0, sample_x} - probe_precrop_start]
+                capture_window_x >= probe_precrop_start &&
+                capture_window_x < crop_h_local) begin
+            probe_precrop_mem[capture_window_x - probe_precrop_start]
                 <= {8'b0, rgbin};
 
-            if ({1'b0, sample_x} == probe_precrop_start)
+            if (capture_window_x == probe_precrop_start)
                 probe_precrop_context <= {9'h000, capture_bank,
                                            raw_y, sample_x};
-            if ({1'b0, sample_x} == crop_h_local - 1'b1)
+            if (capture_window_x == crop_h_local - 1'b1)
                 probe_precrop_publish_pending <= 1;
         end
 
@@ -771,14 +1420,15 @@ always @(posedge cap_clk) begin
                 shres_half <= 1;
             end else begin
                 shres_half <= 0;
-                if ({1'b0, sample_x} > crop_h_local &&
+                if (capture_window_x > crop_h_local &&
                         cap_x < (ctl_full_width_cap ? 11'h500 : 11'h200) &&
+                        !cap_short &&
                         (rgbin !== shres_prev) && diff_count != 16'hffff)
                     diff_count <= diff_count + 1'b1;
             end
         end
 
-        if ({1'b0, sample_x} < crop_h_local) begin
+        if (capture_window_x < crop_h_local) begin
             half <= 0;
         end else begin
             if (filter_pairs) begin
@@ -796,22 +1446,24 @@ always @(posedge cap_clk) begin
                      * window and visible rows: activity beyond the
                      * 512-pair output window (or on cropped rows)
                      * would dilute the margin (PR review). */
-                    if (grid_seen && cap_x < 11'h200 &&
-                            capture_output_line_valid &&
-                            grid_cross_sum <=
-                                27'h7ffffff - {17'd0, grid_cross_delta})
-                        grid_cross_sum <=
-                            grid_cross_sum + {17'd0, grid_cross_delta};
+                    if (grid_seen && grid_prev_second_valid &&
+                            cap_x < 11'h200 &&
+                            capture_output_line_valid) begin
+                        grid_cross_r_delta <= grid_cross_r;
+                        grid_cross_g_delta <= grid_cross_g;
+                        grid_cross_b_delta <= grid_cross_b;
+                        grid_cross_channels_valid <= 1;
+                    end
                 end else if (half) begin
                     half <= 0;
                     if (grid_seen && cap_x < 11'h200 &&
                             capture_output_line_valid) begin
                         grid_prev_second <= rgbin;
                         grid_prev_second_valid <= 1;
-                        if (grid_intra_sum <=
-                                27'h7ffffff - {17'd0, grid_intra_delta})
-                            grid_intra_sum <=
-                                grid_intra_sum + {17'd0, grid_intra_delta};
+                        grid_intra_r_delta <= grid_intra_r;
+                        grid_intra_g_delta <= grid_intra_g;
+                        grid_intra_b_delta <= grid_intra_b;
+                        grid_intra_channels_valid <= 1;
                     end
                     if (capture_head_valid)
                         linebuf[capture_buf_addr] <= {8'b0, filtered_sample};
@@ -842,7 +1494,7 @@ always @(posedge cap_clk) begin
                     probe_context <= {9'h000, capture_bank,
                                       raw_y, sample_x};
                     probe_config <= {7'h00, ctl_full_width_cap,
-                                     ctl_crop_v_cap, ctl_crop_h_cap};
+                                     crop_v_eff, crop_h_eff};
                 end else begin
                     probe_seen_mask[cap_x - PROBE_SOURCE_X] <= 1'b1;
                 end
@@ -895,7 +1547,7 @@ always @(posedge cap_clk) begin
              * publishes its completed-line token at line_sync instead. */
             if (!cap_x_done && cap_x >= 11'd1279) begin
                 cap_x_done <= 1;
-                if (capture_output_line_valid) begin
+                if (capture_output_line_valid && capture_ready) begin
                     cap_token_y <= capture_output_y[9:0];
                     cap_token_bank <= capture_bank;
                     cap_token_pending <= 1;
@@ -905,6 +1557,7 @@ always @(posedge cap_clk) begin
             cap_x_done <= (cap_x > 11'h200);
         end
     end
+end
 end
 
 endmodule
