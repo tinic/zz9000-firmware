@@ -7580,6 +7580,10 @@ static uint32_t    cenc_snap_len;
  * it.  Cleared when the geometry changes: a later band of a new geometry
  * must not encode from a copy of the old, smaller frame. */
 static int         cenc_snap_ok;
+/* The client the encoder state belongs to, by its output buffer: the
+ * request has no session field, and each client allocates its own shared
+ * buffer.  Another buffer is another client (ANX-025). */
+static uint32_t    cenc_owner;
 static uint8_t    *cenc_defl;        /* per-message deflate scratch */
 static uint32_t    cenc_defl_len;
 
@@ -7737,10 +7741,19 @@ static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
 	    (uint32_t)height * bpr > fb.length)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 
+	/* ANX-025: one encoder, one owner.  A request through another output
+	 * buffer starts a new session from a zeroed shadow and a fresh band 0,
+	 * so no client is sent deltas computed against another's screen state. */
+	if (cenc_ready && out_handle != cenc_owner) {
+		cenc_ready = 0;
+		cenc_snap_ok = 0;
+	}
+
 	if (!cenc_ready || cenc_flags != enc_flags ||
 	    !cenc_geom_same(&g, &cenc_geom) || (rflags & HTTPZZ_F_RESET)) {
 		if (!cenc_configure(&g, enc_flags))
 			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
+		cenc_owner = out_handle;
 		reinit = 1;
 	}
 
