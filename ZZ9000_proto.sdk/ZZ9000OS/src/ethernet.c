@@ -1093,7 +1093,7 @@ static void ethernet_tx_prepare_shifted_checksum(volatile u8 *frame, u16 size) {
 void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	XEmacPs_Bd *BdTxPtr;
-	u16 reserved = slot & (ETH_TX_RESERVED >> ETH_TX_SLOT_SHIFT);
+	u16 csum = slot & (ETH_TX_CSUM >> ETH_TX_SLOT_SHIFT);
 	u16 shifted = slot & (ETH_TX_OFFSET2 >> ETH_TX_SLOT_SHIFT);
 	slot &= ETH_TX_SLOT_MASK;
 
@@ -1104,9 +1104,9 @@ void ethernet_send_frame_async(u16 slot, u16 frame_size) {
 	LONG Status;
 
 	if (ethernet_task_state != ETH_TASK_READY || frame_size == 0 ||
-	    reserved || (shifted && frame_size > FRAME_SIZE - 2u))
+	    (shifted && frame_size > FRAME_SIZE - 2u))
 		goto refused;
-	if (shifted)
+	if (shifted && csum)
 		ethernet_tx_prepare_shifted_checksum(
 			(volatile u8 *)TxFrame + (UINTPTR)slot * FRAME_SIZE + 2u,
 			frame_size);

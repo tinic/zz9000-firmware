@@ -63,10 +63,14 @@ u16 ethernet_send_frame(u16 frame_size);
  */
 #define ETH_TX_ASYNC        0x8000u
 #define ETH_TX_OFFSET2      0x4000u /* frame begins two bytes into its slot */
-#define ETH_TX_RESERVED     0x2000u /* must be zero in this protocol version */
+/* Shifted frames only: the TCP/UDP checksum field holds the opener's
+ * pseudo-header seed, so the ARM zeroes it for the GEM's full checksum.
+ * Without it the ARM leaves the frame's bytes exactly as written (a raw or
+ * unnegotiated frame).  Staged frames are prepared by the host itself. */
+#define ETH_TX_CSUM         0x2000u
 #define ETH_TX_SLOT_SHIFT   11
 #define ETH_TX_SLOT_MASK    0x3u
-#define ETH_TX_FIELD_MASK   0xfu /* slot, reserved bit, shifted-source bit */
+#define ETH_TX_FIELD_MASK   0xfu /* slot, checksum-consent bit, shifted-source bit */
 #define ETH_TX_LEN_MASK     0x7ffu
 #define ETH_TX_STATUS_PRESENT 0x8000u
 #define ETH_TX_STATUS_COUNT   0x7fffu
@@ -85,6 +89,7 @@ u16 ethernet_get_rx_stats();
 /* REG_ZZ_ETH_RX_META: checksum capabilities plus the current RX verdict. */
 #define ETH_RX_META_PRESENT 0x8000u
 #define ETH_TX_CSUM_PRESENT 0x4000u
+/* Shifted TX slots, with explicit per-frame checksum consent (ETH_TX_CSUM). */
 #define ETH_TX_OFFSET2_PRESENT 0x2000u
 #define ETH_RX_META_MASK    0x0003u
 #define ETH_RX_META_NONE    0u
