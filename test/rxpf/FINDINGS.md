@@ -37,14 +37,14 @@ frames.  So frames arrive intact as far as the 68k can tell, but late.
 1. **Why the round trip goes to ~200 ms.**  The 68k side handles every frame
    on its interrupt; the delay is elsewhere -- the ARM presenting frames late,
    or the GEM/ARM path slowed by the bursts.
-2. **ACP + L2.**  The m00 read path is on S_AXI_ACP with ARCACHE 0xf, so a
-   16-beat burst allocates up to 60 bytes past what the 68k needs into the
-   PL310 L2.  The firmware invalidates a slot's L2 lines when it publishes a
-   frame; if it invalidates only the frame's length, lines allocated past the
-   end of a short frame could serve stale bytes when a longer frame later uses
-   the slot.  The driver trusts the GEM checksum verdict, so stale payload
-   would not be counted anywhere.  **Unverified, and a correctness risk**:
-   check `ethernet.c`'s invalidate range before trusting any read-ahead here.
+2. ~~Stale L2 lines past a short frame~~ -- **ruled out by reading the
+   firmware.**  `ethernet.c` (publish, ~line 850) drops from L2 every line
+   the new frame covers (offset 32 .. rx_bytes + RX_FRAME_PAD), then writes
+   the header and drops its line.  A line a burst allocated beyond an earlier
+   short frame is invalidated before a longer frame can expose it; lines
+   beyond the current frame are never read by the driver.  Bursts issued
+   while the 68k polls an empty slot fill from DDR the GEM has not yet
+   written, and those lines are dropped by the same publish.
 3. Whether 16 x 32-bit INCR bursts on the ACP stall the ARM's own DDR/L2 work
    enough to delay frame presentation (the 22-09 ARCACHE experiment showed
    this read path's cache attributes do change ARM-side throughput).
