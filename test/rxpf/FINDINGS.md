@@ -1,7 +1,8 @@
 # Receive-window read-ahead: hardware result (2026-10-08)
 
-Status: **regression on hardware, reverted on the bench.**  The read path is
-faster; end-to-end receive collapses.  Pushed for review, not for merging.
+Status: **bimodal per boot.**  Window reads are faster on every boot; end-to-end
+receive is +8.7 % on some boots and collapses to 3.4 Mbit/s on others.  Not for
+merging until the slow state is explained.  (Update 2026-10-08 23:35Z below.)
 
 ## Setup
 
@@ -81,3 +82,55 @@ random gaps between beats), ragged with random ARREADY -- and exits non-zero
 unless every arm prints its verdict.  Not modelled yet: RRESP other than OKAY,
 and ARM-side S_AXI register traffic (slot changes arrive as a direct write to
 slv_reg4) while a burst is in flight.
+
+
+## Update 2026-10-08 23:35Z: the slow state is per boot, not per image
+
+Reflashed the same `BOOT-rxpf-b9c0af5.bin` and power-cycled (flushed, 30 s)
+four times, one iperf RX via the ZZ9000 per boot (3 on boot 2).  Window read
+timing (452 ns/long) confirmed the candidate on every boot checked.
+
+| boot | IPv4 lease | RX Mbit/s | sender RTT | sender snd_wnd (1 s samples) |
+|---|---|---|---|---|
+| 1 | > 60 s | 3.39 / 3.42 / 3.41 | 198-216 ms | 80288 every sample |
+| 2 | < 10 s | 23.57 / 23.55 / 23.55 | 9.2-10.0 ms | 6912-60736, varying |
+| 3 | 2 s | 3.44 | 199 ms | 80288 every sample |
+| 4 | 3 s | 23.66 | 10.6 ms | 41952-80288, varying |
+| control (upstream/all), 2 boots | -- | 21.6-21.7 | 10.1-12.5 ms | 25888-62368, varying |
+
+Good boots are **+8.7 %** over the control.  The slow lease on boot 1 was a
+coincidence (boot 3 leased in 2 s and was still slow).
+
+**Sender pcaps** (playhouse4, headers only, `ackscan.py`), control vs good boot 2:
+
+| | control | candidate, good boot |
+|---|---|---|
+| throughput in the capture | 21.43 Mbit/s | 23.35 Mbit/s |
+| ACKs (advancing / other) | 1230 / 662 | 1332 / 717 |
+| inter-ACK gap p50 / p90 / max | 10.7 / 14.7 / 19.0 ms | 9.6 / 13.3 / 17.8 ms |
+| bytes acked per ACK p50 | 35040 | 36500 |
+| RTT samples p50 / p90 | 12.5 / 15.3 ms | 11.4 / 14.1 ms |
+| retransmitted-looking segments | 67 | 70 |
+
+Same ACK pattern, slightly faster; no gap over 150 ms in either.
+
+**The slow boots** look like the receiver acknowledging only on a ~200 ms
+timer: a constant full window (80288), 55 segments always in flight
+(55 x 1460 B / 0.2 s = 3.2 Mbit/s, the observed rate), no loss.  68k-side
+counters, slow boot 1 vs good boot 2 (after equal-length runs):
+
+| | slow boot 1 | good boot 2 |
+|---|---|---|
+| serial gaps (ARM ring overflow) at boot | 11 | 0 |
+| TCP segments after GRO, bytes each | ~4.3 KB | ~16.5 KB |
+| packets sent per received frame | ~1 : 3 | ~1 : 15 |
+| bad data / checksum / drops | 0 | 0 |
+
+So in the slow state the stack merges far fewer segments per GRO run and sends
+many more packets, yet the sender sees ACK progress only every ~200 ms.  The
+deciding state may be in the stack's GRO / ACK pacing, latched by early
+timing after boot, rather than in the read-ahead itself; the slow state has
+not been seen on the control image (2 boots only -- not enough to exclude it).
+
+Next: a slow-boot sender pcap (cycling until one is caught), then codex's
+proposed builds with `rxpf_beats` forced to 1, 4, 8.
