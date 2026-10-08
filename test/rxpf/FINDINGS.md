@@ -16,6 +16,20 @@ faster; end-to-end receive collapses.  Pushed for review, not for merging.
   move.l / movem.l copies into TF4060 RAM), best of 3-5, under Forbid().
 - Throughput: iperf, peer on the same switch -> the ZZ9000 address, 3 x 15 s.
 
+## Exact artifacts and conditions (both arms)
+
+| item | value |
+|---|---|
+| candidate BOOT.bin | `BOOT-rxpf-b9c0af5.bin` sha256 `31f5fb1ac2bbaed8f1a248249087964781a99128e42586b7bbbdee22bc3ee66f` |
+| candidate bitstream | `rxpf.bit` sha256 `b8e357627aa7873972e7d813eec9f433c9edaacfb9cf1af76ea5a3e6e5ea8cdf` |
+| control BOOT.bin | `BOOT-upstream-all.bin` sha256 `1c17006018eb6ed1c829a281b8cd1fc139f7e91a684e14c309ba93aca1be6427` (restored with `ZZFwUpdate RESTORE -y`) |
+| ARM firmware (both) | `ZZ9000OS.elf` sha256 `e6d96168d1ff33f3e38507a2accd4d5d336855c7b5dd3b3704a2847cc2b58455` (upstream/all 6aeab1c build) |
+| 68k driver (both) | `anxzz9000.device` sha256 `fdbc7a98fa83111415b1caf7b59e6197d648bd95a60e2f0588f73b08d2980e65` (AmiNetXDuo main bf215f5c) |
+| interface file (both) | `DEVICE=AmiNetXDuo:Devs/Networks/anxzz9000.device UNIT=0 CONFIGURE=DHCP MDNS=YES` |
+| load | the card loaded each image on a flushed 30 s shop power cut; control measured before the candidate flash and again after the restore (21.7 both times) |
+| traffic | peer playhouse4 (192.168.1.160, same TL-SG1016PE switch) sends iperf TCP to the ZZ9000 address, `--seconds 15 --length 65536`, Amiga side `AmiNetXDuo:C/iperf -s -t 30`; 3 runs per arm; switch port flow control on for the X-Surf port (16) |
+| other interface | X-Surf 100 up on the same A3000 throughout (its own RX 21.8 on the candidate boot) |
+
 ## Numbers
 
 | | control | read-ahead |
