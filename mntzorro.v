@@ -1240,6 +1240,8 @@ module MNTZorro_v0_1_S00_AXI
   localparam WAIT_READ3C = 59;
   localparam Z3_WRITE_FINALIZE2 = 60;
   localparam Z2_REGREAD_DTACK = 62;
+  localparam Z3_RXPF_ISSUED = 63; // receive-window read-ahead: burst accepted
+  localparam Z3_RXPF_SERVE = 64;  // receive-window read-ahead: answer from the line
   localparam Z2_WRITE_FINALIZE2 = 61;
 
   reg [7:0] zorro_state = COLD;
@@ -1271,6 +1273,36 @@ module MNTZorro_v0_1_S00_AXI
   reg [31:0] axi_reg4;
   reg [3:0] axi_reg5; // Amiga IRQ control: only bits 3:0 are consumed
   reg [20:0] eth_rx_frame_select;
+
+  /* Receive-window read-ahead.  A 68k copying a frame out of the window
+   * reads it front to back, one longword per Zorro cycle, and each of
+   * those was a single-beat AXI read: about 280 ns of a 574 ns cycle on
+   * an A3000/060 was the DDR round trip.  A miss in the window now asks
+   * for a 16-beat INCR burst; the cycle is answered as soon as its own
+   * beat lands and the rest fill rxpf_buf, so the following reads are
+   * answered without touching AXI.
+   *
+   * A line is only ever used going forward: an address at or below the
+   * last one it answered misses and goes back to DDR.  Polling the slot
+   * header, which reads the same address until the ARM publishes a frame,
+   * therefore always sees DDR.  Any Zorro write, and a change of the
+   * presented slot, retires the line. */
+  wire [31:0] rxpf_rx_addr = ((`RX_BACKLOG_ADDRESS - 32'h2000) + z3_mapped_addr +
+                              {eth_rx_frame_select, 11'h0}) & 32'hfffffffc;
+  // 16 beats, fewer near a 4 KB boundary (AXI bursts must not cross one)
+  wire [4:0]  rxpf_beats = (rxpf_rx_addr[11:0] > 12'hfc0) ?
+                             (5'd16 - rxpf_rx_addr[5:2]) : 5'd16;
+  wire [31:0] rxpf_off = rxpf_rx_addr - rxpf_base;
+  wire [3:0]  rxpf_hit_idx = rxpf_off[5:2];
+  reg [31:0] rxpf_buf [0:15];
+  reg [31:0] rxpf_base = 0;    // DDR address of beat 0
+  reg [4:0]  rxpf_total = 0;   // beats asked for
+  reg [4:0]  rxpf_got = 0;     // beats landed
+  reg        rxpf_busy = 0;    // a burst still owes beats
+  reg        rxpf_valid = 0;   // the line may answer reads
+  reg [20:0] rxpf_select = 0;  // eth_rx_frame_select the line was filled for
+  reg [31:0] rxpf_last = 0;    // last window offset the line answered
+  reg [3:0]  rxpf_idx = 0;     // beat the current cycle wants
   reg sdk_doorbell_pending;
   reg sdk_irq_ack_pending;
   reg sdk_aperture_layout_ack;
@@ -1857,9 +1889,8 @@ module MNTZorro_v0_1_S00_AXI
     m00_axi_wlast <= 'h1;
     m00_axi_bready <= 'h1;
 
-    m00_axi_arlen <= 'h0;
+    // arlen/arburst are set per request in the Zorro state machine
     m00_axi_arsize <= 'h2;
-    m00_axi_arburst <= 'h0;
     m00_axi_arcache <= 'hf; //was 3
     m00_axi_arlock <= 'h0;
     m00_axi_arprot <= 'h0;
@@ -2163,6 +2194,16 @@ module MNTZorro_v0_1_S00_AXI
       zorro_state <= RESET;
     end
 
+    if (rxpf_busy && m00_axi_rvalid) begin
+      rxpf_buf[rxpf_got[3:0]] <= m00_axi_rdata;
+      rxpf_got <= rxpf_got + 1'b1;
+      if (m00_axi_rlast)
+        rxpf_busy <= 0;
+    end
+    if (zorro_state == Z3_WRITE_PRE || zorro_state == Z3_REGWRITE_PRE ||
+        rxpf_select != eth_rx_frame_select)
+      rxpf_valid <= 0;
+
     if ((axi_reg0 & SDK_CTRL_DOORBELL_CLEAR) != 0)
       sdk_doorbell_pending <= 0;
     if ((axi_reg0 & SDK_CTRL_IRQ_ACK_CLEAR) != 0)
@@ -2185,6 +2226,7 @@ module MNTZorro_v0_1_S00_AXI
           z3_confdone <= 0;
           zorro_ram_read_request <= 0;
           zorro_ram_write_request <= 0;
+          rxpf_valid <= 0; // a burst in flight still drains through rxpf_busy
           zorro_ram_read_flag <= 0;
           zorro_ram_write_flag <= 0;
           sdk_doorbell_pending <= 0;
@@ -2586,6 +2628,8 @@ module MNTZorro_v0_1_S00_AXI
             zorro_state <= WAIT_READ3;
           else begin
             // read via AXI DMA
+            m00_axi_arlen <= 'h0;
+            m00_axi_arburst <= 'h0;
             if (last_addr>='ha000 && last_addr<'h10000)
               m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + {last_addr[23:2],2'b00};
             else
@@ -2936,23 +2980,65 @@ module MNTZorro_v0_1_S00_AXI
         end
 
         WAIT_READ_DMA_Z3: begin
-          if (z3_mapped_addr>='ha000 && z3_mapped_addr<'h10000)
-            m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + z3_mapped_addr;
-          else
-          if (z3_mapped_addr>='h8000 && z3_mapped_addr<'hA000)
-            m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + z3_mapped_addr;
-          else
-          if (z3_mapped_addr>='h2000 && z3_mapped_addr<'h6000)
-            m00_axi_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + z3_mapped_addr + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
-          else
-          if (z3_mapped_addr>='h6000 && z3_mapped_addr<'h8000)
-            m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + z3_mapped_addr;
-          else
-            m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
+          if (z3_mapped_addr>='h2000 && z3_mapped_addr<'h6000) begin
+            // receive window: answer from the read-ahead line, or fill it
+            if (rxpf_valid && rxpf_select == eth_rx_frame_select &&
+                z3_mapped_addr > rxpf_last &&
+                rxpf_rx_addr >= rxpf_base &&
+                rxpf_rx_addr < rxpf_base + {rxpf_total, 2'b00}) begin
+              rxpf_idx <= rxpf_hit_idx;
+              zorro_state <= Z3_RXPF_SERVE;
+            end else if (!rxpf_busy) begin
+              m00_axi_araddr  <= rxpf_rx_addr;
+              m00_axi_arlen   <= rxpf_beats - 1'b1;
+              m00_axi_arburst <= 'h1; // INCR
+              m00_axi_arvalid <= 1;
+              if (m00_axi_arready && m00_axi_arvalid) begin
+                m00_axi_arvalid <= 0; // accepted on this edge: exactly one request
+                rxpf_base   <= rxpf_rx_addr;
+                rxpf_total  <= rxpf_beats;
+                rxpf_got    <= 0;
+                rxpf_busy   <= 1;
+                rxpf_valid  <= 1;
+                rxpf_select <= eth_rx_frame_select;
+                rxpf_idx    <= 0;
+                zorro_state <= Z3_RXPF_ISSUED;
+              end
+            end
+          end else if (!rxpf_busy) begin
+            m00_axi_arlen   <= 'h0;
+            m00_axi_arburst <= 'h0;
+            if (z3_mapped_addr>='ha000 && z3_mapped_addr<'h10000)
+              m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + z3_mapped_addr;
+            else
+            if (z3_mapped_addr>='h8000 && z3_mapped_addr<'hA000)
+              m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + z3_mapped_addr;
+            else
+            if (z3_mapped_addr>='h6000 && z3_mapped_addr<'h8000)
+              m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + z3_mapped_addr;
+            else
+              m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
 
-          m00_axi_arvalid  <= 1;
-          if (m00_axi_arready) begin
-            zorro_state <= WAIT_READ_DMA_Z3B;
+            m00_axi_arvalid  <= 1;
+            if (m00_axi_arready) begin
+              zorro_state <= WAIT_READ_DMA_Z3B;
+            end
+          end
+        end
+
+        Z3_RXPF_ISSUED: begin
+          m00_axi_arvalid <= 0;
+          zorro_state <= Z3_RXPF_SERVE;
+        end
+
+        Z3_RXPF_SERVE: begin
+          if (rxpf_got > {1'b0, rxpf_idx}) begin
+            data_z3_hi16  <= {rxpf_buf[rxpf_idx][7:0],   rxpf_buf[rxpf_idx][15:8]};
+            data_z3_low16 <= {rxpf_buf[rxpf_idx][23:16], rxpf_buf[rxpf_idx][31:24]};
+            dataout_z3 <= 1; // enable data output
+            dtack <= 1;
+            rxpf_last <= z3_mapped_addr;
+            zorro_state <= Z3_ENDCYCLE;
           end
         end
 
