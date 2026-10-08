@@ -67,9 +67,17 @@ frames.  So frames arrive intact as far as the 68k can tell, but late.
 
 - Burst only within the current frame's length (the length word is the first
   beat of the slot) instead of a fixed 16 beats.
-- Non-allocating ARCACHE for the burst beats beyond the requested word, or a
-  read-ahead buffer filled from a non-ACP port.
+- ARCACHE belongs to the whole AR transaction, so "allocate only the demand
+  beat" is not one burst: either split it (a single-beat allocating read for
+  the demand word, then a non-allocating burst for the rest) or make the whole
+  burst non-allocating -- noting the 22-09 ARCACHE A/B, where non-allocating
+  window reads were 8 % slower.  Or fill the line from a non-ACP port.
 - Count, in the firmware, the time from GEM completion to frame presentation
   under both images.
 
-Reproduce in simulation: `test/rxpf/run.sh` (Vivado 2018.3 xsim).
+Reproduce in simulation: `test/rxpf/run.sh` (Vivado 2018.3 xsim).  It runs
+four arms -- steady, random ARREADY, ragged (5-68 cycle latency per burst,
+random gaps between beats), ragged with random ARREADY -- and exits non-zero
+unless every arm prints its verdict.  Not modelled yet: RRESP other than OKAY,
+and ARM-side S_AXI register traffic (slot changes arrive as a direct write to
+slv_reg4) while a burst is in flight.

@@ -41,6 +41,10 @@ module rxpf_tb;
   // +RANDOM_ARREADY: the interconnect holds arready low at random
   reg random_arready = 0;
   initial random_arready = $test$plusargs("RANDOM_ARREADY");
+  // +RAGGED: 5..68 cycle latency per burst and random gaps between beats
+  reg ragged = 0;
+  integer lat = 20;
+  initial ragged = $test$plusargs("RAGGED");
   always @(posedge clk) if (random_arready) arready <= $random;
   reg [31:0] last_arlen;
   always @(posedge clk) begin
@@ -54,12 +58,15 @@ module rxpf_tb;
     end
     rvalid <= 0; rlast <= 0;
     if (q_head != q_tail) begin
-      if (wait_cnt < 20) wait_cnt <= wait_cnt + 1;   // ~200 ns DDR latency
-      else begin
+      if (wait_cnt < lat) wait_cnt <= wait_cnt + 1;  // ~200 ns DDR latency by default
+      else if (ragged && beat != 0 && ($random & 3) == 0) begin
+        // a cycle with no beat inside the burst
+      end else begin
         rvalid <= 1;
         rdata  <= model(q_addr[q_head % 16] + beat * 4, q_gen[q_head % 16]);
         if (beat + 1 == q_len[q_head % 16]) begin
           rlast <= 1; beat <= 0; q_head <= q_head + 1; wait_cnt <= 0;
+          if (ragged) lat <= 5 + ($random & 63);
         end else beat <= beat + 1;
       end
     end
@@ -211,6 +218,7 @@ module rxpf_tb;
     z3cycle(BOARD + 32'h2004, 1, 2'b11, got, ns); $display("INFO hit  cycle %0d ns", ns);
 
     $display("%s rxpf_tb: %0d error(s)", errors == 0 ? "PASS" : "FAIL", errors);
+    if (errors == 0) $display("RXPF_VERDICT_OK");
     $finish;
   end
 

@@ -15,8 +15,18 @@ PY
 xvlog -sv $VIVADO_DIR/data/ip/xpm/xpm_cdc/hdl/xpm_cdc.sv > xvlog.log 2>&1
 xvlog --relax $VIVADO_DIR/data/verilog/src/glbl.v $R/videocap_*.v mntzorro_sim.v rxpf_tb.v >> xvlog.log 2>&1
 xelab --relax -L unisims_ver -L xpm --timescale 1ns/1ps rxpf_tb glbl -s rxpf > xelab.log 2>&1
-xsim rxpf -R > xsim.log 2>&1
-grep -E 'PASS|FAIL|INFO|ERROR' xsim.log | grep -v 'INFO: \['
-echo "--- arready held low at random"
-xsim rxpf -R -testplusarg RANDOM_ARREADY > xsim-rand.log 2>&1
-grep -E 'PASS|FAIL|ERROR' xsim-rand.log
+# Each arm must print RXPF_VERDICT_OK; a FAIL line, a timeout or a missing
+# verdict fails the script.
+status=0
+arm(){ name=$1; shift
+  xsim rxpf -R "$@" > xsim-$name.log 2>&1
+  echo "--- $name"
+  grep -E 'PASS|FAIL|INFO [a-z]' xsim-$name.log | grep -v 'INFO: \['
+  if ! grep -q RXPF_VERDICT_OK xsim-$name.log || grep -q '^FAIL' xsim-$name.log; then status=1; fi
+}
+arm steady
+arm random-arready -testplusarg RANDOM_ARREADY
+arm ragged -testplusarg RAGGED
+arm ragged+random -testplusarg RAGGED -testplusarg RANDOM_ARREADY
+[ $status = 0 ] && echo "rxpf: all arms PASS" || echo "rxpf: FAILED"
+exit $status
