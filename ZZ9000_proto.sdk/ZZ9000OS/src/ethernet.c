@@ -132,6 +132,10 @@ static u16 rx_bd_backlog_slot[RXBD_CNT];
 static u8 rx_backlog_csum[FRAME_MAX_BACKLOG];
 static struct zz_rx_lease packet_leases;
 static int packet_mode, packet_active, packet_fault, packet_can_clear;
+/* Set once REARM succeeded and never cleared: from then on submissions may
+ * exist, and every clear of host state must follow a completed fence.  Before
+ * it ARM descriptor submission has never been enabled, so no lease exists. */
+static int packet_session_started;
 static u16 packet_length[FRAME_MAX_BACKLOG], packet_serial[FRAME_MAX_BACKLOG];
 static int ethernet_packet_fence(void);
 static int ethernet_packet_rearm(void);
@@ -316,6 +320,7 @@ static int ethernet_packet_rearm(void)
 	dsb();
 	packet_can_clear = 0;
 	packet_active = 1;
+	packet_session_started = 1;
 	return 1;
 }
 
@@ -659,7 +664,7 @@ void ethernet_log_status(const char *reason) {
 }
 
 void ethernet_clear_host_state(void) {
-	if (packet_mode && !packet_can_clear) {
+	if (packet_mode && !packet_can_clear && packet_session_started) {
 		/* An old init/reset caller must not bypass packet/host/DMA drain. */
 		packet_fault = 1;
 		return;
