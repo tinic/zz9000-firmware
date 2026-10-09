@@ -3702,7 +3702,7 @@ module MNTZorro_v0_1_S00_AXI
         // 128 MB layout is deliberately outside this Z2 contract.
         3'h7   : reg_data_out <= SDK_APERTURE_SIZE_VALUE;
         6'h8   : reg_data_out <= PKT_CAPABILITY;
-        6'h9   : reg_data_out <= {27'b0, pkt_running, pkt_mode, pkt_packet_valid,
+        6'h9   : reg_data_out <= {25'b0, pkt_packet_csum, pkt_running, pkt_mode, pkt_packet_valid,
                     !pkt_ack_req && !pkt_ack_valid,
                     pkt_host_stop && zorro_state != Z3_PKT_READ &&
                     zorro_state != Z3_PKT_READ2 && zorro_state != Z3_PKT_READ3};

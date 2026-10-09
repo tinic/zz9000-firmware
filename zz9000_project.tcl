@@ -209,6 +209,9 @@ set files [list \
  [file normalize "${origin_dir}/video_source_sync.v" ]\
  [file normalize "${origin_dir}/video_overlay_pixel.v" ]\
  [file normalize "${origin_dir}/video_overlay_linebuffer.v" ]\
+ [file normalize "${origin_dir}/experimental/zz_eth_packet_window.v" ]\
+ [file normalize "${origin_dir}/experimental/zz_eth_packet_mailbox.v" ]\
+ [file normalize "${origin_dir}/experimental/zz_eth_read_arbiter.v" ]\
  [file normalize "${origin_dir}/ZZ9000_proto.srcs/sources_1/new/audio_clock.v" ]\
  [file normalize "${origin_dir}/ZZ9000_proto.srcs/sources_1/bd/zz9000_ps/hdl/zz9000_ps_wrapper.v" ]\
 ]
@@ -310,6 +313,15 @@ if { [get_files mntzorro.v] == "" } {
 }
 if { [get_files videocap_sampler.v] == "" } {
   import_files -quiet -fileset sources_1 videocap_sampler.v
+}
+if { [get_files zz_eth_packet_window.v] == "" } {
+  import_files -quiet -fileset sources_1 experimental/zz_eth_packet_window.v
+}
+if { [get_files zz_eth_packet_mailbox.v] == "" } {
+  import_files -quiet -fileset sources_1 experimental/zz_eth_packet_mailbox.v
+}
+if { [get_files zz_eth_read_arbiter.v] == "" } {
+  import_files -quiet -fileset sources_1 experimental/zz_eth_read_arbiter.v
 }
 if { [get_files videocap_clock_control.v] == "" } {
   import_files -quiet -fileset sources_1 videocap_clock_control.v

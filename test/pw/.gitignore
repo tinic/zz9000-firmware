@@ -1,0 +1,8 @@
+xvlog.log
+xelab.log
+xsim.log
+mntzorro_sim.v
+xsim.dir/
+*.jou
+*.pb
+*.wdb
