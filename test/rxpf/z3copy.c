@@ -183,6 +183,13 @@ int main(void)
             for (i = 0; i < len; i++) if (dst[i] != snap[i]) bad++;
             for (i = 0; i < (ULONG)(dst - dbuf); i++) if (dbuf[i] != 0xA5) guardbad++;
             for (i = (ULONG)(dst - dbuf) + len; i < alloc; i++) if (dbuf[i] != 0xA5) guardbad++;
+            if (bad != 0 || guardbad != 0) {
+                Printf((CONST_STRPTR)"z3copy: verification failed, mismatch %lu guard %lu (source may have changed)\n", bad, guardbad);
+                CloseDevice((struct IORequest *)&tr);
+                FreeMem(snap, len); FreeMem(dbuf, alloc);
+                if (own) FreeMem(own, len + 16);
+                FreeArgs(rd); return 20;
+            }
             {
                 if (best == 0 || hz == 0) {
                     Printf((CONST_STRPTR)"z3copy: invalid timer sample\n");
