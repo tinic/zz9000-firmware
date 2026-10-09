@@ -572,3 +572,21 @@ Readings:
 - Smaller, cheap target: place the frame so window source and RAM
   destination share alignment (payload at offset 2 mod 4 in the slot, one
   word peeled), removing the dst+2 penalty: ~2-2.5 % of frame time.
+
+**Correction to the "next target" above (same day):** the FPGA is not where
+the ~490 ns per longword goes.  `rxpf_tb.v` now reports the read-ahead hit
+latency: /FCS falling -> /DTACK asserted = **60 ns** (6 clocks at 100 MHz:
+FCS synchroniser, address decode, Z3_IDLE, WAIT_READ_DMA_Z3, Z3_RXPF_SERVE),
+and /DTACK follows the data strobes by 10 ns in the testbench's strobe
+timing.  So of ~452-494 ns measured per window longword on the TF4060, only
+~60 ns is the ZZ9000's response; the rest is the TF4060 -> A3000 bus path
+(Buster cycle and the accelerator's bus bridge, which also explains why the
+copy gets slower at 82 MHz).  Speeding up mntzorro.v's read FSM can save at
+most a few tens of ns per longword.  Remaining levers:
+- the non-copy work per frame (339 us @50 MHz, 242 us @82 MHz: driver, stack,
+  TCP, ACK transmit) -- the larger share of frame time;
+- fewer Z3 cycles per frame (no burst on this bus path: move16 = movem);
+- the dst+2 alignment penalty (8.5-13 us per frame);
+- moving the copy off the 68060 entirely (ZZ9000 bus mastering into
+  motherboard RAM; unknown cost of the 060 reading motherboard RAM back --
+  measure before considering).

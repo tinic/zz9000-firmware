@@ -136,6 +136,7 @@ module rxpf_tb;
   );
 
   // one Zorro III longword (or word) cycle at absolute address a
+  integer lat_fcs, lat_ds, t_fcs, t_ds;
   task z3cycle(input [31:0] a, input rd, input [1:0] lanes /*3=long,2=hi word,1=lo word*/,
                output [31:0] got, output integer cycles_ns);
     integer t0;
@@ -144,12 +145,13 @@ module rxpf_tb;
       zorro_started = 1;
       za_drv = {a[23:2], 1'b0}; zd_drv = {a[31:24], 8'h00};
       za_oe = 1; zd_oe = 1; ZORRO_READ = rd;
-      #30 ZORRO_NFCS = 0;
+      #30 ZORRO_NFCS = 0; t_fcs = $time;
       #40 za_oe = 0; zd_oe = !rd;
       if (!rd) begin zd_drv = 16'hdead; za_drv = {16'hbeef, 7'h0}; za_oe = 1; end
       ZORRO_DOE = 1;
-      #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0];
-      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #10;
+      #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0]; t_ds = $time;
+      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #1;
+      lat_fcs = $time - t_fcs; lat_ds = $time - t_ds;
       if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rd_out, dut.z3addr_in_ram, dut.z3_fcs_state); end
       #20;
       got = {dut.data_z3_hi16, dut.data_z3_low16};
@@ -365,7 +367,19 @@ module rxpf_tb;
 
     // 1. a 1500-byte frame read front to back: one burst per 64 bytes
     n0 = ar_count;
-    for (i = 0; i < 375; i = i + 1) expect_read(32'h2000 + i*4, 3, 2'b11, gen, "seq");
+    begin : latstat
+      integer mn, mx, sum, mnd, mxd, k;
+      mn = 99999; mx = 0; sum = 0; mnd = 99999; mxd = 0;
+      for (i = 0; i < 375; i = i + 1) begin
+        k = ar_count;
+        expect_read(32'h2000 + i*4, 3, 2'b11, gen, "seq");
+        if (ar_count == k) begin  // a read-ahead hit
+          if (lat_fcs < mn) mn = lat_fcs; if (lat_fcs > mx) mx = lat_fcs; sum = sum + lat_fcs;
+          if (lat_ds < mnd) mnd = lat_ds; if (lat_ds > mxd) mxd = lat_ds;
+        end
+      end
+      $display("INFO latency hit FCS->DTACK min %0d max %0d ns; DS->DTACK min %0d max %0d ns", mn, mx, mnd, mxd);
+    end
     $display("%s seq: %0d longs, %0d AXI requests (want 24)", (ar_count - n0 == 24) ? "PASS" : "FAIL",
              375, ar_count - n0);
     if (ar_count - n0 != 24) errors = errors + 1;
