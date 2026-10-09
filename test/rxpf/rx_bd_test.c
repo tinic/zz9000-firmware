@@ -41,7 +41,7 @@ static u16 rx_bd_backlog_slot[RXBD_CNT];
 static u8 rx_backlog_csum[FRAME_MAX_BACKLOG];
 static u32 frames_received;
 static unsigned grants, unsafe_grants, pauses, clears, watch_grants;
-static u8 frame_bytes[FRAME_MAX_BACKLOG][FRAME_SIZE];
+static u8 frame_bytes[FRAME_MAX_BACKLOG][FRAME_SIZE] __attribute__((aligned(4))); /* slots are 2 KB aligned */
 #define XEmacPs_GetRxRing(instance) ((instance)->RxRing)
 /* Pointer-sized host indexing replaces only the target's 32-bit address cast. */
 #define XEMACPS_BD_TO_INDEX(ring, bd) ((u32)(((UINTPTR)(bd) - (ring)->BaseBdAddr) / (ring)->Separation))
@@ -111,6 +111,10 @@ int main(int argc, char **argv)
         arm_last_slot(); complete(0); XEmacPsRecvHandler(&EmacPsInstance);
         assert(frames_backlog == 120 && !frames_backlog_reserved && !r->HwCnt && r->FreeCnt == 64);
         assert(descriptors[0][0] & XEMACPS_RXBUF_NEW_MASK);
+        /* The header the 68k polls: big-endian length, then serial (2, the
+           generator skips 0 and 1), written as one word. */
+        assert(frame_bytes[119][0] == 0x05 && frame_bytes[119][1] == 0xea &&
+               frame_bytes[119][2] == 0x00 && frame_bytes[119][3] == 0x02);
         puts("PASS pressure: completed descriptor stays CPU-owned while refill is withheld");
     } else if (!strcmp(argv[1], "scan")) {
         arm_last_slot(); complete(0);

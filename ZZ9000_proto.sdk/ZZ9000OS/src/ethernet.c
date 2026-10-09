@@ -902,12 +902,13 @@ static void XEmacPsRecvHandler(void *Callback)
 					ethernet_backlog_slot_publish_from(backlog_slot, 32U,
 					                                   rx_bytes + RX_FRAME_PAD + rx_offset_ring - 32U);
 				{
+					/* One aligned 32-bit store (the slot is 2 KB aligned): the 68k
+					 * reads the serial first as the publication marker, and byte
+					 * stores could let it see half a serial.  Big-endian for it. */
 					u16 lenword = (u16)rx_bytes | (rx_offset_ring ? ETH_RX_LEN_OFFSET2 : 0);
-					*(frame_bl_ptr)   = (lenword&0xff00)>>8;
-					*(frame_bl_ptr+1) = (lenword&0xff);
+					*(volatile u32 *)frame_bl_ptr =
+						__builtin_bswap32(((u32)lenword << 16) | (u16)frame_serial);
 				}
-				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
-				*(frame_bl_ptr+3) = (frame_serial&0xff);
 				ethernet_backlog_slot_publish_from(backlog_slot, 0U, 32U);
 
 				frames_backlog_write = ethernet_next_backlog_slot(frames_backlog_write);
