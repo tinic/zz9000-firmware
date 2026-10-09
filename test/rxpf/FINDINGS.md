@@ -1,6 +1,8 @@
 # Receive-window read-ahead: hardware result (2026-10-08)
 
-Status: **bimodal per boot.**  Window reads are faster on every boot; end-to-end
+Status: **DO NOT FLASH.  On its 7th power-up this bitstream left the A3000
+unable to boot (white screen flashes, then black); the user restored an older
+image by hand.**  Before that: bimodal per boot.  Window reads are faster on every boot; end-to-end
 receive is +8.7 % on some boots and collapses to 3.4 Mbit/s on others.  Not for
 merging until the slow state is explained.  (Update 2026-10-08 23:35Z below.)
 
@@ -134,3 +136,23 @@ not been seen on the control image (2 boots only -- not enough to exclude it).
 
 Next: a slow-boot sender pcap (cycling until one is caught), then codex's
 proposed builds with `rxpf_beats` forced to 1, 4, 8.
+
+
+## Update 2026-10-09: boot hang -- the image is unsafe
+
+Boots 5 and 6 were good (23.56 Mbit/s each; tally 4 good, 2 slow of 6).  On the
+7th flushed power cycle (2026-10-08 23:38Z) the A3000 never came up: per the
+user, **white screen flashes at startup, then a black screen, no boot**.  No
+ARP from either interface.  The user restored an older ZZ9000 image by hand;
+afterwards the receive window reads 567 ns/long (no read-ahead) and the
+machine boots normally.
+
+So the candidate has a power-up dependence that reaches beyond Ethernet: the
+RTG/video side failed to come up on that boot, and on other boots the network
+path lands in the 200 ms ACK-timer state.  The read-ahead changes only the m00
+read path, so the leading suspects are power-up conditions it touches: the
+registers it adds without a reset term other than Zorro reset (`rxpf_busy`
+can only clear on RLAST), arlen/arburst moved out of the defaults block and
+now set only in the Z2/Z3 read states (undefined until the first read), and
+any m00 burst issued before the PS/ACP side is up (the 68k probing the card
+during its own boot).  Nothing here is verified.
