@@ -8,7 +8,7 @@
  * are counted and their length checked.  Prints PASS/FAIL per case and a
  * final verdict.
  */
-module rxpf_tb;
+module rxpf_tb #(parameter EXTERNAL_DRIVER = 0);
   localparam BOARD   = 32'h48000000;
   localparam BACKLOG = 32'h3fe00000;
 
@@ -137,6 +137,8 @@ module rxpf_tb;
 
   // one Zorro III longword (or word) cycle at absolute address a
   integer lat_fcs, lat_ds, t_fcs, t_ds;
+  integer address_setup_ns = 30, fcs_doe_ns = 40, doe_ds_ns = 10;
+  integer post_ack_hold_ns = 20;
   task z3cycle(input [31:0] a, input rd, input [1:0] lanes /*3=long,2=hi word,1=lo word*/,
                output [31:0] got, output integer cycles_ns);
     integer t0;
@@ -145,16 +147,16 @@ module rxpf_tb;
       zorro_started = 1;
       za_drv = {a[23:2], 1'b0}; zd_drv = {a[31:24], 8'h00};
       za_oe = 1; zd_oe = 1; ZORRO_READ = rd;
-      #30 ZORRO_NFCS = 0; t_fcs = $time;
-      #40 za_oe = 0; zd_oe = !rd;
+      #(address_setup_ns) ZORRO_NFCS = 0; t_fcs = $time;
+      #(fcs_doe_ns) za_oe = 0; zd_oe = !rd;
       if (!rd) begin zd_drv = 16'hdead; za_drv = {16'hbeef, 7'h0}; za_oe = 1; end
       ZORRO_DOE = 1;
-      #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0]; t_ds = $time;
-      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #1;
+      #(doe_ds_ns) ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0]; t_ds = $time;
+      for (hang = 0; hang < 30000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #1;
       lat_fcs = $time - t_fcs; lat_ds = $time - t_ds;
       if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rd_out, dut.z3addr_in_ram, dut.z3_fcs_state); end
-      #20;
-      got = {dut.data_z3_hi16, dut.data_z3_low16};
+      #(post_ack_hold_ns);
+      got = {ZORRO_DATA, ZORRO_ADDR[22:7]};
       ZORRO_NUDS = 1; ZORRO_NLDS = 1; ZORRO_NDS1 = 1; ZORRO_NDS0 = 1;
       ZORRO_DOE = 0; za_oe = 0; zd_oe = 0;
       #10 ZORRO_NFCS = 1;
@@ -184,7 +186,7 @@ module rxpf_tb;
   endtask
 
   integer i, n0, ns, k; reg [31:0] got;
-  initial begin
+  initial if (!EXTERNAL_DRIVER) begin
     $timeformat(-9, 0, " ns", 8);
     if ($test$plusargs("BOOT")) begin : boot_arm
       integer n0b;
