@@ -53,6 +53,7 @@ int ethernet_get_backlog();
 u16 ethernet_get_rx_status();
 u16 ethernet_get_rx_stats();
 void ethernet_task();
+void ethernet_packet_service(void);
 void ethernet_reset_for_amiga();
 
 #define FRAME_MAX_BACKLOG 128

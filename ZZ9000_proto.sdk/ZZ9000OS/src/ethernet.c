@@ -31,6 +31,7 @@
 #include <xscugic.h>
 #include "ethernet.h"
 #include "eth_tx_order.h"
+#include "eth_packet_window.h"
 #include "interrupt.h"
 #include "memorymap.h"
 #include "mntzorro.h"
@@ -129,6 +130,13 @@ static u16 rx_bd_backlog_slot[RXBD_CNT];
  * this verdict and the frame presented through the Zorro window cannot part
  * company. */
 static u8 rx_backlog_csum[FRAME_MAX_BACKLOG];
+static struct zz_rx_lease packet_leases;
+static int packet_mode, packet_active, packet_fault, packet_can_clear;
+static u16 packet_length[FRAME_MAX_BACKLOG], packet_serial[FRAME_MAX_BACKLOG];
+static int ethernet_packet_fence(void);
+static int ethernet_packet_rearm(void);
+static void ethernet_packet_service_locked(void);
+
 
 static u16 ethernet_next_backlog_slot(u16 slot)
 {
@@ -211,6 +219,106 @@ static void ethernet_clear_backlog_slot(u16 slot)
 	ethernet_backlog_slot_publish_from(slot, 0U, RX_FRAME_PAD);
 }
 
+/* Sole ARM writer. Every MMIO write is complete before LAST_RESULT is read.
+ * The mailbox contains no write buffer owned by another ARM task/core. */
+static uint32_t ethernet_packet_read(void *context, unsigned word)
+{
+	(void)context;
+	dsb();
+	u32 value = mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_MAILBOX_OFFSET + word * 4u);
+	dsb();
+	return value;
+}
+
+static void ethernet_packet_write(void *context, unsigned word, uint32_t value)
+{
+	(void)context;
+	dsb();
+	mntzorro_write(MNTZ_BASE_ADDR, ETH_PACKET_MAILBOX_OFFSET + word * 4u, value);
+	dsb();
+}
+
+static const struct zz_pkt_io packet_io = {
+	ethernet_packet_read, ethernet_packet_write, 0
+};
+
+static void ethernet_packet_invalidate(void *context, unsigned slot,
+                                       unsigned from, unsigned bytes)
+{
+	(void)context;
+	ethernet_backlog_slot_publish_from((u16)slot, from, bytes);
+}
+
+static void ethernet_packet_header(void *context, unsigned slot,
+                                   uint16_t length, uint16_t serial)
+{
+	volatile u8 *bytes = ethernet_backlog_slot_ptr((u16)slot);
+	(void)context;
+	bytes[0] = (u8)(length >> 8); bytes[1] = (u8)length;
+	bytes[2] = (u8)(serial >> 8); bytes[3] = (u8)serial;
+}
+
+static const struct zz_rx_publish_ops packet_publish = {
+	ethernet_packet_invalidate, ethernet_packet_header
+};
+
+/* Called with GEM stopped and its IRQ excluded. Timeout leaves every old lease
+ * pinned and host admission closed. It never substitutes for a completed fence.
+ * XEmacPs_Stop's BSP contract is synchronous DMA stop; read back RX/TX disable
+ * and complete the ARM stores before reclaiming any descriptor memory. */
+static int ethernet_packet_fence(void)
+{
+	if (!packet_mode) return 1;
+	packet_active = 0;
+	packet_can_clear = 0;
+	zz_rx_lease_flush_begin(&packet_leases);
+	dsb();
+	mntzorro_write(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET, ETH_PACKET_FENCE_STOP);
+	dsb();
+	unsigned stopped;
+	for (stopped = 0; stopped < 10000u; ++stopped) {
+		u32 fence = mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET);
+		if ((fence & (ETH_PACKET_HOST_DRAINED | ETH_PACKET_LINK_DRAINED)) ==
+		    (ETH_PACKET_HOST_DRAINED | ETH_PACKET_LINK_DRAINED)) break;
+	}
+	if (stopped == 10000u) goto failed;
+	/* Let an admitted host read/ACK finish before hiding the bank contents. */
+	if (zz_pkt_write(&packet_io, ZZ_PKT_CONTROL, 1u) != 1) goto failed;
+	for (unsigned n = 0; n < 10000u; ++n) {
+		u32 status = ethernet_packet_read(0, ZZ_PKT_STATUS);
+		u32 fence = mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET);
+		if ((status & (ZZ_PKT_HALTED | ZZ_PKT_DRAIN_COMPLETE)) !=
+		    (ZZ_PKT_HALTED | ZZ_PKT_DRAIN_COMPLETE) ||
+		    (fence & (ETH_PACKET_HOST_DRAINED | ETH_PACKET_LINK_DRAINED)) !=
+		    (ETH_PACKET_HOST_DRAINED | ETH_PACKET_LINK_DRAINED)) continue;
+		u32 ctrl = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress,
+		                             XEMACPS_NWCTRL_OFFSET);
+		dsb();
+		if (ctrl & (XEMACPS_NWCTRL_RXEN_MASK | XEMACPS_NWCTRL_TXEN_MASK))
+			goto failed;
+		if (!zz_rx_lease_flush_finish(&packet_leases, ZZ_RX_FLUSH_FENCE))
+			goto failed;
+		packet_can_clear = 1;
+		packet_fault = 0;
+		return 1;
+	}
+failed:
+	packet_fault = 1;
+	return 0;
+}
+
+static int ethernet_packet_rearm(void)
+{
+	if (!packet_mode) return 1;
+	if (!packet_can_clear || packet_fault) return 0;
+	if (zz_pkt_write(&packet_io, ZZ_PKT_CONTROL, 2u) != 1) return 0;
+	mntzorro_write(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET, ETH_PACKET_FENCE_RESUME);
+	dsb();
+	packet_can_clear = 0;
+	packet_active = 1;
+	return 1;
+}
+
 void micrel_auto_negotiate(XEmacPs *xemacpsp, u32 phy_addr);
 u32 micrel_auto_negotiate_step2(XEmacPs *xemacpsp, u32 phy_addr);
 
@@ -256,6 +364,8 @@ int init_ethernet_buffers() {
 	XEmacPs_Bd *BdRxPtr;
 
 	XEmacPs_Stop(EmacPsInstancePtr);
+	if (!ethernet_packet_fence()) return XST_FAILURE;
+	ethernet_clear_host_state();
 
 	XEmacPs_BdClear(&BdTemplate);
 
@@ -323,6 +433,7 @@ int init_ethernet_buffers() {
 		return XST_FAILURE;
 	}
 
+	if (!ethernet_packet_rearm()) return XST_FAILURE;
 	XEmacPs_Start(EmacPsInstancePtr);
 #if ETH_DEBUG_VERBOSE
 	printf("EMAC: XEmacPs_Start done.\n");
@@ -401,6 +512,9 @@ int ethernet_init() {
 
 	setup_phy(EmacPsInstancePtr);
 
+	packet_mode = mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_CAP_OFFSET) == ETH_PACKET_CAP_MAGIC;
+	zz_rx_lease_init(&packet_leases);
+	packet_active = packet_fault = packet_can_clear = 0;
 	return XST_SUCCESS;
 }
 
@@ -452,11 +566,15 @@ int ethernet_pause_rx_irq(void)
 	}
 
 	uint32_t irq_state = smp_local_irq_save();
-	XScuGic_Disable(interrupt_get_intc(), EMACPS_IRPT_INTR);
+	XScuGic *intc = interrupt_get_intc();
+	u32 enabled = XScuGic_DistReadReg(intc, XSCUGIC_ENABLE_SET_OFFSET +
+	                                  (EMACPS_IRPT_INTR / 32u) * 4u);
+	XScuGic_Disable(intc, EMACPS_IRPT_INTR);
 	dsb();
 	isb();
 	smp_local_irq_restore(irq_state);
-	return 1;
+	/* Restore the prior mask, so nested restart/MAC-update callers stay fenced. */
+	return (enabled & (1u << (EMACPS_IRPT_INTR % 32u))) != 0;
 }
 
 void ethernet_resume_rx_irq(int paused)
@@ -541,6 +659,11 @@ void ethernet_log_status(const char *reason) {
 }
 
 void ethernet_clear_host_state(void) {
+	if (packet_mode && !packet_can_clear) {
+		/* An old init/reset caller must not bypass packet/host/DMA drain. */
+		packet_fault = 1;
+		return;
+	}
 	eth_tx_order_flush(&eth_tx_ord);
 	frames_backlog = 0;
 	frames_backlog_read = 0;
@@ -572,6 +695,8 @@ int ethernet_restart_dma(const char *reason) {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	u32 BaseAddress = EmacPsInstancePtr->Config.BaseAddress;
 
+	int paused = ethernet_pause_rx_irq();
+	ethernet_hw_ready = 0;
 	ethernet_log_status(reason);
 
 	XEmacPs_Stop(EmacPsInstancePtr);
@@ -589,15 +714,17 @@ int ethernet_restart_dma(const char *reason) {
 		XEmacPs_WriteReg(BaseAddress, XEMACPS_ISR_OFFSET, status);
 	}
 
-	ethernet_clear_host_state();
-
+	/* init_ethernet_buffers performs the packet fence before clearing the ring. */
 	int Status = init_ethernet_buffers();
 	if (Status != XST_SUCCESS) {
 		printf("EMAC: DMA restart failed (%s): %d\n", reason, Status);
+		ethernet_resume_rx_irq(paused);
 		return XST_FAILURE;
 	}
 
+	ethernet_hw_ready = 1;
 	ethernet_log_status("dma-restart-after");
+	ethernet_resume_rx_irq(paused);
 	return XST_SUCCESS;
 }
 
@@ -692,6 +819,20 @@ static int ethernet_prepare_rx_bd(XEmacPs_BdRing *rxring, XEmacPs_Bd *rxbd) {
 	u32 bd_index = XEMACPS_BD_TO_INDEX(rxring, rxbd);
 	u16 backlog_slot = frames_backlog_reserve;
 
+	if (packet_mode) {
+		unsigned distance = (backlog_slot + FRAME_MAX_BACKLOG - frames_backlog_read) % FRAME_MAX_BACKLOG;
+		if (bd_index >= RXBD_CNT || rx_bd_backlog_slot[bd_index] != ETH_INVALID_BACKLOG_SLOT ||
+		    zz_rx_lease_pinned(&packet_leases, backlog_slot) || distance < frames_backlog) {
+			packet_fault = 1;
+			return XST_FAILURE;
+		}
+		for (unsigned i = 0; i < RXBD_CNT; ++i) {
+			if (rx_bd_backlog_slot[i] == backlog_slot) {
+				packet_fault = 1;
+				return XST_FAILURE;
+			}
+		}
+	}
 	ethernet_clear_backlog_slot(backlog_slot);
 	rx_bd_backlog_slot[bd_index] = backlog_slot;
 	frames_backlog_reserve = ethernet_next_backlog_slot(frames_backlog_reserve);
@@ -760,6 +901,66 @@ void ethernet_alloc_rx_frames() {
 	if (!free_bds) {
 		printf("EMAC: no BDs free for allocation\n");
 	}
+}
+
+static void ethernet_packet_service_locked(void)
+{
+	if (!packet_mode || !packet_active || packet_fault || !ethernet_hw_ready)
+		return;
+	if (!(ethernet_packet_read(0, ZZ_PKT_STATUS) & ZZ_PKT_RUNNING)) {
+		packet_fault = 1;
+		return;
+	}
+	/* Bounded work: at most four releases/submissions per main-loop pass. */
+	for (unsigned budget = 0; budget < 4u; ++budget) {
+		int result = zz_pkt_release(&packet_leases, &packet_io);
+		if (result < 0) goto fault;
+		if (!result) break;
+		struct zz_rx_descriptor d;
+		unsigned error;
+		/* Verify the ring identity BEFORE the helper makes the slot FREE. */
+		while (packet_leases.count &&
+		       packet_leases.state[packet_leases.order[packet_leases.head]] == ZZ_RX_RELEASED) {
+			if (!frames_backlog || packet_leases.order[packet_leases.head] != frames_backlog_read)
+				goto fault;
+			if (!zz_rx_lease_retire(&packet_leases, &d, &error)) goto fault;
+			ethernet_clear_backlog_slot(d.slot);
+			frames_backlog_read = ethernet_next_backlog_slot(frames_backlog_read);
+			frames_backlog--;
+			if (error) frames_dropped++;
+		}
+	}
+	for (unsigned budget = 0; budget < 4u; ++budget) {
+		if (!zz_rx_lease_offer(&packet_leases)) {
+			if (zz_rx_lease_rollover_needed(&packet_leases)) break;
+			if (packet_leases.count >= frames_backlog) break;
+			unsigned slot = (frames_backlog_read + packet_leases.count) % FRAME_MAX_BACKLOG;
+			if (!zz_rx_lease_prepare(&packet_leases, slot, packet_length[slot],
+			                         packet_serial[slot], rx_backlog_csum[slot],
+			                         &packet_publish, 0)) goto fault;
+		}
+		int result = zz_pkt_submit(&packet_leases, &packet_io);
+		if (result < 0) goto fault;
+		if (!result) break;
+	}
+	if (rx_backpressure && ethernet_backlog_pending() <= ETH_BACKLOG_LOW_WATERMARK) {
+		rx_backpressure = 0;
+		ethernet_alloc_rx_frames();
+	}
+	return;
+fault:
+	/* Keep all ownership intact until a completed reset fence. */
+	packet_fault = 1;
+}
+
+void ethernet_packet_service(void)
+{
+	if (!packet_mode) return;
+	int paused = ethernet_pause_rx_irq();
+	ethernet_packet_service_locked();
+	int rollover = !packet_fault && zz_rx_lease_rollover_needed(&packet_leases);
+	ethernet_resume_rx_irq(paused);
+	if (rollover) ethernet_restart_dma("packet-cookie-rollover");
 }
 
 static void XEmacPsRecvHandler(void *Callback)
@@ -846,14 +1047,19 @@ static void XEmacPsRecvHandler(void *Callback)
 				 * read payload lines the L2 still held from the slot's last use
 				 * or from prefetch past the polled header.
 				 */
-				if (rx_bytes + RX_FRAME_PAD > 32U)
-					ethernet_backlog_slot_publish_from(backlog_slot, 32U,
-					                                   rx_bytes + RX_FRAME_PAD - 32U);
-				*(frame_bl_ptr)   = (rx_bytes&0xff00)>>8;
-				*(frame_bl_ptr+1) = (rx_bytes&0xff);
-				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
-				*(frame_bl_ptr+3) = (frame_serial&0xff);
-				ethernet_backlog_slot_publish_from(backlog_slot, 0U, 32U);
+				if (packet_mode) {
+					packet_length[backlog_slot] = (u16)rx_bytes;
+					packet_serial[backlog_slot] = frame_serial;
+				} else {
+					if (rx_bytes + RX_FRAME_PAD > 32U)
+						ethernet_backlog_slot_publish_from(backlog_slot, 32U,
+						                                   rx_bytes + RX_FRAME_PAD - 32U);
+					*(frame_bl_ptr)   = (rx_bytes&0xff00)>>8;
+					*(frame_bl_ptr+1) = (rx_bytes&0xff);
+					*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
+					*(frame_bl_ptr+3) = (frame_serial&0xff);
+					ethernet_backlog_slot_publish_from(backlog_slot, 0U, 32U);
+				}
 
 				frames_backlog_write = ethernet_next_backlog_slot(frames_backlog_write);
 				frames_backlog++;
@@ -893,6 +1099,9 @@ uint8_t* ethernet_current_receive_ptr() {
 }
 
 int ethernet_get_backlog() {
+	if (packet_mode)
+		return packet_active && !packet_fault &&
+		       (mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET) & ETH_PACKET_READY);
 	return frames_backlog;
 }
 
@@ -925,6 +1134,8 @@ u16 ethernet_get_rx_stats() {
 }
 
 int ethernet_receive_frame(u16 acked_serial) {
+	/* A legacy ACK must never retire a packet lease, including during reset. */
+	if (packet_mode) return frames_backlog_read;
 	//printf("[eth rx] backlog %d read %d write %d\n", frames_backlog, frames_backlog_read, frames_backlog_write);
 
 	int paused = ethernet_pause_rx_irq();
@@ -1080,7 +1291,11 @@ u16 ethernet_get_rx_meta(void) {
 	u16 verdict = ETH_RX_META_NONE;
 	u16 capabilities = 0;
 
-	if (frames_backlog > 0) {
+	if (packet_mode) {
+		u32 status = mntzorro_read(MNTZ_BASE_ADDR, ETH_PACKET_FENCE_OFFSET);
+		if (packet_active && !packet_fault && (status & ETH_PACKET_READY))
+			verdict = (u16)((status >> 5) & ETH_RX_META_MASK);
+	} else if (frames_backlog > 0) {
 		verdict = rx_backlog_csum[frames_backlog_read] & ETH_RX_META_MASK;
 	}
 
@@ -1121,8 +1336,8 @@ void ethernet_update_mac_address() {
 			EmacPsMAC[0],EmacPsMAC[1],EmacPsMAC[2],EmacPsMAC[3],EmacPsMAC[4],EmacPsMAC[5]);
 	ethernet_log_status("mac-update-before");
 
+	int paused = ethernet_pause_rx_irq();
 	XEmacPs_Stop(EmacPsInstancePtr);
-	ethernet_clear_host_state();
 
 	int Status = XEmacPs_SetMacAddress(EmacPsInstancePtr, EmacPsMAC, 1);
 	if (Status != XST_SUCCESS) {
@@ -1130,6 +1345,7 @@ void ethernet_update_mac_address() {
 	}
 
 	ethernet_restart_dma("mac-update-restart");
+	ethernet_resume_rx_irq(paused);
 
 	ethernet_log_status("mac-update-after");
 }

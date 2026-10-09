@@ -2254,6 +2254,8 @@ int main() {
 				audio_debug_timer(1);
 			}
 
+			ethernet_packet_service();
+
 			// check for queued up ethernet frames and interrupt amiga
 			if (interrupt_enabled_ethernet && ethernet_get_backlog()) {
 				amiga_interrupt_set(AMIGA_INTERRUPT_ETH);
