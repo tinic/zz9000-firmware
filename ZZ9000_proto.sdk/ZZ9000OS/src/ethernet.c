@@ -636,7 +636,8 @@ void ethernet_set_rx_offset2(int on)
 {
 	u32 want = on ? 2 : 0;
 
-	if (want == rx_offset_req)
+	if (want == rx_offset_req &&
+	    (ethernet_task_state != ETH_TASK_READY || ethernet_hw_ready))
 		return;
 	rx_offset_req = want;
 	if (ethernet_task_state == ETH_TASK_READY)
