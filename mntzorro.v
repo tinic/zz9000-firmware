@@ -2179,6 +2179,16 @@ module MNTZorro_v0_1_S00_AXI
 
   wire [5:0] s_axi_wword = axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB];
   wire [5:0] s_axi_rword = axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB];
+  // 0x20 capability (RO) and 0x24 host-fence control/status, outside the mailbox.
+  localparam [31:0] PKT_CAPABILITY = 32'h5a505731; // "ZPW1"
+  wire pkt_ctl_write = slv_reg_wren && s_axi_wword == 9 && S_AXI_WSTRB == 4'hf;
+  wire pkt_ctl_stop = pkt_ctl_write && S_AXI_WDATA == 32'd1;
+  wire pkt_ctl_resume = pkt_ctl_write && S_AXI_WDATA == 32'd2;
+  reg  pkt_mode = 0;        // ARM negotiated packet mode: never expose raw DDR
+  reg  pkt_host_stop = 1;   // host admission stopped (reset state)
+  reg  pkt_snap_valid = 0;  // host snapshot latched by a header read
+  reg  [31:0] pkt_snap_cookie = 0;
+  reg  [15:0] pkt_snap_serial = 0;
   wire pkt_csr_write = slv_reg_wren && s_axi_wword >= 16 && s_axi_wword < 26;
   wire [3:0] pkt_csr_word = s_axi_wword - 6'd16;
   wire [3:0] pkt_csr_read_word = s_axi_rword - 6'd16;
@@ -2259,8 +2269,24 @@ module MNTZorro_v0_1_S00_AXI
     // Host ACK: an error packet is dropped by the FPGA (the driver never
     // sees its serial); a good packet is released when the 68k writes its
     // serial to the RX ACK register.  A stale serial is discarded.
-    if (!m00_axi_aresetn || !pkt_running) begin
+    // A 16-bit serial alone cannot identify a packet across sessions: the
+    // ACK must match the snapshot latched when the 68k read that packet's
+    // header, and the head must still hold the snapshot's cookie.
+    if (pkt_ctl_write) pkt_mode <= 1;
+    if (pkt_ctl_stop) pkt_host_stop <= 1;
+    else if (pkt_ctl_resume) pkt_host_stop <= 0;
+
+    if (!m00_axi_aresetn) begin
+      pkt_mode <= 0;
+      pkt_host_stop <= 1;
+      pkt_snap_valid <= 0;
       pkt_ack_valid <= 0;
+      pkt_ack_req <= 0;
+    end else if (!pkt_running || pkt_host_stop || pkt_ctl_stop) begin
+      // If ack_ready is high this cycle the core takes the ACK on this edge
+      // anyway; an unaccepted one is withdrawn (its cookie may never match).
+      pkt_ack_valid <= 0;
+      pkt_snap_valid <= 0;
       pkt_ack_req <= 0;
     end else if (pkt_ack_valid) begin
       if (pkt_ack_ready) pkt_ack_valid <= 0;
@@ -2269,9 +2295,11 @@ module MNTZorro_v0_1_S00_AXI
       pkt_ack_cookie <= pkt_packet_cookie;
     end else if (pkt_ack_req) begin
       pkt_ack_req <= 0;
-      if (pkt_packet_valid && pkt_ack_serial == pkt_packet_serial) begin
+      if (pkt_snap_valid && pkt_ack_serial == pkt_snap_serial &&
+          pkt_packet_valid && pkt_packet_cookie == pkt_snap_cookie) begin
         pkt_ack_valid <= 1;
-        pkt_ack_cookie <= pkt_packet_cookie;
+        pkt_ack_cookie <= pkt_snap_cookie;
+        pkt_snap_valid <= 0;
       end
     end
     videocap_control_live_event <= 1'b0;
@@ -3037,7 +3065,7 @@ module MNTZorro_v0_1_S00_AXI
           zorro_ram_write_request <= 1;
           // RX ACK (0x82, low half of 0x80): the ARM still sees the write,
           // and the packet window releases the matching head packet.
-          if (pkt_running && z3_mapped_addr[15:2] == 14'h20 && (z3_ds0 || z3_ds1)) begin
+          if (pkt_running && !pkt_host_stop && z3_mapped_addr[15:2] == 14'h20 && (z3_ds0 || z3_ds1)) begin
             pkt_ack_serial <= z3_din_low_s2;
             pkt_ack_req <= 1;
           end
@@ -3061,7 +3089,7 @@ module MNTZorro_v0_1_S00_AXI
         end
 
         WAIT_READ_DMA_Z3: begin
-          if (pkt_running && z3_mapped_addr>='h2000 && z3_mapped_addr<'h2800) begin
+          if (pkt_mode && z3_mapped_addr>='h2000 && z3_mapped_addr<'h2800) begin
             // One 2 KB packet slot (header + frame) served from the FPGA bank.
             pkt_wait <= 0;
             zorro_state <= Z3_PKT_READ;
@@ -3102,11 +3130,11 @@ module MNTZorro_v0_1_S00_AXI
         // at 100 MHz) so the driver never sees a half-published slot; with
         // no packet the window reads as zero (serial 0 = nothing presented).
         Z3_PKT_READ: begin
-          if (pkt_packet_valid) begin
+          if (pkt_running && !pkt_host_stop && pkt_packet_valid) begin
             pkt_host_read <= 1;
             pkt_host_word <= z3_mapped_addr[10:2];
             zorro_state <= Z3_PKT_READ2;
-          end else if (pkt_head_busy && pkt_wait != 13'h1fff) begin
+          end else if (pkt_running && !pkt_host_stop && pkt_head_busy && pkt_wait != 13'h1fff) begin
             pkt_wait <= pkt_wait + 1'b1;
           end else begin
             data_z3_hi16 <= 16'h0;
@@ -3123,6 +3151,11 @@ module MNTZorro_v0_1_S00_AXI
 
         Z3_PKT_READ3: begin
           // Rejected reads (past the padded frame, error packet) return zero.
+          if (pkt_host_read_valid && pkt_host_word == 9'd0 && pkt_running && !pkt_host_stop) begin
+            pkt_snap_valid <= 1;
+            pkt_snap_cookie <= pkt_packet_cookie;
+            pkt_snap_serial <= pkt_packet_serial;
+          end
           data_z3_hi16 <= pkt_host_read_valid ?
                           {pkt_host_data[7:0], pkt_host_data[15:8]} : 16'h0;
           data_z3_low16 <= pkt_host_read_valid ?
@@ -3668,6 +3701,11 @@ module MNTZorro_v0_1_S00_AXI
         // Exact compile-time aperture bytes. Z3 reports zero: its established
         // 128 MB layout is deliberately outside this Z2 contract.
         3'h7   : reg_data_out <= SDK_APERTURE_SIZE_VALUE;
+        6'h8   : reg_data_out <= PKT_CAPABILITY;
+        6'h9   : reg_data_out <= {27'b0, pkt_running, pkt_mode, pkt_packet_valid,
+                    !pkt_ack_req && !pkt_ack_valid,
+                    pkt_host_stop && zorro_state != Z3_PKT_READ &&
+                    zorro_state != Z3_PKT_READ2 && zorro_state != Z3_PKT_READ3};
         // Words 16-25: packet receive mailbox (zz_eth_packet_mailbox words 0-9).
         default : reg_data_out <= (s_axi_rword >= 16 && s_axi_rword < 26) ?
                                   pkt_csr_rdata : 'h0;
