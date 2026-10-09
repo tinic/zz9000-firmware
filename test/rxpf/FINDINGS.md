@@ -449,3 +449,22 @@ which spans 0x2000-0x5fff.  The packet bank only covers 0x2000-0x27ff, so
 those numbers mix one 2 KB bank read with 14 KB of plain DDR reads; they are
 NOT active-bank latency.  A bank-only measurement needs SIZE=2048 with a
 packet held in the bank.  The RX Mbit/s figures are unaffected.
+
+## Read-ahead + ownership fixes on hardware (789e9b1, 2026-10-09 09:43-10:07Z)
+
+Image `BOOT-rxpf-789e9b1-nofast.bin` b6e31172... = c8786cc read-ahead
+bitstream (unchanged) + ARM with the RX BD ownership fix, guarded
+restart_dma, hw_ready gate and MAC-update clear.  Eight flushed power
+cycles, `pwmeasure.sh` as before.
+
+| | 50 MHz RX Mbit/s | 82 MHz RX Mbit/s | window readl ns (50/82) | dead/degraded |
+|---|---|---|---|---|
+| upstream nofast (control, earlier) | 21.0-21.7 | 25.4-26.1 | 574 | 3/20 slow |
+| read-ahead c8786cc, old ARM | 23.5-23.7 | 28.2-28.4 (one 24.6) | 452 | 1/6 degraded |
+| **read-ahead 789e9b1, fixed ARM** | **23.06-23.18** | **27.81-27.89** | 452 / 494 | **0/8** |
+
+All 8 boots: backpressure 0 in every sample.  Versus upstream: +7 % at both
+clocks.  Versus the old-ARM read-ahead: ~2 % lower at 50 MHz and ~1.5 % at
+82 MHz but no outliers.  Not yet attributed: the ownership fix hands each
+refilled BD to the GEM with a DSB after BdRingToHw (one barrier per BD); that
+per-frame ARM cost is the first suspect, untested.
