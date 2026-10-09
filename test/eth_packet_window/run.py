@@ -11,8 +11,11 @@ def main():
     parser.add_argument("--iverilog", default="iverilog")
     parser.add_argument("--vvp", default="vvp")
     parser.add_argument("--ivl-dir", type=Path)
-    parser.add_argument("--shared-port", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--shared-port", action="store_true",
                         help="Place packet fetches behind the foreground-priority read arbiter")
+    mode.add_argument("--mailbox", action="store_true",
+                      help="Exercise the registered CSR descriptor/release backend with the real core")
     parser.add_argument("--id-width", type=int, choices=(1, 2), default=2,
                         help="AXI transaction ID width (1 matches live m00; 2 detects truncation)")
     args = parser.parse_args()
@@ -27,12 +30,15 @@ def main():
             run_args += ["-M", str(args.ivl_dir.resolve())]
         if args.shared_port:
             compile_args += ["-DSHARED_READ_PORT"]
+        top = "mailbox_tb" if args.mailbox else "packet_window_tb"
+        if not args.mailbox:
+            compile_args += ["-P", "packet_window_tb.TEST_ID_WIDTH=" + str(args.id_width)]
         compile_args += [
-            "-g2012", "-Wall", "-s", "packet_window_tb", "-o", output,
-            "-P", "packet_window_tb.TEST_ID_WIDTH=" + str(args.id_width),
+            "-g2012", "-Wall", "-s", top, "-o", output,
             str(root / "experimental/zz_eth_packet_window.v"),
             str(root / "experimental/zz_eth_read_arbiter.v"),
-            str(here / "packet_window_tb.v"),
+            str(root / "experimental/zz_eth_packet_mailbox.v"),
+            str(here / (top + ".v")),
         ]
         subprocess.run(compile_args, check=True)
         subprocess.run(run_args + [output], check=True)

@@ -45,6 +45,9 @@ copies remain. Changing that front end is outside this prototype.
 ## Descriptor, publication and ownership contract
 
 All module signals use one clock. Cross-domain transport is an integration task.
+The [registered mailbox backend](MAILBOX.md) now exercises atomic ARM descriptor
+commit and matching release snapshots with this core at the shared 100 MHz clock.
+It has no live address allocation or AXI-Lite/host adapter yet.
 The separate [ARM integration contract](ARM_CONTRACT.md) now provides a portable
 ownership helper and host tests for publication order, matching releases,
 contiguous ring retirement and coordinated reset fences. It is not linked into
@@ -199,6 +202,7 @@ with address/undefined-behavior sanitizers for the ARM helper. Run from any dire
 python3 test/eth_packet_window/run.py
 python3 test/eth_packet_window/run.py --shared-port --id-width 1
 python3 test/eth_packet_window/run.py --shared-port --id-width 2
+python3 test/eth_packet_window/run.py --mailbox
 python3 test/eth_packet_window/run_arm.py
 ```
 
