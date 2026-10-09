@@ -117,3 +117,27 @@ Vivado reference: [UG835 timing-path queries](https://docs.amd.com/r/2020.2-Engl
 describe querying slack from path objects; the lane's actual Vivado 2018.3 run
 must establish command compatibility and the measured result. Local syntax or
 mock-command checks are only runner checks, never synthesis evidence.
+
+## Combined engine profile
+
+`--top engine` selects `zz_eth_packet_engine`: AXI-Lite adapter, registered mailbox,
+packet core and shared read arbiter, with the wrapper defaults (one-bit AXI IDs,
+packet ARCACHE 0xf). The default `--top core` retains the original isolated core
+profile. The runner hashes every selected RTL input, records the selected top,
+and uses the same clock and interface budgets for both. No constraints are
+relaxed to remove an input hold failure.
+
+```sh
+python3 test/eth_packet_window/run_ooc.py --top engine --period-ns 10.0 \
+  --output build/packet-engine-ooc
+```
+
+The engine adds `descriptor_setup_paths.rpt` and `descriptor_hold_paths.rpt`
+for mailbox `desc_cookie` registers to core cookie registers. Missing cells or
+paths fail the run instead of allowing an optimized-away producer to count as
+validation. These paths distinguish the now-internal descriptor transfer from
+the remaining external interface budgets. Core-only measurements above do not
+measure this combined design; actual engine reports must be reviewed separately.
+The combined probe still lacks the live block-design/PS clock and physical port
+context, Zorro adapter and real reset controller. Even an OOC numeric pass is
+not image readiness, full-design closure or a throughput result.

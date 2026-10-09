@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Standalone packet-core measurement, NOT a full-design build or bitstream.
+# Standalone packet-core or combined-engine measurement, NOT a full-design build or bitstream.
 # Run via run_ooc.py for immutable source provenance and scratch cleanup.
 proc packet_ooc {} {
     global argv
-    if {[llength $argv] != 2} { error "Expected output directory and clock period (ns)" }
-    lassign $argv out period
+    if {[llength $argv] != 3} { error "Expected output directory, clock period (ns), core|engine" }
+    lassign $argv out period profile
+    if {$profile ni {core engine}} { error "Unknown OOC profile" }
+    set top zz_eth_packet_window
+    if {$profile eq "engine"} { set top zz_eth_packet_engine }
     set out [file normalize $out]
     if {![string is double -strict $period] || $period < 1.0 || $period > 100.0} {
         error "Clock period must be between 1 and 100 ns"
@@ -14,6 +17,11 @@ proc packet_ooc {} {
     set_param general.maxThreads 1
     create_project -in_memory packet_window_ooc -part $part
     read_verilog [file join $root experimental zz_eth_packet_window.v]
+    if {$profile eq "engine"} {
+        foreach source {zz_eth_packet_mailbox.v zz_eth_packet_axilite.v zz_eth_read_arbiter.v zz_eth_packet_engine.v} {
+            read_verilog [file join $root experimental $source]
+        }
+    }
 
     # These are explicit assumed synchronous interface budgets, not Zorro/ACP
     # constraints. Include reset in the budget; no false paths or multicycles.
@@ -28,7 +36,7 @@ proc packet_ooc {} {
     puts $f {set_output_delay -clock packet_clk -min 0.000 [all_outputs]}
     close $f
     read_xdc $xdc
-    synth_design -top zz_eth_packet_window -part $part -mode out_of_context
+    synth_design -top $top -part $part -mode out_of_context
     if {[llength [get_clocks -quiet packet_clk]] != 1} { error "Missing probe clock" }
     report_utilization -hierarchical -file [file join $out synth_utilization.rpt]
     report_timing_summary -delay_type min_max -report_unconstrained \
@@ -71,6 +79,29 @@ proc packet_ooc {} {
         -path_type full_clock_expanded -input_pins -file [file join $out internal_hold_paths.rpt]
     report_timing -delay_type min -from $inputs -to $registers -max_paths 20 \
         -path_type full_clock_expanded -input_pins -file [file join $out input_hold_paths.rpt]
+    # The combined probe must actually contain the registered descriptor path.
+    # Do not treat an optimized-away producer as proof of interface timing.
+    set descriptor_setup_slack unavailable
+    set descriptor_hold_slack unavailable
+    if {$profile eq "engine"} {
+        set desc_regs [get_cells -hierarchical -quiet -filter {NAME =~ *mailbox*desc_cookie_reg*}]
+        set cookie_regs [get_cells -hierarchical -quiet -filter {NAME =~ *core*cookie_reg*}]
+        if {![llength $desc_regs] || ![llength $cookie_regs]} {
+            error "Missing registered descriptor source/destination cells"
+        }
+        foreach delay {max min} report {descriptor_setup_paths.rpt descriptor_hold_paths.rpt} {
+            report_timing -delay_type $delay -from $desc_regs -to $cookie_regs -max_paths 10 \
+                -path_type full_clock_expanded -input_pins -file [file join $out $report]
+            set paths [get_timing_paths -quiet -delay_type $delay -from $desc_regs \
+                -to $cookie_regs -max_paths 1 -nworst 1]
+            if {[llength $paths] != 1} { error "Missing registered descriptor timing path" }
+            set slack [get_property SLACK $paths]
+            if {![string is double -strict $slack] || abs($slack) > 1.0e6} {
+                error "Invalid registered descriptor slack"
+            }
+            if {$delay eq "max"} { set descriptor_setup_slack $slack } else { set descriptor_hold_slack $slack }
+        }
+    }
     report_route_status -file [file join $out route_status.rpt]
     report_drc -file [file join $out drc.rpt]
     check_timing -verbose -file [file join $out check_timing.rpt]
@@ -97,10 +128,11 @@ proc packet_ooc {} {
     set ram_ok [expr {$bram18 + 2 * $bram36 >= 2}]
     set timing_ok [expr {$setup_slack >= 0 && $hold_slack >= 0}]
     set f [open [file join $out metrics.tsv] w]
-    foreach {key value} [list vivado [version -short] part $part period_ns $period \
+    foreach {key value} [list vivado [version -short] top $top part $part period_ns $period \
             ramb18 $bram18 ramb36 $bram36 setup_slack_ns $setup_slack \
             hold_slack_ns $hold_slack internal_hold_slack_ns $internal_hold_slack \
-            input_hold_slack_ns $input_hold_slack bram_capacity_gate $ram_ok \
+            input_hold_slack_ns $input_hold_slack descriptor_setup_slack_ns $descriptor_setup_slack \
+            descriptor_hold_slack_ns $descriptor_hold_slack bram_capacity_gate $ram_ok \
             numeric_timing_gate $timing_ok image_ready 0] {
         puts $f "$key\t$value"
     }

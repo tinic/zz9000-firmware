@@ -18,6 +18,8 @@ def main():
                       help="Exercise the registered CSR descriptor/release backend with the real core")
     mode.add_argument("--axilite", action="store_true",
                       help="Exercise AXI-Lite capture, responses and quiesce with mailbox/core")
+    mode.add_argument("--engine", action="store_true",
+                      help="Run AXI-Lite and shared-port cases through the combined engine")
     parser.add_argument("--id-width", type=int, choices=(1, 2), default=2,
                         help="AXI transaction ID width (1 matches live m00; 2 detects truncation)")
     args = parser.parse_args()
@@ -32,15 +34,20 @@ def main():
             run_args += ["-M", str(args.ivl_dir.resolve())]
         if args.shared_port:
             compile_args += ["-DSHARED_READ_PORT"]
-        top = "axilite_tb" if args.axilite else ("mailbox_tb" if args.mailbox else "packet_window_tb")
+        if args.engine:
+            compile_args += ["-DCOMBINED_PACKET_ENGINE"]
+        top = "axilite_tb" if (args.axilite or args.engine) else ("mailbox_tb" if args.mailbox else "packet_window_tb")
         if top == "packet_window_tb":
             compile_args += ["-P", "packet_window_tb.TEST_ID_WIDTH=" + str(args.id_width)]
+        if args.engine:
+            compile_args += ["-P", "axilite_tb.TEST_ID_WIDTH=" + str(args.id_width)]
         compile_args += [
             "-g2012", "-Wall", "-s", top, "-o", output,
             str(root / "experimental/zz_eth_packet_window.v"),
             str(root / "experimental/zz_eth_read_arbiter.v"),
             str(root / "experimental/zz_eth_packet_mailbox.v"),
             str(root / "experimental/zz_eth_packet_axilite.v"),
+            str(root / "experimental/zz_eth_packet_engine.v"),
             str(here / (top + ".v")),
         ]
         subprocess.run(compile_args, check=True)

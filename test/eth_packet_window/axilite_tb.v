@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
-module axilite_tb;
+module axilite_tb #(parameter TEST_ID_WIDTH = 2);
     localparam BASE = 32'h3fe00000;
     reg clk = 0;
     always #5 clk = !clk;
@@ -17,7 +17,9 @@ module axilite_tb;
     wire [31:0] desc_cookie, release_cookie;
     wire [1:0] desc_csum;
     wire release_valid, release_ready, release_error;
+`ifndef COMBINED_PACKET_ENGINE
     zz_eth_packet_mailbox mailbox (.*);
+`endif
 
     wire packet_valid, packet_error, ack_ready, host_read_valid;
     wire [11:0] packet_length;
@@ -35,7 +37,27 @@ module axilite_tb;
     reg [31:0] rdata = 0;
     reg [1:0] rresp = 0;
     reg rlast = 0, rvalid = 0;
+`ifndef COMBINED_PACKET_ENGINE
     zz_eth_packet_window core (.flush(core_flush), .flush_done(core_flush_done), .*);
+`endif
+
+`ifdef COMBINED_PACKET_ENGINE
+    localparam [TEST_ID_WIDTH-1:0] BG_ID = TEST_ID_WIDTH > 1 ? 2 : 0;
+    reg foreground_pending=0, fg_arvalid=0, fg_rready=1;
+    reg [31:0] fg_araddr=BASE+32'h20000;
+    reg [7:0] fg_arlen=0;
+    reg [1:0] fg_arburst=1;
+    reg [3:0] fg_arcache=4'hf;
+    reg [2:0] fg_arprot=3'h2;
+    reg [TEST_ID_WIDTH-1:0] fg_arid=1;
+    wire fg_arready, fg_rvalid, fg_rlast;
+    wire [31:0] fg_rdata;
+    wire [1:0] fg_rresp;
+    wire [TEST_ID_WIDTH-1:0] fg_rid, arid;
+    wire [3:0] arcache;
+    wire [2:0] arprot;
+    reg [TEST_ID_WIDTH-1:0] rid=0, bus_id=0;
+`endif
 
     reg [31:0] memory [0:65535];
     reg allow_ar = 1, allow_r = 1, active = 0;
@@ -67,9 +89,20 @@ module axilite_tb;
                     $fatal(1, "invalid or duplicate AXI address");
                 active <= 1; word_index <= (araddr-BASE)/4; beats <= arlen+1;
                 requests = requests + 1;
+`ifdef COMBINED_PACKET_ENGINE
+                bus_id <= arid;
+                if (fg_arready) begin
+                    if (engine.bg_arready || arcache!==4'hf || arprot!==3'h2 || arid!=1)
+                        $fatal(1,"engine foreground attribute/owner mismatch");
+                end else if (!engine.bg_arready || arcache!==4'h3 || arprot!==3'h5 || arid!==BG_ID)
+                    $fatal(1,"engine packet attribute/owner mismatch");
+`endif
             end
             if (active && !rvalid && allow_r) begin
                 rdata <= memory[word_index]; rresp <= 0; rlast <= beats == 1; rvalid <= 1;
+`ifdef COMBINED_PACKET_ENGINE
+                rid <= bus_id;
+`endif
             end
             if (rvalid && rready) begin
                 rvalid <= 0; word_index <= word_index+1; beats <= beats-1;
@@ -93,7 +126,35 @@ module axilite_tb;
     reg s_axi_bready = 0, s_axi_rready = 0;
     reg quiesce_request = 0, resume = 0;
     wire quiesced, local_drained;
+`ifdef COMBINED_PACKET_ENGINE
+    // Deliberately distinct test attributes expose crossed-client wiring.
+    zz_eth_packet_engine #(.ID_WIDTH(TEST_ID_WIDTH), .PACKET_ARCACHE(4'h3),
+        .PACKET_ARPROT(3'h5), .PACKET_ARID(BG_ID)) engine (.*);
+    assign csr_write=engine.csr_write;
+    assign csr_word=engine.csr_word;
+    assign csr_wstrb=engine.csr_wstrb;
+    assign csr_wdata=engine.csr_wdata;
+    assign csr_read_word=engine.csr_read_word;
+    assign csr_rdata=engine.csr_rdata;
+    assign csr_error=engine.csr_error;
+    assign core_flush=engine.core_flush;
+    assign desc_valid=engine.desc_valid;
+    assign desc_ready=engine.desc_ready;
+    assign desc_slot=engine.desc_slot;
+    assign desc_length=engine.desc_length;
+    assign desc_serial=engine.desc_serial;
+    assign desc_cookie=engine.desc_cookie;
+    assign desc_csum=engine.desc_csum;
+    assign release_valid=engine.release_valid;
+    assign release_ready=engine.release_ready;
+    assign release_slot=engine.release_slot;
+    assign release_cookie=engine.release_cookie;
+    assign release_error=engine.release_error;
+    wire mailbox_halted=engine.mailbox.mode==0;
+`else
     zz_eth_packet_axilite adapter (.*);
+    wire mailbox_halted=mailbox.mode==0;
+`endif
 
     integer aw_count=0, w_count=0, b_count=0, ar_count=0, r_count=0, strobes=0;
     reg b_stalled=0, r_stalled=0, prior_write=0;
@@ -220,11 +281,149 @@ module axilite_tb;
             if (!local_drained) $fatal(1,"flush before local drain");
             @(negedge clk); flush_request=1;
             clocks(8);
-            if (!core_flush_done && mailbox.mode!=0) $fatal(1,"core not drained");
+            if (!core_flush_done && !mailbox_halted) $fatal(1,"core not drained");
             if (s_axi_awready || s_axi_wready || s_axi_arready) $fatal(1,"flush reopened adapter");
             @(negedge clk); flush_request=0;
         end
     endtask
+
+`ifdef COMBINED_PACKET_ENGINE
+    integer fg_requests=0, fg_responses=0, bg_requests=0, bg_responses=0;
+    reg held_ar=0;
+    reg [31+8+2+4+3+TEST_ID_WIDTH:0] saved_ar;
+    wire [31+8+2+4+3+TEST_ID_WIDTH:0] full_ar={araddr,arlen,arburst,arcache,arprot,arid};
+    always @(posedge clk) begin
+        if (!aresetn) held_ar<=0;
+        else begin
+            if (held_ar && (!arvalid || full_ar!==saved_ar))
+                $fatal(1,"engine physical AR changed before acceptance");
+            held_ar<=arvalid && !arready; saved_ar<=full_ar;
+            if (fg_arvalid && fg_arready) fg_requests=fg_requests+1;
+            if (engine.bg_arvalid && engine.bg_arready) bg_requests=bg_requests+1;
+            if (fg_rvalid && engine.bg_rvalid) $fatal(1,"engine crossed response ownership");
+            if (fg_rvalid && fg_rready) begin
+                if (fg_rdata!==32'hfe123456 || fg_rid!=1 || fg_rresp!=0 || !fg_rlast)
+                    $fatal(1,"engine foreground response corrupted");
+                fg_responses=fg_responses+1;
+            end
+            if (engine.bg_rvalid && engine.bg_rready) begin
+                if (engine.bg_rid!==BG_ID) $fatal(1,"engine packet RID corrupted");
+                if (engine.bg_rlast) bg_responses=bg_responses+1;
+            end
+        end
+    end
+    task foreground_start;
+        begin
+            @(negedge clk); fg_arvalid=1;
+            @(posedge clk); while (!fg_arready) @(posedge clk);
+            @(negedge clk); fg_arvalid=0;
+        end
+    endtask
+    task foreground_finish;
+        begin
+            while (!fg_rvalid) clocks(1);
+            @(negedge clk); fg_rready=1;
+            @(posedge clk); #1;
+            @(negedge clk); fg_rready=0;
+        end
+    endtask
+    task ack_packet;
+        begin
+            @(negedge clk); ack_valid=1; ack_cookie=32'hc001;
+            @(posedge clk); while (!ack_ready) @(posedge clk);
+            @(negedge clk); ack_valid=0; clocks(4);
+            read_bus(20,32'hc001,0); write_bus(28,32'hc001,15,2,0);
+        end
+    endtask
+    task combined_tests;
+        integer old_requests, old_fg, old_flushes;
+        reg [31+8+2+4+3+TEST_ID_WIDTH:0] frozen_ar;
+        begin
+            memory[32768]=32'hfe123456;
+            foreground_pending=1; fg_rready=0;
+            stage_packet; write_bus(16,32'hc001,15,2,0);
+            clocks(10);
+            if (!engine.bg_arvalid || arvalid) $fatal(1,"engine foreground reservation lost");
+            foreground_start;
+            while (!fg_rvalid) clocks(1);
+            clocks(20);
+            if (packet_valid || engine.bg_arready) $fatal(1,"prefetch bypassed held foreground response");
+            foreground_finish;
+            @(negedge clk); foreground_pending=0;
+            wait_packet;
+            old_requests=requests;
+            // Read the completed bank while unrelated demand AXI remains stalled.
+            allow_r=0; foreground_start;
+            @(negedge clk); host_read=1; host_word=15;
+            clocks(1);
+            if (!host_read_valid || host_data!==memory[527]) $fatal(1,"local bank waited on demand AXI");
+            @(negedge clk); host_read=0;
+            if (requests!=old_requests+1) $fatal(1,"local bank read issued extra DDR request");
+            allow_r=1; foreground_finish; ack_packet;
+            $display("PASS engine foreground priority/backpressure and local bank independence");
+
+            // Packet-selected AR cannot be abandoned when the mailbox flushes;
+            // a later foreground request must wait for that accepted tail.
+            allow_ar=0; allow_r=0;
+            stage_packet; write_bus(16,32'hc001,15,2,0);
+            while (!arvalid) clocks(1);
+            frozen_ar=full_ar; old_fg=fg_requests; old_flushes=flushes;
+            @(negedge clk); quiesce_request=1;
+            clocks(2); if (!local_drained) $fatal(1,"idle control adapter did not drain");
+            @(negedge clk); flush_request=1; fg_arvalid=1;
+            clocks(30);
+            if (flushes!=old_flushes+1 || !arvalid || full_ar!==frozen_ar || mailbox_halted)
+                $fatal(1,"engine logical flush abandoned selected packet AR");
+            @(negedge clk); allow_ar=1;
+            while (!active) clocks(1);
+            clocks(2500); // 25 us delayed response, with a later foreground waiting.
+            if (mailbox_halted || fg_requests!=old_fg || packet_valid)
+                $fatal(1,"engine released ownership before packet tail drained");
+            @(negedge clk); allow_r=1;
+            @(posedge clk); while (!fg_arready) @(posedge clk);
+            @(negedge clk); fg_arvalid=0;
+            while (!fg_rvalid) clocks(1);
+            clocks(10);
+            if (!mailbox_halted || !local_drained || !fg_rvalid || rready)
+                $fatal(1,"packet drain incorrectly claimed or reset physical foreground owner");
+            foreground_finish;
+            @(negedge clk); flush_request=0; quiesce_request=0;
+            enable_bus; write_bus(32,2,15,2,0);
+            read_bus(0,1,0);
+            $display("PASS engine packet flush retains stalled AR/tail and leaves foreground owner alive");
+
+            // Foreground was selected first. A packet's asserted-but-unselected
+            // AR must survive its own flush and drain after foreground finishes.
+            allow_ar=0; allow_r=0;
+            @(negedge clk); fg_arvalid=1;
+            while (!arvalid) clocks(1);
+            frozen_ar=full_ar;
+            stage_packet; write_bus(16,32'hc001,15,2,0);
+            while (!engine.bg_arvalid) clocks(1);
+            @(negedge clk); quiesce_request=1;
+            clocks(2);
+            @(negedge clk); flush_request=1;
+            clocks(30);
+            if (!arvalid || full_ar!==frozen_ar || !engine.bg_arvalid || mailbox_halted)
+                $fatal(1,"packet reset damaged queued physical ownership");
+            @(negedge clk); allow_ar=1;
+            @(posedge clk); while (!fg_arready) @(posedge clk);
+            @(negedge clk); fg_arvalid=0; allow_r=1;
+            while (!fg_rvalid) clocks(1);
+            clocks(20); if (mailbox_halted) $fatal(1,"unselected packet request discarded on flush");
+            foreground_finish;
+            while (!mailbox_halted) clocks(1);
+            if (packet_valid) $fatal(1,"discarded packet became visible");
+            @(negedge clk); flush_request=0; quiesce_request=0;
+            enable_bus; write_bus(32,2,15,2,0);
+            stage_packet; write_bus(16,32'hc001,15,2,0); wait_packet; ack_packet;
+            if (fg_requests!=fg_responses || bg_requests!=bg_responses || active || arvalid || rvalid)
+                $fatal(1,"engine transactions unbalanced after combined drain");
+            $display("PASS engine foreground-held reset, queued packet drain and fresh-session recovery");
+            $display("PASS engine integration groups=3 fg=%0d/%0d packet=%0d/%0d",fg_requests,fg_responses,bg_requests,bg_responses);
+        end
+    endtask
+`endif
 
     integer before_count, before_accepts, before_aw;
     initial begin #1000000; $fatal(1,"AXI-Lite test timed out"); end
@@ -350,6 +549,9 @@ module axilite_tb;
         if (aw_count!=b_count || w_count!=b_count || ar_count!=r_count)
             $fatal(1,"unbalanced final AXI transactions");
         $display("PASS concurrent read-before-write and common fabric reset of requests/responses");
+`ifdef COMBINED_PACKET_ENGINE
+        combined_tests;
+`endif
         $display("PASS AXI-Lite groups=5 CSR strobes=%0d core accepts=%0d releases=%0d DDR requests=%0d",strobes,accepts,releases,requests);
         $finish;
     end

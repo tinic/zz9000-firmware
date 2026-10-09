@@ -42,6 +42,12 @@ They imply about a 21% reduction in read latency (26% increase in raw read rate)
 for that path, not an equivalent TCP gain. The Zorro front end and software
 copies remain. Changing that front end is outside this prototype.
 
+The [combined offline engine](ENGINE.md) connects the AXI-Lite adapter, mailbox,
+packet core and shared read arbiter. Its integration suite checks simultaneous
+control/packet/foreground ownership and logical reset across the physical port.
+It is a synthesis target for the real registered descriptor path; it still has
+no live address allocation, block-design connection or host driver.
+
 ## Descriptor, publication and ownership contract
 
 All module signals use one clock. Cross-domain transport is an integration task.

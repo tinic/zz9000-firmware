@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the isolated packet core in Vivado; never generate an FPGA image."""
+"""Measure the isolated packet core or combined engine in Vivado; never generate an FPGA image."""
 import argparse
 import hashlib
 import json
@@ -9,15 +9,23 @@ import subprocess
 import tempfile
 
 
-INPUTS = (
+COMMON_INPUTS = (
     "experimental/zz_eth_packet_window.v",
     "test/eth_packet_window/run_ooc.tcl",
     "test/eth_packet_window/run_ooc.py",
 )
 
+ENGINE_INPUTS = (
+    "experimental/zz_eth_packet_mailbox.v",
+    "experimental/zz_eth_packet_axilite.v",
+    "experimental/zz_eth_read_arbiter.v",
+    "experimental/zz_eth_packet_engine.v",
+)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--top", choices=("core", "engine"), default="core")
     parser.add_argument("--vivado", default="vivado")
     parser.add_argument("--period-ns", type=float, choices=(10.0, 6.666667), default=10.0)
     parser.add_argument("--output", required=True, type=Path,
@@ -27,7 +35,8 @@ def main():
     # Reject a package or dirty input whose claimed commit cannot be established.
     sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     contents = {}
-    for rel in INPUTS:
+    inputs = COMMON_INPUTS + (ENGINE_INPUTS if args.top == "engine" else ())
+    for rel in inputs:
         data = (root / rel).read_bytes()
         committed = subprocess.check_output(["git", "-C", str(root), "show", sha + ":" + rel])
         if data != committed:
@@ -41,12 +50,15 @@ def main():
     manifest = {
         "source_commit": sha,
         "input_sha256": {rel: hashlib.sha256(data).hexdigest() for rel, data in contents.items()},
-        "top": "zz_eth_packet_window", "part": "xc7z020clg400-1",
+        "top": "zz_eth_packet_engine" if args.top == "engine" else "zz_eth_packet_window",
+        "part": "xc7z020clg400-1",
         "period_ns": args.period_ns,
         "boundary_assumptions_ns": {"input_max": 1.0, "input_min": 0.0,
                                     "output_max": 1.0, "output_min": 0.0,
                                     "setup_uncertainty": 0.1, "hold_uncertainty": 0.05},
-        "scope": "Standalone OOC synthesis/place/route; core only, no arbiter or live m00",
+        "scope": ("Standalone OOC synthesis/place/route; "
+                  + ("AXI-Lite/mailbox/core/read-arbiter engine" if args.top == "engine" else "packet core")
+                  + "; no live m00, block design or host adapter"),
         "status": "started", "image_ready": False,
         "manual_review_required": ["memory_cells", "constraint coverage", "DRC", "route status"],
     }
@@ -63,7 +75,7 @@ def main():
                 target.write_bytes(data)
             command = [executable, "-mode", "batch", "-nojournal", "-log", str(output / "vivado.log"),
                        "-source", str(source / "test/eth_packet_window/run_ooc.tcl"),
-                       "-tclargs", str(output), str(args.period_ns)]
+                       "-tclargs", str(output), str(args.period_ns), args.top]
             manifest["command"] = command
             with (output / "console.log").open("w") as log:
                 result_code = subprocess.run(command, cwd=work, stdout=log,
