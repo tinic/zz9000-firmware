@@ -704,3 +704,20 @@ cycle per leg, installed size checked before each cycle.
 Every B leg beats every A leg at both clocks.  Matches the z3copy
 prediction (dst+2 = 8.5-13 us of ~435-524 us per frame) and recovers the
 ~2 % the ownership fix cost against the old-ARM read-ahead peak.
+
+## RX offset 2 (dst+2 removal) on hardware, 2026-10-09 10:27-10:55Z
+
+Firmware zz9k/rx-offset2 2156a56 (opt-in GEM RXOFFS=2, `BOOT-rxpf-2156a56-nofast.bin`
+5659ba94..., same read-ahead bitstream) for both arms; driver A = AmiNetXDuo
+origin/main 8bb3dc44 (never asks), B = fix/zz9000-rx-offset2 6c28957a (asks;
+payload copy aligned on both sides).  Eight flushed power cycles, ABBA ABBA,
+installed size verified per leg.
+
+| RX Mbit/s | A (main) | B (offset 2) | median delta |
+|---|---|---|---|
+| 50 MHz | 23.10 23.21 23.21 23.19 | 23.80 23.67 23.64 23.63 | +2.0 % |
+| 82 MHz | 27.81 27.94 27.99 27.96 | 28.35 28.20 28.17 28.20 | +0.9 % |
+
+Every B leg is above every A leg at both clocks; backpressure 0 throughout.
+The 50 MHz gain matches the z3copy estimate (13 us of a 524 us frame); at
+82 MHz it is smaller than the 8.5 us estimate suggested.
