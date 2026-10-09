@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Compile and run the isolated packet-window experiment; leave no build files."""
+import argparse
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--iverilog", default="iverilog")
+    parser.add_argument("--vvp", default="vvp")
+    parser.add_argument("--ivl-dir", type=Path)
+    args = parser.parse_args()
+    here = Path(__file__).resolve().parent
+    root = here.parent.parent
+    with tempfile.TemporaryDirectory(prefix=".sim-", dir=here) as directory:
+        output = str(Path(directory) / "packet_window.vvp")
+        compile_args = [args.iverilog]
+        run_args = [args.vvp]
+        if args.ivl_dir:
+            compile_args += ["-B", str(args.ivl_dir.resolve())]
+            run_args += ["-M", str(args.ivl_dir.resolve())]
+        compile_args += [
+            "-g2012", "-Wall", "-s", "packet_window_tb", "-o", output,
+            str(root / "experimental/zz_eth_packet_window.v"),
+            str(here / "packet_window_tb.v"),
+        ]
+        subprocess.run(compile_args, check=True)
+        subprocess.run(run_args + [output], check=True)
+
+
+if __name__ == "__main__":
+    main()
