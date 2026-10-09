@@ -868,3 +868,14 @@ off/on but the A3000 did not reboot):
 
 Equal within noise, 0 bad data: 4ba340b is a safe correctness fix with no
 throughput effect.  Bench left on the baseline b6e31172.
+
+4ba340b on hardware (BOOT 9884680a..., 789e9b1 ARM, beta8 driver), 2026-10-09
+11:33-12:07Z, valid legs only (rr4-3 discarded: no reboot despite the switch
+cycling, readl@50 494.8; the series now checks readl@50 ~452 per leg):
+
+| arm | RX @50 | RX @82 | readl @50 / @82 |
+|---|---|---|---|
+| A baseline x3 | 23.14 23.13 22.91 | 27.89 27.81 27.93 | 452.1-452.8 / 494.1-494.8 |
+| B 4ba340b x3 | 23.17 23.16 23.05 | 27.63 27.70 27.82 | 452.5-452.8 / 494.8 |
+
+Same throughput and latency within noise, 0 bad data: a clean correctness fix.
