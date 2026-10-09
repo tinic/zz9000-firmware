@@ -150,7 +150,7 @@ module rxpf_tb;
       if (!rd) begin zd_drv = 16'hdead; za_drv = {16'hbeef, 7'h0}; za_oe = 1; end
       ZORRO_DOE = 1;
       #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0]; t_ds = $time;
-      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #1;
+      for (hang = 0; hang < 30000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #1;
       lat_fcs = $time - t_fcs; lat_ds = $time - t_ds;
       if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rd_out, dut.z3addr_in_ram, dut.z3_fcs_state); end
       #20;
