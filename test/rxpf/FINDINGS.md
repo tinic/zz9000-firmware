@@ -834,3 +834,18 @@ one flash's shell never echoed; bench re-flashed to b6e31172):
 No measurable latency or throughput change: the ~10 ns internal saving does
 not shorten the Buster/TF4060 bus cycle.  The fix is a correctness fix (data
 valid before DTACK, saturating DTACK timeout), not a speed-up.
+
+**Correction to the 0551318 pin-delay reading above:** in 0551318 the
+pin-side `data_z3_*_latched` and `dtack` load on the *same* edge (ACK is
+reached one edge after staging), so the data-to-DTACK margin was 0 + routing
+skew, not one clock; codex's 89/122 short-setup result is the right one.  The
+corrected candidate **4ba340b** adds Z3_RXPF_GUARD: latched data at GUARD,
+DTACK at ACK.  Nofast build: TIMING_GATE PASS, overall setup 0.021 / hold
+0.016 ns, LUT 14993 / FF 23491 / BRAM 28.5, bit 057efb67...  Routed: data
+reg->pin 8.3-13.4 ns slow / 2.4-4.9 fast, DTACK 11.3 / 3.85, so DTACK lags the
+latest data bit by ~8.0 ns (slow) / ~8.9 ns (fast), +0.5 ns pessimistic
+cross-corner.  Pin-level tb: 0 short setup/enable (0551318: 89/89).  It removes
+0551318's 10 ns saving; 0551318 measured no throughput change anyway, so
+4ba340b is a correctness fix only.  Packaged BOOT (789e9b1 ARM) 9884680a...,
+not yet on hardware.  Separate, unchanged since upstream: WAIT_READ_DMA_Z3B
+(non-window card-memory reads) sets data, enable and DTACK on one edge.
