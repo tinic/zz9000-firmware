@@ -539,3 +539,36 @@ into Fast RAM, best of 5 x 64, bytes and guard regions verified (0 errors).
 - Remaining lever without bus mastering: card response latency, 517 ns per
   access vs the ~296 ns Buster floor quoted for Z3, i.e. up to ~1.7x on the
   copy if the ZZ9000 front end could answer a read-ahead hit faster.
+
+## Zorro III copy cost (z3copy, 789e9b1 image, 2026-10-09 ~10:10Z)
+
+`test/rxpf/z3copy.c`: one 1512-byte frame copied into Fast RAM, best of 5
+x 64 copies, E-clock under Forbid, bytes and guard regions verified (all 0
+mismatches).  movem = the driver's n68k_copy_longs loop; movel = unrolled;
+move16 only with both ends 16-byte aligned.  Same boot, `cpuspeed 86` then
+`cpuspeed 50` from the shell.
+
+| us per frame | 82 MHz movem +0 | +2 | movel +0 | +2 | move16 | 50 MHz movem +0 | +2 | movel +0 | +2 | move16 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RX window (read-ahead) | 192.9 | 201.4 | 205.4 | 205.1 | 193.0 | 184.9 | 197.8 | 186.4 | 201.9 | 184.7 |
+| card DDR (no read-ahead) | 230.4 | 239.3 | 242.5 | 242.4 | 229.6 | 228.7 | 242.8 | 234.6 | 248.8 | 226.1 |
+| Fast RAM control | 10.2 | 19.3 | 9.9 | 18.9 | 38.0 | 16.9 | 31.9 | 16.3 | 31.3 | 59.0 |
+
+Readings:
+- The card copy is bus-bound, not CPU-bound: 82 MHz is slightly *slower*
+  than 50 MHz (~490 vs ~510 ns/long), consistent with the window readl
+  452 -> 494 ns seen in every boot.  The CPU-clock gain in RX (23.1 -> 27.9
+  Mbit/s) comes from the non-copy work.
+- Read-ahead saves ~16-19 % per frame over plain DDR (185 vs 229 us @50).
+- move16 = movem (no Z3 burst); movel is 1-6 % slower; the driver's movem
+  loop is already the right choice.
+- dst+2 (IP-header alignment) costs 8.5-13 us per frame (4-7 % of the copy).
+- Budget at the measured RX rates: the copy is 35 % (50 MHz, 185 of 524 us
+  per frame) and 44 % (82 MHz, 193 of 435 us) of the per-frame time.  If a
+  Z3 read cost the ~296 ns Buster floor instead of ~490-510 ns, the copy
+  would be ~112 us and RX would model at ~26.9 / ~34.2 Mbit/s (+16 / +23 %).
+  So the next target is the ZZ9000's Z3 slave response latency (the ~200 ns
+  per longword above the floor), not the 68k copy loop.
+- Smaller, cheap target: place the frame so window source and RAM
+  destination share alignment (payload at offset 2 mod 4 in the slot, one
+  word peeled), removing the dst+2 penalty: ~2-2.5 % of frame time.
