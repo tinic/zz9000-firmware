@@ -789,3 +789,24 @@ errors either arm (one A boot: one frame dropped for size, as seen before).
 The A3000's previously installed driver (beta8 8c93d4a, .beta8 backup) was
 restored afterwards; the card keeps firmware 2156a56 (offset off unless a
 driver asks).  Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2 (dst+2 removal) on hardware, 2026-10-09 10:27-10:55Z
+
+Firmware `zz9k/rx-offset2` 2156a56 (`BOOT-rxpf-2156a56-nofast.bin` 5659ba94...,
+read-ahead bitstream unchanged): opt-in GEM RX buffer offset 2 via
+REG_ZZ_ETH_CONFIG 0x1000|1, length bit 15 marks shifted frames, RX_META bit
+12 advertises it, cleared on Amiga reset.  Driver AmiNetXDuo
+`fix/zz9000-rx-offset2` 6c28957a asks for it and copies the payload aligned on
+both sides.  ABBA ABBA on the same firmware, A = origin/main 8bb3dc44 driver
+(acf73ec6...), B = 6c28957a driver (f786b47a...), driver swap + flushed power
+cycle per leg, installed size verified per leg.
+
+| arm | 50 MHz Mbit/s | 82 MHz Mbit/s |
+|---|---|---|
+| A main | 23.10 23.21 23.21 23.19 (median 23.20) | 27.81 27.94 27.99 27.96 (median 27.95) |
+| B offset2 | 23.80 23.67 23.64 23.63 (median 23.66) | 28.35 28.20 28.17 28.20 (median 28.20) |
+
+B > A in every leg, no overlap: **+2.0 % at 50 MHz, +0.9 % at 82 MHz**
+(model from z3copy predicted ~2-2.5 %).  B legs: 0 bad data, 0 overruns, 0
+size drops; one A leg had 1 bad-data/size drop (also seen on baseline boots).
+Evidence: ~/ooc-evidence/rxoff2/ (SHA256SUMS).
