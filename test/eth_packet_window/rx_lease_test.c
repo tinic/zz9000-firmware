@@ -178,11 +178,21 @@ static void ring_and_cookie_wrap(void)
     last = prepare(&p, 0, 60, 2); CHECK(last == UINT32_MAX, "last cookie truncated");
     CHECK(zz_rx_lease_accept(&p), "last cookie accept");
     CHECK(zz_rx_lease_release(&p, 0, last, 0), "last cookie release"); retire(&p, 0, last, 0);
+    CHECK(zz_rx_lease_rollover_needed(&p), "cookie exhaustion not signalled");
     CHECK(!zz_rx_lease_prepare(&p, 0, 60, 2, 0, &ops, &publication), "exhausted cookies wrapped");
     zz_rx_lease_flush_begin(&p);
+    for (unsigned fence = 0; fence != ZZ_RX_FLUSH_FENCE; ++fence) {
+        CHECK(!zz_rx_lease_flush_finish(&p, fence), "cookie rollover before complete fence");
+        CHECK(zz_rx_lease_rollover_needed(&p), "cookie reused before all old commands drained");
+    }
     CHECK(zz_rx_lease_flush_finish(&p, ZZ_RX_FLUSH_FENCE), "exhausted-cookie flush");
-    CHECK(!zz_rx_lease_prepare(&p, 0, 60, 2, 0, &ops, &publication), "logical reset reused exhausted cookies");
-    puts("PASS full ledger/backpressure, repeated ring wrap and fail-closed cookie exhaustion");
+    CHECK(!zz_rx_lease_rollover_needed(&p), "completed fence did not recover exhausted cookies");
+    cookies[0] = prepare(&p, 0, 60, 2);
+    CHECK(cookies[0] == 1 && zz_rx_lease_accept(&p), "fenced cookie rollover failed");
+    CHECK(!zz_rx_lease_release(&p, 0, last, 0), "last pre-fence cookie consumed fresh lease");
+    CHECK(zz_rx_lease_release(&p, 0, cookies[0], 0), "post-rollover release failed");
+    retire(&p, 0, cookies[0], 0);
+    puts("PASS full ledger/backpressure, ring wrap and cookie rollover only after full session fence");
 }
 
 int main(void)

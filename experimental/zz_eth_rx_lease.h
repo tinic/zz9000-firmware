@@ -35,8 +35,10 @@ struct zz_rx_lease {
     uint8_t flushing;
 };
 
-/* Each callback completes synchronously, including the required cache sync/DSB.
- * The live adapter must preserve ethernet_backlog_slot_publish_from semantics.
+/* Requires the live STRONGLY_ORDERED RX_BACKLOG mapping: header stores reach
+ * DDR directly. Pure invalidation is not safe for a dirty cacheable header.
+ * Each callback completes synchronously, including the required cache sync/DSB.
+ * The adapter must preserve ethernet_backlog_slot_publish_from semantics.
  */
 struct zz_rx_publish_ops {
     void (*invalidate)(void *context, unsigned slot, unsigned from, unsigned bytes);
@@ -56,6 +58,12 @@ static inline void zz_rx_lease_init(struct zz_rx_lease *p)
 static inline int zz_rx_lease_pinned(const struct zz_rx_lease *p, unsigned slot)
 {
     return slot >= ZZ_RX_SLOTS || p->state[slot] != ZZ_RX_FREE;
+}
+
+/* Stop admission and initiate the full session fence before cookie reuse. */
+static inline int zz_rx_lease_rollover_needed(const struct zz_rx_lease *p)
+{
+    return p->next_cookie == 0;
 }
 
 /* Read-only staging record. Copy it atomically into the eventual transport;
@@ -168,7 +176,11 @@ static inline int zz_rx_lease_flush_finish(struct zz_rx_lease *p, unsigned fence
         return 0;
     next_cookie = p->next_cookie;
     zz_rx_lease_init(p);
-    p->next_cookie = next_cookie; /* Zero means exhausted; never silently wrap. */
+    /* A COMPLETE session fence proves no old host/transport command can arrive.
+     * Only here may exhausted cookies restart; skipping pinned values alone
+     * cannot protect against a stale command surviving an entire cookie cycle.
+     */
+    p->next_cookie = next_cookie ? next_cookie : 1;
     return 1;
 }
 #endif

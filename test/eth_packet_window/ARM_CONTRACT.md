@@ -34,6 +34,9 @@ alone is insufficient. The helper has no internal locks and callbacks must not
 reenter it. Merely adding `volatile` does not provide mutual exclusion. Use an
 adapter with defined IRQ save/restore and nesting behavior; do not assume the
 current pause/resume pair provides a general nestable lock.
+The reported DMA-restart race violates this exclusion requirement today;
+integration must include the independently validated fix rather than relying on
+this helper to repair the live restart path.
 
 ## Publish, offer, accept, release, retire
 
@@ -49,6 +52,11 @@ current pause/resume pair provides a general nestable lock.
    the first-line operation covers the entire frame. Both invalidations retain
    `ethernet_backlog_slot_publish_from()` completion/DSB semantics. Callback
    return must mean completion, not just enqueueing cache work.
+   This specifically requires the live **STRONGLY_ORDERED RX_BACKLOG mapping**
+   described at lines 161–179: ARM header stores reach DDR, and invalidation
+   removes stale ACP cache lines. A pure invalidate on a dirty, cacheable header
+   could discard the new data. A different mapping needs a separately validated
+   cache publication protocol; this helper does not make it portable by itself.
 3. Only after those callbacks finish does `zz_rx_lease_offer()` expose the whole
    immutable descriptor: slot, length, serial, checksum verdict and 32-bit cookie.
    The C structure's padding/layout is **not a wire format**. Future transport
@@ -111,13 +119,24 @@ completion, rebuild the GEM/ring state under the same exclusion, then enable
 transport/submission and host access in the new session. No simultaneous old
 release and bulk-cancellation path may decrement the ring twice.
 
-Cookies are monotonically allocated across logical resets; the legacy serial
-may wrap independently. A 32-bit cookie is never silently recycled. After
-`UINT32_MAX`, preparation fails closed (including after a logical flush), allowing
-existing leases to release/drain. A planned, coordinated session reinitialization
-with every fence above is required before restarting the sequence. The eventual
-host ABI needs a capability/session handshake and must preserve the entire
-cookie across its 16-bit register interface. That ABI remains unassigned.
+Cookies are monotonically allocated across ordinary logical resets; the legacy
+serial may wrap independently. After `UINT32_MAX`, preparation stops and
+`zz_rx_lease_rollover_needed()` tells the adapter to initiate a coordinated session
+fence. Existing leases may still release/drain. Only a successful
+`zz_rx_lease_flush_finish()` with **all four** fences restarts an exhausted
+sequence at 1. A non-exhausted sequence continues unchanged after the same fence.
+The live adapter must service this condition; otherwise admission stays stopped.
+
+Merely skipping zero and pinned cookies is insufficient: a delayed command from
+an earlier use of a cookie could match its new slot/cookie after wrap (ABA).
+Rollover is therefore permitted only when the transport and host prove that
+**no old command can ever arrive afterward**. If the eventual transport cannot
+provide that guarantee, do not assert the fence; it needs an additional session
+identifier/lifetime protocol first. The helper cannot distinguish a replayed
+cookie 1 from a new cookie 1 after reuse. The tests check admission fencing and
+allocator recovery, not the still-unimplemented transport's stale-record drain.
+The eventual host ABI needs a capability/session handshake and must preserve
+the entire cookie across its 16-bit register interface. That ABI remains unassigned.
 
 ## Validation and remaining integration
 
@@ -126,7 +145,7 @@ callback order and first-line boundaries, invalid metadata, immutable stalled
 offers, exact release identity, reordered/error/duplicate releases, contiguous
 retirement, pending and accepted descriptors across incomplete reset fences,
 stale releases after reset, full-ledger pressure, repeated ring wrap and cookie
-exhaustion. The runner enables warnings as errors and address/undefined-behavior
+rollover after a complete session fence. The runner enables warnings as errors and address/undefined-behavior
 sanitizers, and removes its temporary executable on success or failure.
 Temporary negative controls also verify that the tests reject wrong-cookie
 acceptance, retirement before release, an incomplete reset fence, resetting the
