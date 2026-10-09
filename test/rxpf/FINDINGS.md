@@ -441,3 +441,11 @@ backpressure 0 in every sample.  Integrated on zz9k/packet-window-live as
 e19c45b (fix + codex's rx_bd and rx_init host regressions), pushed to the
 tinic fork.  The same fix applies to legacy (non-packet) firmware: it should
 also end the upstream slow-boot reserved leak (not yet measured on a legacy image).
+
+**Correction (2026-10-09, caught by codex):** the packet-window "window read
+ns/long" figures (505 ns @82 MHz in the table above, and the ~578/600 ns in
+the packet-window boot logs) come from `z3read ADDR=48002000 SIZE=16384`,
+which spans 0x2000-0x5fff.  The packet bank only covers 0x2000-0x27ff, so
+those numbers mix one 2 KB bank read with 14 KB of plain DDR reads; they are
+NOT active-bank latency.  A bank-only measurement needs SIZE=2048 with a
+packet held in the bank.  The RX Mbit/s figures are unaffected.
