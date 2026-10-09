@@ -1,15 +1,17 @@
 # ARM packet ownership integration contract
 
-`experimental/zz_eth_rx_lease.h` is a portable, tested ownership helper, outside
-all firmware builds. It supplies neither a register map nor a CDC transport.
+`experimental/zz_eth_rx_lease.h` is a portable, tested ownership helper. The
+[ARM integration candidate](ARM_LIVE.md) now connects it to capability-gated
+firmware on this follow-up branch. The helper itself supplies neither a register
+map nor a CDC transport.
 `rx_lease_test.c` runs it with cache-publication callbacks on the host. Those
 callbacks test ordering; they do not emulate PL310 coherency, GEM DMA or IRQs.
 The existing RTL tests and this C test are separate, not an end-to-end cosimulation.
 
 The source anchors below refer to `ethernet.c` at firmware commit
 `efc04df280286b3f0091a0cd609dda9032030624`, under
-`ZZ9000_proto.sdk/ZZ9000OS/src/`. The helper deliberately leaves that file alone;
-zz9k-fpga owns the separate DMA-restart/IRQ exclusion fix and its validation.
+`ZZ9000_proto.sdk/ZZ9000OS/src/`. Those anchors describe the original standalone helper. The live candidate now
+edits that file and coordinates DMA restart/IRQ exclusion with zz9k-fpga.
 
 ## Existing accounting must continue to own the DDR ring
 

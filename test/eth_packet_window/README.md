@@ -1,5 +1,10 @@
 # Packet-sized FPGA receive-window prototype
 
+ARM integration branch follow-up: [ARM_LIVE.md](ARM_LIVE.md) documents the
+capability-gated firmware producer, release handling and reset fences added at
+`2e134d22`. The standalone baseline below remains useful reference; the live
+FPGA/host integration is owned separately and is not yet a validated image.
+
 Status: **offline experiment, not integrated into any firmware build**. No image
 was built or flashed for this prototype. Vivado 2018.3 at 100 MHz measured the
 combined engine at two RAMB18s, 437 LUTs and 617 FFs (core alone: 293 LUTs/254 FFs).
