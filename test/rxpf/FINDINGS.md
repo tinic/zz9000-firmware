@@ -226,3 +226,218 @@ After codex's review of the watchdog:
 Limits of the testbench: autoconfig is still seeded rather than run; S_AXI
 (ARM register) traffic is modelled by writing `slv_reg4` directly, not as AXI
 write transactions; RRESP is passed through, not acted on.  Hardware: not yet.
+
+
+## Correction 2026-10-09: every hardware result above used the wrong variant
+
+All images built so far (`rxpf.bit` b9c0af5, `rxpf3.bit` 03a5f70, and the
+`BOOT-upstream-all.bin` control) had `VARIANT_Z3_FASTRAM` and
+`VARIANT_SUPERDENISE` defined.  This A3000 runs a TF4060 and needs the
+**zorro3-nofast** variant (both undefined); the release image the user
+restored is that variant.  So the bimodal boots, the boot-7 hang and the
++8.7 % all come from a configuration the machine is not meant to run, and
+none of them can be attributed to the read-ahead until they are repeated on
+nofast builds.  Next: c8786cc nofast and an `upstream/all` nofast control,
+same ARM elf, the same flushed power-up series on each.
+
+
+## Nofast A/B, 2026-10-09: the read-ahead is +9-10 %, and the slow boots are not its doing
+
+Both images nofast (`VARIANT_Z3_FASTRAM` and `VARIANT_SUPERDENISE` off), same
+ARM `ZZ9000OS.elf` (e6d96168...), same driver.  Candidate c8786cc
+(`BOOT-rxpf-c8786cc-nofast.bin` c649517b..., TIMING_GATE setup 0.000 / hold
+0.015 ns); control `upstream/all` 6aeab1c (`BOOT-upall-nofast.bin`
+66673085..., setup 0.091 / hold 0.050 ns).  Six flushed 30 s power cycles
+each.  Per boot: window timing and one iperf RX at 50 MHz, then `cpuspeed 86`
+from the shell (the TF4060 reports 82 MHz; never in Startup-Sequence), then
+timing and RX again.  Counters are cumulative over both runs.
+
+| boot | window ns/long (50 MHz) | RX Mbit/s 50 MHz | RX Mbit/s 82 MHz | serial gaps | dropped for size |
+|---|---|---|---|---|---|
+| rxpf 1 | 452.1 | 23.5 | 28.4 | 0 | 0 |
+| rxpf 2 | 452.1 | 23.6 | 28.4 | 0 | 0 |
+| rxpf 3 | 452.1 | 23.7 | 28.4 | 0 | 0 |
+| rxpf 4 | 452.1 | 23.5 | **24.6** | 1 | 1 |
+| rxpf 5 | 452.1 | 23.6 | 28.4 | 0 | 0 |
+| rxpf 6 | 452.5 | 23.6 | 28.2 | 0 | 0 |
+| upstream 1 | 565.4 | 18.6 | 21.2 | 0 | 1 |
+| upstream 2 | 566.4 | 21.7 | 26.1 | 0 | 1 |
+| upstream 3 | 566.4 | 21.6 | 25.9 | 0 | 1 |
+| upstream 4 | 567.1 | **3.4** | **3.4** | 4 | 0 |
+| upstream 5 | 566.7 | 21.5 | 26.0 | 0 | 0 |
+| upstream 6 | 565.4 | 21.7 | 25.9 | 0 | 0 |
+
+- Every power-up of both images came back; no hang on nofast.
+- Clean boots: read-ahead 23.5-23.7 vs 21.5-21.7 Mbit/s at 50 MHz (+9 %),
+  28.2-28.4 vs 25.9-26.1 at 82 MHz (+9 %).  At 82 MHz a window read takes
+  longer in ns (494 vs 452 on rxpf) yet RX is +20 % over 50 MHz.
+- **The 3.4 Mbit/s / ~200 ms state occurs on the upstream image (boot 4).**
+  It is a pre-existing problem, not caused by the read-ahead.
+- Size drops occur on clean upstream boots (1-3) with normal throughput: not
+  a read-ahead artifact and not the marker of the bad state.
+- **Serial gaps (frames the ARM dropped) mark the bad boots in both arms**
+  (rxpf 4: 1, upstream 4: 4; the old fastram slow boot: 11).  Every clean
+  boot has 0.
+
+Slow state (upstream boot 4, `ackscan`): ACKs every 10.9 ms (p10-p90
+10.4-11.4), each covering exactly 3 segments (4380 B), RTT 196 ms, no
+retransmissions, window always full.  So frames are not ACKed late; they
+**queue ~200 ms (~55 frames, the whole window) and drain at ~280 frames/s**.
+The degraded rxpf boot 4 was a milder form: ACKs every 14 ms covering 30
+segments, 28 ms RTT, almost no window-update ACKs.
+
+The 68k driver only counts a gap (`zz_rint`), it changes no state, so the
+latch is not there.  Firmware candidates (`ethernet.c`): a drop still
+consumes a serial; backlog over the high watermark sets `rx_backpressure`
+and sends 802.3x PAUSE, cleared only from the 68k ack path; and the
+full/slot-mismatch drop branch clears the slot without advancing
+`frames_backlog_write` while the reserve pointer has moved on.  Next:
+sample the ARM's RX status register (`zzrxs`: ready/reserved/backpressure/
+drops/PAUSE every 20 ms) during the RX run until a slow boot is caught.
+
+**Hypothesis (02:00Z, unverified): the slow state is a latched PAUSE storm.**
+`ETH_PAUSE_QUANTUM` is 0x0800 = 2048 x 512 bit times = 10.49 ms at 100 Mbit/s;
+the slow boot's ACK clock is 10.9 ms (p10-p90 10.4-11.4).  The ARM sends a
+PAUSE from `XEmacPsRecvHandler` whenever `pending = frames_backlog +
+frames_backlog_reserved >= 120` (HIGH; LOW is 96).  If a drop path leaks
+that accounting by ~56 entries, pending never falls below HIGH even with
+the 68k drained, every RX interrupt re-pauses the switch, and ~3 frames get
+through per pause window (~280 frames/s, as observed).  The drops are what
+the 68k sees as serial gaps.  To verify: `zzrxs` on a slow boot should show
+`ready` or `reserved` stuck high with the window empty, and `pause` rising.
+
+ARM RX state on a clean upstream boot (ctl-8, `zzrxs` 700 x 20 ms during the
+50 MHz run): ready 0 (697) / 1 (3), reserved 64, backpressure never, ARM drops
+>= 255 (8-bit field saturated) and 203 PAUSE frames sent, both static for the
+whole run.  So every boot drops and pauses while nobody drains the backlog
+before the driver attaches; the 68k counts none of that as a gap, since its
+serial tracking starts at 0.  Note (codex): a serial gap is evidence of loss,
+not proof of the latched cause; `zz_rint` only counts forward gaps, and the
+repeat/older-serial `ACK_RECOVER` path is a separate mechanism.
+
+## Slow state CONFIRMED on hardware (ctl-10, upstream nofast, 2026-10-09 02:08Z)
+
+`zzrxs` on the slow boot (3.44 / 3.40 Mbit/s, RTT 207 / 210 ms), 700 samples
+per run: **ready 0, reserved 116-119, backpressure set in 700/700**, PAUSE
+counter saturated (255).  On clean boots reserved is 64 (= RXBD_CNT, the
+physical maximum) and backpressure is never set.  So `frames_backlog_reserved`
+has leaked by ~53 above the descriptors that exist: pending can never fall
+to LOW (96), backpressure never clears, `ethernet_alloc_rx_frames()` arms
+only the 1-3 descriptors that fit under HIGH (120), and each arrival
+re-sends a 10.49 ms PAUSE, giving ~3 frames per pause (= the 10.9 ms ACK clock).
+68k: 8 serial gaps, 0 size drops, 0 ACK recoveries.
+
+Root cause (source reading, consistent with the above): `ethernet_reset_for_
+amiga()` runs on every Amiga reset, i.e. every boot.  In ETH_TASK_READY it
+calls `ethernet_restart_dma("amiga-reset")`, which runs Stop /
+`ethernet_clear_host_state()` (reserved = 0) / `init_ethernet_buffers()`
+(reserved += 64) **without** `ethernet_pause_rx_irq()`; only the not-ready
+branch masks the GEM line.  `XEmacPs_Stop()` does not mask the GIC, so a
+frame landing in that window runs `XEmacPsRecvHandler()` on the old ring,
+whose `ethernet_alloc_rx_frames()` reserves k slots for descriptors the ring
+re-create then discards: reserved = 64 + k for the rest of the boot.  Before
+the driver attaches the backlog is full of boot-time traffic, so k ~ 53 is
+the expected size.  Per-boot because it needs a frame inside the window.
+Independent of the read-ahead and of fastram/nofast.
+
+Fix (drafted, not yet applied): hold `ethernet_pause_rx_irq()` across the
+whole of `ethernet_restart_dma()` (Stop .. init_ethernet_buffers), as
+`ethernet_receive_frame()` already does, resuming after the new ring is
+armed.  Branch `fix/eth-restart-dma-irq-mask` off 6aeab1c in zz9k-clean.
+Verify: flash upstream + fix (nofast), power-cycle until 20+ boots show
+reserved = 64 and no slow state (base rate here: 2 slow of 12 upstream boots).
+
+Second slow boot (ctl-14, 3.43 Mbit/s, RTT 203 ms): same signature, reserved
+116-119 throughout.  Backpressure 0 for the first 66 samples (idle before the
+iperf flow: pending = 0 + 119 < HIGH 120), then 1 from the first arrival to
+the end, since pending can never fall to LOW 96.  Upstream tally so far:
+slow 3 of 14 boots (4, 10, 14), all with reserved ~117; clean boots all 64.
+
+Upstream nofast series complete (boots 1-20): **slow 3/20 (4, 10, 14)**.  The
+two sampled slow boots (10, 14) both show reserved 116-119; all 16 sampled
+clean boots (7-9, 11-13, 15-20 and 8) show reserved 64 and no backpressure.
+Clean-boot RX 21.0-21.7 Mbit/s at 50 MHz, 25.4-26.1 at 82 MHz.
+
+## Fix under test (2026-10-09 04:45Z)
+
+`ethernet_restart_dma()` now holds `ethernet_pause_rx_irq()` from before
+`XEmacPs_Stop()` until after `init_ethernet_buffers()` (branch
+`fix/eth-restart-dma-irq-mask` in zz9k-clean, uncommitted).  Image:
+`BOOT-upall-nofast-irqfix.bin` sha256 017882e1... = the same upstream nofast
+bitstream as the control (da772ddb...) + ZZ9000OS.elf 83901f56... (control
+elf e6d96168...).  Verification: 24 flushed power cycles with `zzrxs`;
+pass = reserved 64 and no slow boot on every boot (control: 3/20 slow).
+
+**Fix result so far (05:10Z): NOT a cure.**  irqfix boots 1-7 clean
+(reserved 64, bp 0, 21.1-21.3 / 25.5-25.7 Mbit/s).  Boots 8 and 9 leaked again:
+reserved 101-104 (~40 excess, vs ~53-55 before), bp 700/700, RX 21.3 / 22.9
+Mbit/s with RTT 21-40 ms: degraded, not collapsed, because pending ~104 sits
+between LOW 96 and HIGH 120 (backpressure never clears; PAUSE only when ready
+>= 16).  Verified the masked path is in the elf (XScuGic_Disable -> Stop ->
+clear -> init -> XScuGic_Enable).  All reset paths are main-loop
+(handle_amiga_reset, main.c:702/704/2243) and go through restart_dma; GEM IRQ
+stays on CPU0.  So restart_dma masking is at best partial: the leak has another
+source.  Next: instrument (expose frames_backlog_reserved vs 64-FreeCnt and a
+restart counter through a register) rather than guess.
+
+## Packet receive window on hardware (2026-10-09 06:15Z)
+
+Image: zz9k/packet-window-live fcc85f3 (FPGA packet core + mailbox + arbiter
+in mntzorro.v, codex's ARM lease/mailbox producer 2e134d2 + 401a030), nofast,
+TIMING_GATE PASS (setup +0.038 / hold +0.051 ns).  test/pw: 29/29 in xsim.
+
+- Boot 1: RX stalled after ~120 frames (status ready 0, reserved 0); the
+  ARM packet service had faulted.  Debug ELF (fault-site code + release
+  count in RX_STATUS stats): fault reason 13 = ethernet_clear_host_state()
+  called in packet mode without a completed fence, during bring-up.
+- Boot 2 (debug ELF): reason 13 recorded but a later fence recovered; network
+  fully up (DHCP + IPv6), 2485 frames, 0 bad/gaps/size drops.
+
+| | upstream | read-ahead c8786cc | packet window fcc85f3 |
+|---|---|---|---|
+| RX Mbit/s, 50 MHz | 21.5-21.7 | 23.5-23.7 | 22.0 |
+| RX Mbit/s, 82 MHz | 25.9-26.1 | 28.2-28.4 | 27.7 |
+| window read ns/long @82 MHz | 584 (DDR) | 494 (line hit) | 505 (bank) |
+
+The bank removes DDR latency, but a Zorro read through it costs about the
+same as a read-ahead hit: the remaining ~500 ns is the Z3 front end.
+Throughput sits between upstream and read-ahead; the ARM main-loop feed and
+two banks are the likely limits (not yet measured).
+
+## Root cause of the slow boots AND the packet-window dead boots (2026-10-09 07:20Z)
+
+Both are the same upstream bug in `ethernet.c` (mntmn original code):
+`XEmacPsRecvHandler()` called `XEmacPs_BdClearRxNew()` on every processed BD.
+That clears the GEM used bit, i.e. hands the BD back to the GEM while it still
+points at its old backlog slot and sits in the ring's *free* group.  And
+`XEmacPs_BdRingFromHwRx()` was called with `BdLimit = RXBD_CNT`, not `HwCnt`
+(the BSP walk only stops at the first BD without the used bit).
+
+Normally the refill re-arms the same BDs at once, so the window is tiny.  At
+boot the backlog fills to HIGH (120) before the driver opens, refills stop,
+and the GEM keeps DMAing into "free" BDs over queued slots; the Xilinx ring's
+HwHead/HwCnt drift away from the GEM's queue pointer.  Legacy mode: leaked
+reservations (reserved ~117, PAUSE latched, 3.4 Mbit/s).  Packet mode: the
+lease checks trip (fault 5 / 0x52) and RX dies.
+
+Evidence: dbg4 first-fault snapshot of a dead boot (raw files in
+`~/ooc-evidence/pw-deadrx/`): reason 0x52 at BD16, GEM RXQ pointer = BD16
+(= 144 frames written), Xilinx HwHead 56 / HwCnt 24, BDs 16-55 in the free
+group yet posted (used=0) with live slots.  Unfixed: 9 of 19 boots dead.
+
+Fix (tinic fork `zz9k/rx-bd-ownership-wip` 9a790af, ordering per codex):
+RX BD template starts with the used bit set; it stays set through completion
+and preparation; it is cleared only after a successful `BdRingToHw()` with a
+DSB; `FromHwRx` is bounded to `HwCnt`.  Host regression (codex, 6ebc09c):
+actual firmware RX functions + actual BSP ring routines, 6 cases, packet and
+legacy mode, gcc and clang-19: all pass on the fix, all fail on 910970b.
+
+Hardware: fix + debug counters, 8/8 boots good (fault 0,
+22.05-22.33 / 27.57-27.76 Mbit/s at 50 / 82 MHz).
+
+Clean fix image (9a790af, no instrumentation; BOOT 92f49b9e..., ELF 477ec57f...):
+**8/8 boots carry RX**, 22.03-22.27 / 27.55-27.79 Mbit/s at 50 / 82 MHz,
+backpressure 0 in every sample.  Integrated on zz9k/packet-window-live as
+e19c45b (fix + codex's rx_bd and rx_init host regressions), pushed to the
+tinic fork.  The same fix applies to legacy (non-packet) firmware: it should
+also end the upstream slow-boot reserved leak (not yet measured on a legacy image).
