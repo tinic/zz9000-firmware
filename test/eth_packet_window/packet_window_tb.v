@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
-module packet_window_tb;
+module packet_window_tb #(
+    parameter TEST_ID_WIDTH = 2
+);
     localparam BASE = 32'h3fe00000;
+    localparam [TEST_ID_WIDTH-1:0] BG_ID = TEST_ID_WIDTH > 1 ? 2 : 0;
     reg clk = 0;
     always #5 clk = !clk;
     reg aresetn = 0, flush = 0;
@@ -33,9 +36,13 @@ module packet_window_tb;
     wire [7:0] arlen;
     wire [2:0] arsize;
     wire [1:0] arburst;
+    wire [3:0] arcache;
+    wire [2:0] arprot;
+    wire [TEST_ID_WIDTH-1:0] arid;
     wire arvalid, arready, rready;
     reg [31:0] rdata = 0;
     reg [1:0] rresp = 0;
+    reg [TEST_ID_WIDTH-1:0] rid = 0;
     reg rlast = 0, rvalid = 0;
 
     wire [31:0] core_araddr, core_rdata;
@@ -54,13 +61,22 @@ module packet_window_tb;
     reg [31:0] fg_araddr = 0;
     reg [7:0] fg_arlen = 0;
     reg [1:0] fg_arburst = 1;
+    reg [3:0] fg_arcache = 4'hf;
+    reg [2:0] fg_arprot = 3'h2;
+    reg [TEST_ID_WIDTH-1:0] fg_arid = 1;
+    reg demand_hint = 1;
     reg fg_arvalid = 0, fg_rready = 1;
     wire fg_arready, fg_rlast, fg_rvalid;
     wire [31:0] fg_rdata;
     wire [1:0] fg_rresp;
-    zz_eth_read_arbiter arbiter (
+    wire [TEST_ID_WIDTH-1:0] fg_rid, bg_rid;
+    // Distinct attributes/IDs test transport only; they are not a proposed
+    // change to the live ACP cache/protection policy. Use a wider ID in tests
+    // to expose accidental truncation of the parameterized ID field.
+    zz_eth_read_arbiter #(.ID_WIDTH(TEST_ID_WIDTH)) arbiter (
         .bg_araddr(core_araddr), .bg_arlen(core_arlen), .bg_arburst(core_arburst),
         .bg_arvalid(core_arvalid), .bg_arready(core_arready),
+        .bg_arcache(4'h3), .bg_arprot(3'h5), .bg_arid(BG_ID),
         .bg_rdata(core_rdata), .bg_rresp(core_rresp), .bg_rlast(core_rlast),
         .bg_rvalid(core_rvalid), .bg_rready(core_rready), .*
     );
@@ -70,6 +86,9 @@ module packet_window_tb;
     assign arsize = core_arsize;
     assign arburst = core_arburst;
     assign arvalid = core_arvalid;
+    assign arcache = 4'h3;
+    assign arprot = 3'h5;
+    assign arid = BG_ID;
     assign core_arready = arready;
     assign core_rdata = rdata;
     assign core_rresp = rresp;
@@ -91,6 +110,11 @@ module packet_window_tb;
     reg stalled_ar = 0;
     reg [31:0] stalled_addr;
     reg [7:0] stalled_len;
+    reg [1:0] stalled_burst;
+    reg [TEST_ID_WIDTH-1:0] stalled_id;
+    reg [3:0] stalled_cache;
+    reg [2:0] stalled_prot;
+    reg [TEST_ID_WIDTH-1:0] bus_id = 0;
     assign arready = allow_ar && !pending && (!jitter || rng[0]);
 
     // Independent AXI slave: requests produce immutable memory data, with
@@ -103,17 +127,35 @@ module packet_window_tb;
             rlast <= 0;
             stalled_ar <= 0;
         end else begin
-            if (stalled_ar && (!arvalid || araddr !== stalled_addr || arlen !== stalled_len))
+            if (stalled_ar && (!arvalid || araddr !== stalled_addr || arlen !== stalled_len ||
+                              arburst !== stalled_burst || arcache !== stalled_cache ||
+                              arprot !== stalled_prot || arid !== stalled_id))
                 $fatal(1, "AR changed before handshake");
             stalled_ar <= arvalid && !arready;
             stalled_addr <= araddr;
             stalled_len <= arlen;
+            stalled_burst <= arburst;
+            stalled_cache <= arcache;
+            stalled_prot <= arprot;
+            stalled_id <= arid;
             if (arvalid && arready) begin
                 if (pending || arsize != 2 || arburst != 1 || arlen > 15 ||
                     araddr < BASE || araddr >= BASE + 32'h40000 ||
                     {1'b0, araddr[11:0]} + (arlen + 1) * 4 > 4096)
                     $fatal(1, "Invalid AXI request %h len %d", araddr, arlen);
+`ifdef SHARED_READ_PORT
+                if (fg_arready) begin
+                    if (core_arready || arcache !== 4'hf || arprot !== 3'h2 || arid !== 2'h1)
+                        $fatal(1, "Foreground AXI attributes were not preserved");
+                end else begin
+`endif
+                    if (arcache !== 4'h3 || arprot !== 3'h5 || arid !== BG_ID)
+                        $fatal(1, "Background AXI attributes were not preserved");
+`ifdef SHARED_READ_PORT
+                end
+`endif
                 pending <= 1;
+                bus_id <= arid;
                 bus_word <= (araddr - BASE) >> 2;
                 bus_left <= arlen + 1 + malformed;
                 malformed <= 0;
@@ -126,6 +168,7 @@ module packet_window_tb;
                 else begin
                     rdata <= memory[bus_word];
                     rresp <= bus_word == error_word ? 2'b10 : 2'b00;
+                    rid <= bus_id;
                     rlast <= bus_left == 1;
                     rvalid <= 1;
                 end
@@ -138,6 +181,9 @@ module packet_window_tb;
                 if (rlast) pending <= 0;
             end
             if (release_valid && release_ready) releases <= releases + 1;
+`ifdef SHARED_READ_PORT
+            if (core_rvalid && bg_rid !== BG_ID) $fatal(1, "Background response ID changed");
+`endif
             if (host_read_valid && (^host_data === 1'bx)) $fatal(1, "Uninitialized host data");
         end
     end
@@ -265,7 +311,8 @@ module packet_window_tb;
         integer w, waited;
         begin
             @(negedge clk);
-            foreground_pending = 1; fg_arvalid = 1;
+            foreground_pending = demand_hint; fg_arvalid = 1;
+            fg_arcache = 4'hf; fg_arprot = 3'h2; fg_arid = 2'h1;
             fg_araddr = BASE + word_index * 4; fg_arlen = count - 1;
             fg_rready = stall == 0;
             @(posedge clk);
@@ -284,6 +331,7 @@ module packet_window_tb;
                 waited = 0;
                 while (!fg_rvalid && waited < 12000) begin @(posedge clk); waited = waited + 1; end
                 if (!fg_rvalid || fg_rdata !== memory[word_index + w] || fg_rresp != 0 ||
+                    fg_rid !== 2'h1 ||
                     fg_rlast !== (w == count - 1) || core_rvalid)
                     $fatal(1, "Foreground response mixed with prefetch or wrong data");
             end
@@ -295,6 +343,22 @@ module packet_window_tb;
     task shared_port_tests;
         begin
             put_packet(127, 60, 100, 900);
+            // Both VALID inputs rise for the same selection edge. There is no
+            // advance demand hint to mask a broken foreground priority rule.
+            put_packet(19, 61, 99, 899);
+            first_request = requests;
+            demand_hint = 0;
+            submit(19, 61, 99, 899);
+            while (!core_arvalid) clocks(1);
+            if (arvalid || requests != first_request)
+                $fatal(1, "Race test did not reach idle selection edge");
+            demand_read(127*512 + 11, 1, 0);
+            if (address_log[first_request] != BASE + 127*2048 + 44)
+                $fatal(1, "Same-clock foreground request lost to prefetch");
+            verify_packet(19, 61, 99, 899); ack(899, 19, 0);
+            demand_hint = 1;
+            $display("PASS shared port: simultaneous foreground/prefetch selection without hint");
+
             put_packet(20, 1514, 101, 901);
             foreground_pending = 1;
             first_request = requests;
@@ -332,6 +396,12 @@ module packet_window_tb;
             allow_ar = 0; allow_r = 0;
             submit(22, 1514, 103, 903);
             while (!arvalid) clocks(1);
+            // Change the inactive requester's sidebands while the background
+            // AR is stalled. The selected request must retain all its fields.
+            @(negedge clk); fg_arcache = 4'h0; fg_arprot = 3'h7; fg_arid = 2'h3;
+            clocks(4);
+            if (arcache !== 4'h3 || arprot !== 3'h5 || arid !== BG_ID)
+                $fatal(1, "Inactive client changed a stalled request");
             first_request = requests;
             fork
                 demand_read(127*512 + 9, 1, 0);

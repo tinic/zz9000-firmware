@@ -13,6 +13,8 @@ def main():
     parser.add_argument("--ivl-dir", type=Path)
     parser.add_argument("--shared-port", action="store_true",
                         help="Place packet fetches behind the foreground-priority read arbiter")
+    parser.add_argument("--id-width", type=int, choices=(1, 2), default=2,
+                        help="AXI transaction ID width (1 matches live m00; 2 detects truncation)")
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
     root = here.parent.parent
@@ -27,6 +29,7 @@ def main():
             compile_args += ["-DSHARED_READ_PORT"]
         compile_args += [
             "-g2012", "-Wall", "-s", "packet_window_tb", "-o", output,
+            "-P", "packet_window_tb.TEST_ID_WIDTH=" + str(args.id_width),
             str(root / "experimental/zz_eth_packet_window.v"),
             str(root / "experimental/zz_eth_read_arbiter.v"),
             str(here / "packet_window_tb.v"),

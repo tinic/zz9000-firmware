@@ -7,9 +7,12 @@ has been verified. The existing nofast control/read-ahead experiment is separate
 
 The initial packet core at `e81420cc` received an independent source review from
 zz9k-fpga: no core correctness blocker found; tests were not independently rerun.
-Two RAMB18s is the reviewer's area estimate, not measured synthesis. The current
-follow-up adds an isolated foreground/prefetch arbitration model and tests; it
-still does not modify the live m00 engine or its Zorro-pin testbench.
+Two RAMB18s is the reviewer's area estimate, not measured synthesis. The isolated
+foreground/prefetch arbitration model at `7b852b90` also received a source review
+with no correctness blocker identified. That review requested AXI attribute/ID
+preservation and a simultaneous-arrival priority test. This follow-up implements
+both; independent review of this delta is pending. It still does not modify the
+live m00 engine or its Zorro-pin testbench.
 
 ## What this experiment establishes
 
@@ -137,9 +140,17 @@ permanently asserting the demand hint and must measure progress under real load.
 
 The model has no logical-reset input: clients drain/discard their own operations.
 Shared `aresetn` resets the owner, both clients and the interconnect together.
-All signals are in one clock domain. Cache/protection attributes must retain
-the live m00 contract when integrating; this model routes address, length, burst
-and response signals only and makes no cache/coherency claim.
+All signals are in one clock domain. The owner captures each client's ARCACHE,
+ARPROT and ARID alongside its address, length and burst type; these remain stable
+through a stalled address handshake. RID is passed back unchanged, with RVALID
+exclusive to the selected owner. Ownership, not RID, selects the response client;
+clients remain responsible for checking their expected RID. `ID_WIDTH` defaults
+to 1, matching the current m00 port, and is also tested at width 2.
+
+Integration must retain the live m00 attributes and fixed sidebands, including
+its current ARCACHE `0xf` policy. The testbench uses deliberately distinct client
+attributes to detect crossed routing; they are **not** proposed production cache
+or protection settings. Passing these tests makes no cache/coherency claim.
 
 Required adapters and decisions:
 
@@ -174,7 +185,8 @@ Requirements: Icarus Verilog 13.0 (tested) and Python 3. Run from any directory:
 
 ```sh
 python3 test/eth_packet_window/run.py
-python3 test/eth_packet_window/run.py --shared-port
+python3 test/eth_packet_window/run.py --shared-port --id-width 1
+python3 test/eth_packet_window/run.py --shared-port --id-width 2
 ```
 
 The runner uses a temporary directory under `test/eth_packet_window` and removes
@@ -192,16 +204,22 @@ host repeatedly reads it. Simulation does not model caches, CDC, Zorro pins,
 the ARM driver, placement/routing, or end-to-end network throughput.
 
 The shared-port run adds an independent foreground master and checks priority
-before prefetch launch, a late foreground arrival between packet-fill bursts,
-response backpressure, a stalled background address and 25 us discarded tail
-before a foreground read, bank-window reads waiting on their own prefetch,
-and fabric reset with a foreground request pending behind background traffic.
-It then reruns every packet-core case through that shared owner.
+both with an advance demand hint and when both requests arrive at the same idle
+selection edge without that hint. It also checks a late foreground arrival
+between packet-fill bursts, response backpressure, preserved request attributes
+and response IDs, a stalled background address despite changes to the inactive
+client, a 25 us discarded tail before a foreground read, bank-window reads
+waiting on their own prefetch, and fabric reset with a foreground request pending
+behind background traffic. It then reruns every packet-core case through that
+shared owner.
 
-Icarus 13.0 results for this follow-up: direct run 386 requests / 5,932 response
-beats / 39 releases; shared run 442 requests / 6,732 response beats / 42 releases.
-Two temporary negative controls were also checked: removing the demand-priority
-hint fails the priority assertion, and incorrectly treating a bank-window wait
-as foreground demand times out waiting for packet 904. These mutations are not
-part of the source or build; they establish that the tests detect those wiring
-errors. No additional hardware measurements were made.
+Icarus 13.0 results for this follow-up: direct run has 7 case groups and passes
+386 requests / 5,932 response beats / 39 releases. Shared runs at both ID widths
+have 12 case groups and pass 445 requests / 6,750 response beats / 43 releases.
+Four temporary negative controls each fail the intended assertion: crossing
+background ARCACHE with the foreground value, replacing foreground RID with
+zero, granting background over simultaneous foreground demand, and truncating
+background ARID to one bit in the two-bit configuration. These mutations are
+not part of the source or build. Earlier `7b852b90` controls also detected an
+ignored demand hint and a bank-window wait incorrectly blocking its own
+prefetch. No additional hardware measurements were made.
