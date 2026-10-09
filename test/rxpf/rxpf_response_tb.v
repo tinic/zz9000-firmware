@@ -6,13 +6,16 @@ module rxpf_response_tb;
   reg active = 0;
   reg [31:0] expected;
   wire [31:0] pins = {tb.ZORRO_DATA, tb.ZORRO_ADDR[22:7]};
-  realtime tfcs, tack, tdata;
+  realtime tfcs, tack, tdata, tenable;
+  integer short_setup = 0, short_enable = 0;
+  wire enabled = tb.dut.ZORRO_DATADIR && tb.dut.ZORRO_ADDRDIR;
   integer checked = 0, late = 0, wrong = 0, repeats = 0, early = 0, ack_edges = 0, phase, delay_sel, k, ns;
   reg [31:0] got;
 
   always @(negedge tb.ZORRO_NFCS) if (active) tfcs = $realtime;
   always @(pins) if (active && pins === expected && tdata < 0)
     tdata = $realtime;
+  always @(posedge enabled) if (active && tenable < 0) tenable = $realtime;
   always @(posedge tb.ZORRO_NDTACK) if (active) begin
     if (ack_edges == 0) tack = $realtime;
     else repeats = repeats + 1;
@@ -27,7 +30,7 @@ module rxpf_response_tb;
     integer before_ar;
     begin
       expected = tb.swapped(tb.model(tb.ddr(off, 3), tb.gen));
-      tdata = -1; tack = -1; tfcs = -1; ack_edges = 0;
+      tdata = -1; tack = -1; tfcs = -1; tenable = -1; ack_edges = 0;
       before_ar = tb.ar_count;
       active = 1;
       tb.z3cycle(tb.BOARD + off, 1, 2'b11, got, ns);
@@ -35,9 +38,11 @@ module rxpf_response_tb;
       checked = checked + 1;
       if (got !== expected || tdata < 0 || tack < 0 || tb.hung != 0)
         wrong = wrong + 1;
-      $display("RESPONSE phase=%0d doe=%0d ds=%0d off=%h ar=%0d fcs_ack=%0.3f fcs_data=%0.3f setup=%0.3f ns",
+      if (tack-tdata < 9.999) short_setup = short_setup + 1;
+      if (tenable < 0 || tack-tenable < 9.999) short_enable = short_enable + 1;
+      $display("RESPONSE phase=%0d doe=%0d ds=%0d off=%h ar=%0d fcs_ack=%0.3f fcs_data=%0.3f setup=%0.3f enable_setup=%0.3f ns",
         phase, tb.fcs_doe_ns, tb.doe_ds_ns, off, tb.ar_count-before_ar,
-        tack-tfcs, tdata-tfcs, tack-tdata);
+        tack-tfcs, tdata-tfcs, tack-tdata, tack-tenable);
     end
   endtask
 
@@ -71,10 +76,11 @@ module rxpf_response_tb;
     read_word(32'h2200);
     tb.post_ack_hold_ns = 4000;
     read_word(32'h2204);
-    $display("RESPONSE checked=%0d late_at_ack=%0d early_ack=%0d repeated_ack=%0d wrong_or_hung=%0d", checked, late, early, repeats, wrong);
+    $display("RESPONSE checked=%0d late_at_ack=%0d early_ack=%0d repeated_ack=%0d wrong_or_hung=%0d short_setup=%0d short_enable=%0d", checked, late, early, repeats, wrong, short_setup, short_enable);
     if (checked == 122 && wrong == 0 &&
         (($test$plusargs("EXPECT_LATE") && late > 0) ||
-         (!$test$plusargs("EXPECT_LATE") && late == 0 && early == 0 && repeats == 0)))
+         ($test$plusargs("EXPECT_SHORT_SETUP") && late == 0 && early == 0 && repeats == 0 && short_setup > 0) ||
+         (!$test$plusargs("EXPECT_LATE") && !$test$plusargs("EXPECT_SHORT_SETUP") && late == 0 && early == 0 && repeats == 0 && short_setup == 0 && short_enable == 0)))
       $display("RESPONSE_VERDICT_OK");
     else $display("FAIL response timing verdict");
     $finish;

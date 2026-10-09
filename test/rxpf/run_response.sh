@@ -14,11 +14,25 @@ s = s.replace("`define VARIANT_SUPERDENISE", "//`define VARIANT_SUPERDENISE")
 print(s, end="")
 PY
 xvlog -sv "$VIVADO_DIR/data/ip/xpm/xpm_cdc/hdl/xpm_cdc.sv" > response-xvlog.log 2>&1
-xvlog --relax "$VIVADO_DIR/data/verilog/src/glbl.v" "$R"/videocap_*.v mntzorro_sim.v rxpf_tb.v rxpf_response_tb.v >> response-xvlog.log 2>&1
+xvlog --relax "$VIVADO_DIR/data/verilog/src/glbl.v" "$R"/videocap_*.v mntzorro_sim.v rxpf_tb.v rxpf_response_tb.v rxpf_guard_tb.v >> response-xvlog.log 2>&1
 xelab --relax -L unisims_ver -L xpm --timescale 1ns/1ps rxpf_response_tb glbl -s response > response-xelab.log 2>&1
 args=()
-if [ "${1:-}" = "baseline" ]; then args=(-testplusarg EXPECT_LATE); fi
+case "${1:-}" in
+  "") ;;
+  baseline) args=(-testplusarg EXPECT_LATE) ;;
+  unguarded) args=(-testplusarg EXPECT_SHORT_SETUP) ;;
+  *) echo "usage: $0 [baseline|unguarded]" >&2; exit 2 ;;
+esac
 xsim response -R "${args[@]}" > response.log 2>&1
 grep -E '^RESPONSE checked|^FAIL|RESPONSE_VERDICT' response.log
 grep -q RESPONSE_VERDICT_OK response.log
 ! grep -q '^FAIL' response.log
+
+# Guard invalidation tests apply only to the corrected candidate.
+if [ -z "${1:-}" ]; then
+  xelab --relax -L unisims_ver -L xpm --timescale 1ns/1ps rxpf_guard_tb glbl -s guard > guard-xelab.log 2>&1
+  xsim guard -R > guard.log 2>&1
+  grep -E '^GUARD|^FAIL' guard.log
+  grep -q GUARD_VERDICT_OK guard.log
+  ! grep -q '^FAIL' guard.log
+fi

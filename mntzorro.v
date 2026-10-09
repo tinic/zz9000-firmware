@@ -1242,7 +1242,8 @@ module MNTZorro_v0_1_S00_AXI
   localparam WAIT_READ3C = 59;
   localparam Z3_WRITE_FINALIZE2 = 60;
   localparam Z2_REGREAD_DTACK = 62;
-  localparam Z3_RXPF_ACK = 65;    // data is already in the output pipeline
+  localparam Z3_RXPF_GUARD = 66;  // allow the output pipeline to load before ACK
+  localparam Z3_RXPF_ACK = 65;    // output data has a full clock of setup
   localparam Z3_RXPF_SERVE = 64;  // receive-window read-ahead: answer from the line
   localparam Z2_WRITE_FINALIZE2 = 61;
 
@@ -2919,11 +2920,13 @@ module MNTZorro_v0_1_S00_AXI
               else if (m00_axi_aresetn && z3_mapped_addr < 'h6000 &&
                        rxpf_forward_hit && rxpf_got > {1'b0, rxpf_hit_idx}) begin
                 // Stage an already received beat while decoding this cycle.
-                // ACK is a separate state, after the physical output register.
+                // Enable now; GUARD lets the physical output register load
+                // on the next edge, then ACK follows one edge later.
                 data_z3_hi16 <= {rxpf_buf[rxpf_hit_idx][7:0], rxpf_buf[rxpf_hit_idx][15:8]};
                 data_z3_low16 <= {rxpf_buf[rxpf_hit_idx][23:16], rxpf_buf[rxpf_hit_idx][31:24]};
                 rxpf_read_cycle <= 1;
-                zorro_state <= Z3_RXPF_ACK;
+                dataout_z3 <= 1;
+                zorro_state <= Z3_RXPF_GUARD;
               end else
                 zorro_state <= WAIT_READ_DMA_Z3;
 `else
@@ -3082,11 +3085,31 @@ module MNTZorro_v0_1_S00_AXI
           if (rxpf_got > {1'b0, rxpf_idx}) begin
             data_z3_hi16  <= {rxpf_buf[rxpf_idx][7:0],   rxpf_buf[rxpf_idx][15:8]};
             data_z3_low16 <= {rxpf_buf[rxpf_idx][23:16], rxpf_buf[rxpf_idx][31:24]};
-            zorro_state <= Z3_RXPF_ACK;
+            dataout_z3 <= 1;
+            zorro_state <= Z3_RXPF_GUARD;
           end else if (!rxpf_valid || (!rd_out && !m00_axi_arvalid)) begin
             // the fill ended (or a reset took it) without this beat: retire
             // the line so the retry misses instead of hitting it again
             rxpf_valid <= 0;
+            zorro_state <= WAIT_READ_DMA_Z3;
+          end
+        end
+
+        Z3_RXPF_GUARD: begin
+          // data_z3_*_latched loads on this edge. Do not assert ACK until
+          // the following edge: simultaneous nonblocking assignments give
+          // zero digital setup and can reverse order after physical routing.
+          if (z_reset) begin
+            dtack <= 0;
+            dataout_z3 <= 0;
+            rxpf_read_cycle <= 0;
+            zorro_state <= RESET;
+          end else if (m00_axi_aresetn && rxpf_valid &&
+              rxpf_select == eth_rx_frame_select) begin
+            zorro_state <= Z3_RXPF_ACK;
+          end else begin
+            dtack <= 0;
+            dataout_z3 <= 0;
             zorro_state <= WAIT_READ_DMA_Z3;
           end
         end
@@ -3104,6 +3127,8 @@ module MNTZorro_v0_1_S00_AXI
             rxpf_last <= z3_mapped_addr;
             zorro_state <= Z3_ENDCYCLE;
           end else begin
+            dtack <= 0;
+            dataout_z3 <= 0;
             zorro_state <= WAIT_READ_DMA_Z3;
           end
         end
