@@ -52,24 +52,37 @@ module rxpf_tb;
   // burst and lose the rest with no rlast, as an interconnect reset would.
   reg late_arready = 0, drop_next = 0;
   always @(posedge clk) if (late_arready) arready <= arvalid;
-  reg [31:0] last_arlen;
+  // aresetn: the fabric reset.  stall_next: after the first beat of the next
+  // multi-beat burst, deliver nothing for stall_cycles, then the rest (a slow
+  // but legal slave).  hold_ar: arready held low.  rresp_err: SLVERR on beats.
+  reg aresetn = 1, stall_next = 0, hold_ar = 0, rresp_err = 0;
+  integer stall_cycles = 2000, stall_left = 0;
+  always @(posedge clk) if (hold_ar) arready <= 0;
+  reg [31:0] last_arlen, last_araddr;
   always @(posedge clk) begin
     if (arvalid && arready) begin
       q_addr[q_tail % 16] <= araddr; q_len[q_tail % 16] <= arlen + 1;
       q_gen[q_tail % 16] <= gen; q_tail <= q_tail + 1;
-      ar_count <= ar_count + 1; last_arlen <= arlen;
+      ar_count <= ar_count + 1; last_arlen <= arlen; last_araddr <= araddr;
       if (arlen != 0 && arburst != 2'b01) begin
         $display("FAIL burst with arburst=%0d", arburst); errors = errors + 1;
       end
     end
     rvalid <= 0; rlast <= 0;
-    if (q_head != q_tail) begin
+    if (!aresetn) begin
+      q_head <= q_tail; beat <= 0; wait_cnt <= 0; stall_left <= 0;   // the interconnect forgets everything
+    end else if (stall_left > 0) begin
+      stall_left <= stall_left - 1;
+    end else if (q_head != q_tail) begin
       if (wait_cnt < lat) wait_cnt <= wait_cnt + 1;  // ~200 ns DDR latency by default
       else if (ragged && beat != 0 && ($random & 3) == 0) begin
         // a cycle with no beat inside the burst
       end else begin
         rvalid <= 1;
         rdata  <= model(q_addr[q_head % 16] + beat * 4, q_gen[q_head % 16]);
+        if (stall_next && q_len[q_head % 16] > 1 && beat == 0) begin
+          stall_next <= 0; stall_left <= stall_cycles;
+        end
         if (drop_next && q_len[q_head % 16] > 1) begin
           // one beat, then the rest of this burst and everything queued is gone
           drop_next <= 0; q_head <= q_tail; beat <= 0; wait_cnt <= 0;
@@ -95,10 +108,10 @@ module rxpf_tb;
     .VCAP_B0(1'b0), .VCAP_B1(1'b0), .VCAP_B2(1'b0), .VCAP_B3(1'b0), .VCAP_B4(1'b0), .VCAP_B5(1'b0), .VCAP_B6(1'b0), .VCAP_B7(1'b0),
     .VCAP_R0(1'b0), .VCAP_R1(1'b0), .VCAP_R2(1'b0), .VCAP_R3(1'b0), .VCAP_R4(1'b0), .VCAP_R5(1'b0), .VCAP_R6(1'b0), .VCAP_R7(1'b0),
     .ZORRO_NDTACK(ZORRO_NDTACK),
-    .m00_axi_aclk(clk), .m00_axi_aresetn(1'b1),
+    .m00_axi_aclk(clk), .m00_axi_aresetn(aresetn),
     .m00_axi_awready(1'b1), .m00_axi_wready(1'b1), .m00_axi_bresp(2'b00), .m00_axi_bvalid(1'b0),
     .m00_axi_arready(arready), .m00_axi_araddr(araddr), .m00_axi_arlen(arlen), .m00_axi_arburst(arburst),
-    .m00_axi_arvalid(arvalid), .m00_axi_rdata(rdata), .m00_axi_rresp(2'b00), .m00_axi_rlast(rlast), .m00_axi_rvalid(rvalid),
+    .m00_axi_arvalid(arvalid), .m00_axi_rdata(rdata), .m00_axi_rresp(rresp_err ? 2'b10 : 2'b00), .m00_axi_rlast(rlast), .m00_axi_rvalid(rvalid),
     .m01_axi_aclk(clk), .m01_axi_aresetn(1'b1), .m01_axi_awready(1'b1), .m01_axi_wready(1'b1),
     .m01_axi_bresp(2'b00), .m01_axi_bvalid(1'b0),
     .video_control_vblank_in(2'b00), .source_sync_diagnostic(64'd0),
@@ -122,7 +135,7 @@ module rxpf_tb;
       ZORRO_DOE = 1;
       #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0];
       for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #10;
-      if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rxpf_busy, dut.z3addr_in_ram, dut.z3_fcs_state); end
+      if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rd_out, dut.z3addr_in_ram, dut.z3_fcs_state); end
       #20;
       got = {dut.data_z3_hi16, dut.data_z3_low16};
       ZORRO_NUDS = 1; ZORRO_NLDS = 1; ZORRO_NDS1 = 1; ZORRO_NDS0 = 1;
@@ -174,21 +187,84 @@ module rxpf_tb;
       $display("%s late arready, window read: %0d request(s) (want 1)", (ar_count - n0b == 1) ? "PASS" : "FAIL", ar_count - n0b);
       if (ar_count - n0b != 1) errors = errors + 1;
       late_arready = 0; @(posedge clk); #1 arready = 1; @(posedge clk);
-      // B2: a burst loses its beats (interconnect reset); a Zorro reset follows,
-      // as the Amiga resets while the card comes up.  Afterwards card memory
-      // must still be readable.
+      // B2: a burst loses its beats because the fabric resets under it
+      //     (aresetn), during a read that wants a later beat.  The read must
+      //     come back with the right data, and so must the ones after it.
       dut.slv_reg4 = 5; repeat (4) @(posedge clk);
-      drop_next = 1;
+      expect_read(32'h2000, 5, 2'b11, gen, "B2-a");
+      stall_next = 1;                        // the next fill stalls after one beat ...
+      dut.slv_reg4 = 6; repeat (4) @(posedge clk);
       hung = 0;
-      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);   // gets its own beat
-      z3cycle(BOARD + 32'h2004, 1, 2'b11, got, ns);   // wants a beat that never comes
+      fork
+        expect_read(32'h2000, 6, 2'b11, gen, "B2-b");   // gets beat 0
+        begin repeat (300) @(posedge clk); aresetn = 0; repeat (16) @(posedge clk); aresetn = 1; end
+      join
+      expect_read(32'h2004, 6, 2'b11, gen, "B2-c");     // the fill was lost: asks again
+      expect_read(32'h2008, 6, 2'b11, gen, "B2-d");
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      $display("%s fabric reset mid-burst: data checked, %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
+      if (hung != 0) errors = errors + 1;
+
+      // B3: a legal but slow slave: 2000 cycles between beat 0 and beat 1.
+      //     Nothing may give the burst up; every word must still be right,
+      //     and the read after it must get its own data, not the old tail.
+      dut.slv_reg4 = 7; repeat (4) @(posedge clk);
+      stall_next = 1; stall_cycles = 2000;
+      hung = 0;
+      for (i = 0; i < 16; i = i + 1) expect_read(32'h2000 + i*4, 7, 2'b11, gen, "B3-seq");
+      expect_read(32'h2100, 7, 2'b11, gen, "B3-next");
+      $display("%s slow slave (20 us stall inside a burst): data checked, %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
+      if (hung != 0) errors = errors + 1;
+
+      // B3b: the same stall, but the next read is OUTSIDE the window, so a
+      //      design that gave the burst up would issue it while the old tail
+      //      is still owed, and take an old beat as its data.
+      dut.slv_reg4 = 12; repeat (4) @(posedge clk);
+      stall_next = 1; stall_cycles = 2000;
+      hung = 0;
+      expect_read(32'h2000, 12, 2'b11, gen, "B3b-a");
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      if (got !== swapped(model(last_araddr, gen))) begin
+        $display("FAIL B3b non-window read after a stalled fill: got %h want %h (req %h)", got, swapped(model(last_araddr, gen)), last_araddr);
+        errors = errors + 1;
+      end else $display("PASS non-window read while an old fill's tail is still owed: data checked, %0d hung", hung);
+      if (hung != 0) errors = errors + 1;
+
+      // B4: arready held low, a read requests, the Amiga resets.  The request
+      //     is accepted after the reset; its beats belong to nobody and must
+      //     be drained and dropped.  The reads after must get their own data.
+      dut.slv_reg4 = 8; repeat (4) @(posedge clk);
+      hold_ar = 1; arready = 0;
+      hung = 0;
+      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);      // no handshake: no DTACK
       ZORRO_NIORST = 0; repeat (20) @(posedge clk); ZORRO_NIORST = 1; repeat (20) @(posedge clk);
+      hold_ar = 0; @(posedge clk); #1 arready = 1; repeat (100) @(posedge clk);
       dut.z3_ram_low = BOARD; dut.z3_confdone = 1;
       dut.zorro_state = 9; repeat (4) @(posedge clk); dut.zorro_state = 12; repeat (10) @(posedge clk);
       hung = 0;
-      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);  // framebuffer-style read
-      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);   // window read
-      $display("%s after lost beats + Zorro reset: %0d hung read(s) (want 0)", hung == 0 ? "PASS" : "FAIL", hung);
+      gen = gen + 1;
+      expect_read(32'h2040, 8, 2'b11, gen, "B4-a");
+      expect_read(32'h2044, 8, 2'b11, gen, "B4-b");
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      $display("%s request pending across a Zorro reset: data checked, %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
+      if (hung != 0) errors = errors + 1;
+
+      // B5: the presented slot changes while a fill is still arriving.
+      dut.slv_reg4 = 10; repeat (4) @(posedge clk);
+      stall_next = 1; stall_cycles = 300;
+      expect_read(32'h2000, 10, 2'b11, gen, "B5-a");
+      dut.slv_reg4 = 11; repeat (4) @(posedge clk);
+      expect_read(32'h2004, 11, 2'b11, gen, "B5-b");
+      expect_read(32'h2008, 11, 2'b11, gen, "B5-c");
+      $display("PASS slot change during a fill (data checked above)");
+
+      // B6: SLVERR responses do not wedge the port.
+      rresp_err = 1; hung = 0;
+      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      rresp_err = 0;
+      expect_read(32'h2100, 11, 2'b11, gen, "B6-after");
+      $display("%s SLVERR beats: %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
       if (hung != 0) errors = errors + 1;
       $display("%s rxpf_tb: %0d error(s)", errors == 0 ? "PASS" : "FAIL", errors);
       if (errors == 0) $display("RXPF_VERDICT_OK");

@@ -180,10 +180,49 @@ burst that delivers one beat and loses the rest (no RLAST).
    had no reset and no timeout, and it intentionally survived a Zorro reset.
    A burst cut off while the PS side comes up left it at 1, and every later
    card read -- framebuffer included, since non-window reads wait for it --
-   waited for ever.  That is the black-screen boot.  Fixed: a watchdog gives
-   a burst up after 1024 cycles (10 us) without a beat and retires the line;
-   a read waiting on it goes back to DDR.
+   waited for ever.  This is a **plausible mechanism** for the black-screen
+   boot, not a demonstrated cause: nothing shows that boot 7 actually lost a
+   burst.  The first fix (60e31fa, a 10 us watchdog) was **wrong** and is
+   superseded below: a timeout is not an AXI cancellation, and a slow slave's
+   old beats arriving after it were taken as a later read's data.
 
 Whether flaw 1 also explains the slow-boot state (a stray beat shifting every
 later window read by one response) is a hypothesis; the fixed image has not
 been on hardware.
+
+
+## Update 2026-10-09: the m00 read port as a single-owner transaction (supersedes 60e31fa)
+
+After codex's review of the watchdog:
+
+- The port carries at most one transaction.  Its state (`m00_axi_arvalid`,
+  `rd_out`, `rd_fill`, `rd_discard`) lives outside `zorro_state`, so leaving a
+  Zorro cycle cannot orphan it.  ARVALID drops only on the ARVALID && ARREADY
+  edge.  A new request goes out only when `rd_idle` (fabric not in reset, no
+  request pending, nothing owed).
+- A Zorro reset does not cancel a read -- AXI cannot -- it marks it
+  `rd_discard`; the beats are drained to RLAST and dropped.
+- `m00_axi_aresetn` (previously unused) clears the port outright and keeps
+  ARVALID low while asserted; a Zorro cycle waiting on a read the reset took
+  issues it again.
+- No timeout anywhere.
+- Power-up values: registers declared `= 0` and the new `initial
+  m00_axi_arvalid = 0` become the flops' INIT values in synthesis (UG901), so
+  they are defined at configuration; in the old code ARLEN/ARBURST being
+  unassigned while ARVALID was low was not itself a bus violation.
+
+`run.sh` boot arm, all with data checked against the AXI model:
+
+| case | 60e31fa (watchdog) | single-owner port |
+|---|---|---|
+| late ARREADY: one request per read | pass | pass |
+| fabric reset (aresetn) mid-burst, then reads | pass | pass |
+| slow slave, 20 us stall inside a burst | pass (by luck: retried burst started at the next address) | pass |
+| stalled fill, then a non-window read while the old tail is owed | **wrong data** | pass |
+| request pending (ARREADY low) across a Zorro reset | **hangs, wrong data** | pass |
+| slot change during a fill | pass | pass |
+| SLVERR beats | pass | pass |
+
+Limits of the testbench: autoconfig is still seeded rather than run; S_AXI
+(ARM register) traffic is modelled by writing `slv_reg4` directly, not as AXI
+write transactions; RRESP is passed through, not acted on.  Hardware: not yet.

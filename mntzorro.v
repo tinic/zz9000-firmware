@@ -1240,7 +1240,6 @@ module MNTZorro_v0_1_S00_AXI
   localparam WAIT_READ3C = 59;
   localparam Z3_WRITE_FINALIZE2 = 60;
   localparam Z2_REGREAD_DTACK = 62;
-  localparam Z3_RXPF_ISSUED = 63; // receive-window read-ahead: burst accepted
   localparam Z3_RXPF_SERVE = 64;  // receive-window read-ahead: answer from the line
   localparam Z2_WRITE_FINALIZE2 = 61;
 
@@ -1298,12 +1297,30 @@ module MNTZorro_v0_1_S00_AXI
   reg [31:0] rxpf_base = 0;    // DDR address of beat 0
   reg [4:0]  rxpf_total = 0;   // beats asked for
   reg [4:0]  rxpf_got = 0;     // beats landed
-  reg        rxpf_busy = 0;    // a burst still owes beats
   reg        rxpf_valid = 0;   // the line may answer reads
   reg [20:0] rxpf_select = 0;  // eth_rx_frame_select the line was filled for
   reg [31:0] rxpf_last = 0;    // last window offset the line answered
   reg [3:0]  rxpf_idx = 0;     // beat the current cycle wants
-  reg [9:0]  rxpf_idle = 0;    // cycles since the in-flight burst's last beat
+
+  /* The m00 read port carries at most one transaction at a time, and its
+   * state lives here rather than in zorro_state, so that leaving a Zorro
+   * cycle (reset) cannot orphan it:
+   *   requested  m00_axi_arvalid is up; it drops only on the edge where
+   *              ARVALID && ARREADY, wherever zorro_state is by then;
+   *   accepted   rd_out: the slave owes beats up to RLAST.
+   * A new request goes out only when neither is true.  A Zorro reset does
+   * not cancel a transaction -- AXI cannot -- it marks it rd_discard; the
+   * beats are drained up to RLAST and dropped.  Only the fabric reset
+   * (m00_axi_aresetn) clears the port outright. */
+  reg        rd_out = 0;       // an accepted read still owes beats
+  reg        rd_fill = 0;      // ... and it is a read-ahead fill
+  reg        rd_discard = 0;   // ... and nobody wants its beats
+  reg        rd_req_fill = 0;  // what the pending request will be once accepted
+  // ARVALID powers up low (synthesis takes this as the flop's INIT value);
+  // rd_idle depends on it before the first request.
+  initial m00_axi_arvalid = 1'b0;
+  // a new request may go out: no transaction, and the fabric not in reset
+  wire       rd_idle = m00_axi_aresetn && !m00_axi_arvalid && !rd_out;
   reg sdk_doorbell_pending;
   reg sdk_irq_ack_pending;
   reg sdk_aperture_layout_ack;
@@ -2195,22 +2212,28 @@ module MNTZorro_v0_1_S00_AXI
       zorro_state <= RESET;
     end
 
-    if (rxpf_busy && m00_axi_rvalid) begin
-      rxpf_buf[rxpf_got[3:0]] <= m00_axi_rdata;
-      rxpf_got <= rxpf_got + 1'b1;
-      rxpf_idle <= 0;
-      if (m00_axi_rlast)
-        rxpf_busy <= 0;
-    end else if (rxpf_busy) begin
-      /* A burst that stops delivering -- the PS side reset under it while
-       * the card comes up -- must not hold every later card read for good.
-       * After 1024 cycles (10 us) with no beat, give it up and retire the
-       * line; a cycle waiting on it goes back to DDR. */
-      rxpf_idle <= rxpf_idle + 1'b1;
-      if (&rxpf_idle) begin
-        rxpf_busy  <= 0;
-        rxpf_valid <= 0;
-        rxpf_idle  <= 0;
+    if (!m00_axi_aresetn) begin
+      m00_axi_arvalid <= 0;
+      rd_out     <= 0;
+      rd_fill    <= 0;
+      rd_discard <= 0;
+      rxpf_valid <= 0;
+    end else begin
+      if (m00_axi_arvalid && m00_axi_arready) begin
+        m00_axi_arvalid <= 0;           // accepted on this edge: exactly one request
+        rd_out  <= 1;
+        rd_fill <= rd_req_fill;
+      end
+      if (rd_out && m00_axi_rvalid) begin
+        if (rd_fill && !rd_discard) begin
+          rxpf_buf[rxpf_got[3:0]] <= m00_axi_rdata;
+          rxpf_got <= rxpf_got + 1'b1;
+        end
+        if (m00_axi_rlast) begin
+          rd_out     <= 0;
+          rd_fill    <= 0;
+          rd_discard <= 0;
+        end
       end
     end
     if (zorro_state == Z3_WRITE_PRE || zorro_state == Z3_REGWRITE_PRE ||
@@ -2239,7 +2262,10 @@ module MNTZorro_v0_1_S00_AXI
           z3_confdone <= 0;
           zorro_ram_read_request <= 0;
           zorro_ram_write_request <= 0;
-          rxpf_valid <= 0; // a burst in flight still drains through rxpf_busy
+          rxpf_valid <= 0;
+          // a read requested or in flight is not ours any more: drain and drop it
+          if (m00_axi_arvalid || (rd_out && !(m00_axi_rvalid && m00_axi_rlast)))
+            rd_discard <= 1;
           zorro_ram_read_flag <= 0;
           zorro_ram_write_flag <= 0;
           sdk_doorbell_pending <= 0;
@@ -2640,40 +2666,35 @@ module MNTZorro_v0_1_S00_AXI
             // read via ARM
             zorro_state <= WAIT_READ3;
           else begin
-            // read via AXI DMA
-            m00_axi_arlen <= 'h0;
-            m00_axi_arburst <= 'h0;
-            if (last_addr>='ha000 && last_addr<'h10000)
-              m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + {last_addr[23:2],2'b00};
-            else
-            if (last_addr>='h8000 && last_addr<'hA000)
-              m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + {last_addr[23:2],2'b00};
-            else
-            if (last_addr>='h2000 && last_addr<'h6000)
-              m00_axi_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + {last_addr[23:2],2'b00} + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
-            else
-            if (last_addr>='h6000 && last_addr<'h8000)
-              m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + {last_addr[23:2],2'b00};
-            else
-              m00_axi_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
-  
-            // One request per read: the handshake is arvalid AND arready on
-            // the same edge, and arvalid drops on that edge.  Moving on when
-            // arready alone was high left arvalid up for one more cycle, and
-            // an interconnect whose arready follows arvalid late (as one
-            // coming out of reset does) took that as a second request.
-            m00_axi_arvalid  <= 1;
-            if (m00_axi_arready && m00_axi_arvalid) begin
-              m00_axi_arvalid <= 0;
+            // read via AXI DMA, once the port is idle (see rd_out)
+            if (rd_idle) begin
+              m00_axi_arlen <= 'h0;
+              m00_axi_arburst <= 'h0;
+              if (last_addr>='ha000 && last_addr<'h10000)
+                m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + {last_addr[23:2],2'b00};
+              else
+              if (last_addr>='h8000 && last_addr<'hA000)
+                m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + {last_addr[23:2],2'b00};
+              else
+              if (last_addr>='h2000 && last_addr<'h6000)
+                m00_axi_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + {last_addr[23:2],2'b00} + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
+              else
+              if (last_addr>='h6000 && last_addr<'h8000)
+                m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + {last_addr[23:2],2'b00};
+              else
+                m00_axi_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
+    
+              m00_axi_arvalid <= 1;
+              rd_req_fill <= 0;
               zorro_state <= WAIT_READ2;
             end
-            
           end
         end
-        
+
         WAIT_READ2: begin
-          m00_axi_arvalid <= 0;
-          if (m00_axi_rvalid) begin
+          if (!rd_out && !m00_axi_arvalid) begin
+            zorro_state <= WAIT_READ;           // the fabric reset took the read: ask again
+          end else if (rd_out && !rd_fill && !rd_discard && m00_axi_rvalid) begin
             zorro_state <= WAIT_READ2D;
             
             // le endian swap
@@ -3007,24 +3028,21 @@ module MNTZorro_v0_1_S00_AXI
                 rxpf_rx_addr < rxpf_base + {rxpf_total, 2'b00}) begin
               rxpf_idx <= rxpf_hit_idx;
               zorro_state <= Z3_RXPF_SERVE;
-            end else if (!rxpf_busy) begin
+            end else if (rd_idle) begin
               m00_axi_araddr  <= rxpf_rx_addr;
               m00_axi_arlen   <= rxpf_beats - 1'b1;
               m00_axi_arburst <= 'h1; // INCR
               m00_axi_arvalid <= 1;
-              if (m00_axi_arready && m00_axi_arvalid) begin
-                m00_axi_arvalid <= 0; // accepted on this edge: exactly one request
-                rxpf_base   <= rxpf_rx_addr;
-                rxpf_total  <= rxpf_beats;
-                rxpf_got    <= 0;
-                rxpf_busy   <= 1;
-                rxpf_valid  <= 1;
-                rxpf_select <= eth_rx_frame_select;
-                rxpf_idx    <= 0;
-                zorro_state <= Z3_RXPF_ISSUED;
-              end
+              rd_req_fill <= 1;
+              rxpf_base   <= rxpf_rx_addr;
+              rxpf_total  <= rxpf_beats;
+              rxpf_got    <= 0;
+              rxpf_valid  <= 1;
+              rxpf_select <= eth_rx_frame_select;
+              rxpf_idx    <= 0;
+              zorro_state <= Z3_RXPF_SERVE;
             end
-          end else if (!rxpf_busy) begin
+          end else if (rd_idle) begin
             m00_axi_arlen   <= 'h0;
             m00_axi_arburst <= 'h0;
             if (z3_mapped_addr>='ha000 && z3_mapped_addr<'h10000)
@@ -3039,34 +3057,28 @@ module MNTZorro_v0_1_S00_AXI
               m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
 
             m00_axi_arvalid  <= 1;
-            if (m00_axi_arready && m00_axi_arvalid) begin // see WAIT_READ
-              m00_axi_arvalid <= 0;
-              zorro_state <= WAIT_READ_DMA_Z3B;
-            end
+            rd_req_fill <= 0;
+            zorro_state <= WAIT_READ_DMA_Z3B;
           end
         end
 
-        Z3_RXPF_ISSUED: begin
-          m00_axi_arvalid <= 0;
-          zorro_state <= Z3_RXPF_SERVE;
-        end
-
         Z3_RXPF_SERVE: begin
-          if (!rxpf_valid && !rxpf_busy && rxpf_got <= {1'b0, rxpf_idx}) begin
-            zorro_state <= WAIT_READ_DMA_Z3;   // the burst was given up: ask again
-          end else if (rxpf_got > {1'b0, rxpf_idx}) begin
+          if (rxpf_got > {1'b0, rxpf_idx}) begin
             data_z3_hi16  <= {rxpf_buf[rxpf_idx][7:0],   rxpf_buf[rxpf_idx][15:8]};
             data_z3_low16 <= {rxpf_buf[rxpf_idx][23:16], rxpf_buf[rxpf_idx][31:24]};
             dataout_z3 <= 1; // enable data output
             dtack <= 1;
             rxpf_last <= z3_mapped_addr;
             zorro_state <= Z3_ENDCYCLE;
+          end else if (!rxpf_valid || (!rd_out && !m00_axi_arvalid)) begin
+            zorro_state <= WAIT_READ_DMA_Z3;   // the fabric reset took the fill: ask again
           end
         end
 
         WAIT_READ_DMA_Z3B: begin
-          m00_axi_arvalid <= 0;
-          if (m00_axi_rvalid) begin
+          if (!rd_out && !m00_axi_arvalid) begin
+            zorro_state <= WAIT_READ_DMA_Z3;   // the fabric reset took the read: ask again
+          end else if (rd_out && !rd_fill && !rd_discard && m00_axi_rvalid) begin
             zorro_state <= Z3_ENDCYCLE;
             data_z3_hi16 <= {m00_axi_rdata[7:0], m00_axi_rdata[15:8]};
             data_z3_low16 <= {m00_axi_rdata[23:16], m00_axi_rdata[31:24]};
