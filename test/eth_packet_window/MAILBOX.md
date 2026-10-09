@@ -24,8 +24,8 @@ completes without waiting for bank capacity, so ARM can always read/pop releases
 holds the same outcome and selector for software. The adapter may return normal
 AXI completion for expected BUSY rejection and let software inspect this result;
 do not turn ordinary queue pressure into an ARM data-abort exception or an
-unbounded bus stall. Actual AXI channel handling is a required next step, not
-implemented by this backend.
+unbounded bus stall. The separate [AXI-Lite adapter](AXILITE.md) now implements channel handling and
+returns OKAY for these logical rejections; it is still outside the live design.
 
 There must be **one writer context** for staging, COMMIT, result reads, release
 processing and reset. The live driver can publish from IRQ and main-loop paths;
@@ -128,6 +128,7 @@ This is an RTL test of the real core and backend, not an ARM/C-helper cosimulati
 AXI-Lite channel test, host-driver test, CDC test or hardware run. The existing
 core and shared-port suites also remain required. No mailbox resource/timing
 measurement has been made: the earlier two-RAMB18/293-LUT result measures the core
-alone and must not be applied to the combined design. The next steps are a real
-AXI-Lite adapter, assigned compatible register/capability protocol, C integration,
-combined timing with the actual clock/boundary, and the shared-m00/Zorro adapter.
+alone and must not be applied to the combined design. The separate AXI-Lite
+regression covers the bus adapter; live address/capability protocol, C integration,
+combined timing with the actual clock/boundary, and the shared-m00/Zorro adapter
+remain open.

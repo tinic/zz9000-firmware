@@ -47,7 +47,10 @@ copies remain. Changing that front end is outside this prototype.
 All module signals use one clock. Cross-domain transport is an integration task.
 The [registered mailbox backend](MAILBOX.md) now exercises atomic ARM descriptor
 commit and matching release snapshots with this core at the shared 100 MHz clock.
-It has no live address allocation or AXI-Lite/host adapter yet.
+The [AXI-Lite adapter](AXILITE.md) adds independent AW/W capture, held responses
+and local quiesce/drain tests. Neither component has a live address allocation
+or host adapter. The existing eight-word ARM aperture is fully occupied; this
+ten-word mailbox needs a widened decode or separate slave.
 The separate [ARM integration contract](ARM_CONTRACT.md) now provides a portable
 ownership helper and host tests for publication order, matching releases,
 contiguous ring retirement and coordinated reset fences. It is not linked into
