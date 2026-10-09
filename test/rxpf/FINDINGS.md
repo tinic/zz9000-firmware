@@ -519,3 +519,23 @@ degraded run, backpressure 0 in every sample.**
 The fixed build is ~1.5-2 % below the old read-ahead runs with identical bus
 timing; not attributed (candidate: per-BD ToHw + DSB + NEW clear on refill,
 or run-to-run peer variance).  Evidence `~/ooc-evidence/rxpf-bdfix/`.
+
+## Z3 copy cost (z3copy, 2026-10-09, 789e9b1 image, TF4060 at 82 MHz)
+
+`z3copy` (source in `~/ooc-evidence/rxpf-bdfix/z3copy.c`): 1512-byte copies
+into Fast RAM, best of 5 x 64, bytes and guard regions verified (0 errors).
+
+| source | movem dst+0 | movem dst+2 | move.l dst+0/+2 | move16 dst+0 |
+|---|---|---|---|---|
+| RX window $48002000 (read-ahead) | 195.3 us, 517 ns/long | 201.5 us | 205.0 us | 192.4 us |
+| card DDR $4C000000 | 227.6 us, 602 ns/long | 236.4 us | 242.7 us | 229.2 us |
+| Fast RAM (cache-resident control) | 10.2 us | 19.3 us | 9.9 / 18.9 us | 38.0 us |
+
+- The Z3 read cycle dominates: method choice moves the copy by <=5 %, dst+2
+  by ~3 %, MOVE16 by ~1.5 % (no Z3 burst).  The driver's MOVEM loop is already
+  the best general form; no copy-loop change is justified.
+- Read-ahead saves ~14 % per longword (517 vs 602 ns).
+- At 27.8 Mbit/s (~2300 frames/s) the copy alone is ~46 % of CPU time.
+- Remaining lever without bus mastering: card response latency, 517 ns per
+  access vs the ~296 ns Buster floor quoted for Z3, i.e. up to ~1.7x on the
+  copy if the ZZ9000 front end could answer a read-ahead hit faster.
