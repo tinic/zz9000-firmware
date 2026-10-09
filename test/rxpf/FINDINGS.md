@@ -763,3 +763,29 @@ Every B leg beats every A leg at both clocks (worst B - best A: +0.41 /
 +0.18 Mbit/s).  The size matches the z3copy dst+2 cost (8.5-13 us per
 frame) and recovers most of the ~2 % the fixed ARM had cost against the
 old-ARM read-ahead peak.  Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2: removing the dst+2 copy penalty (2026-10-09 10:27-10:51Z)
+
+Firmware `zz9k/rx-offset2` 2156a56 (on 629820e): opt-in GEM RX buffer
+offset 2 via `REG_ZZ_ETH_CONFIG` 0x1000|1, applied through the guarded ring
+rebuild, frames flagged by length bit 15, advertised as RX_META bit 12, off
+again on every Amiga reset.  Driver: AmiNetXDuo `fix/zz9000-rx-offset2`
+6c28957a (anxzz9000.device asks for it; the copies peel a word only when the
+source is 2 mod 4).  Host tests: firmware 21 groups (new init `offset2`
+case), driver 872 checks (new: offset2 payload aligned both sides, staging,
+request only when offered).
+
+Hardware A/B, same firmware both arms, ABBA ABBA, flushed power cycle per
+leg, driver size checked on the card before each cycle:
+
+| arm | 50 MHz Mbit/s | mean | 82 MHz Mbit/s | mean |
+|---|---|---|---|---|
+| A origin/main 8bb3dc44 driver | 23.10 23.21 23.21 23.19 | 23.18 | 27.81 27.94 27.99 27.96 | 27.93 |
+| B rx-offset2 driver | 23.80 23.67 23.64 23.63 | 23.68 | 28.35 28.20 28.17 28.20 | 28.23 |
+
+B beats every A leg at both clocks: +2.2 % at 50 MHz, +1.1 % at 82 MHz,
+matching the z3copy prediction (8.5-13 us of a 435-524 us frame).  No
+errors either arm (one A boot: one frame dropped for size, as seen before).
+The A3000's previously installed driver (beta8 8c93d4a, .beta8 backup) was
+restored afterwards; the card keeps firmware 2156a56 (offset off unless a
+driver asks).  Evidence: ~/ooc-evidence/rxoff2/.
