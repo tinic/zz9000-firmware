@@ -627,3 +627,24 @@ asks), B = the branch.  ABBA ABBA, flushed power cycles, install size checked.
 No overlap between the arms at either clock; backpressure 0 throughout.
 Predicted from z3copy: dst+2 costs 8.5-13 us of ~435-524 us per frame
 (2-2.5 %).  Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2: the dst+2 penalty removed (2026-10-09 10:27-10:55Z)
+
+Firmware zz9k/rx-offset2 2156a56 (opt-in GEM RX buffer offset 2 via
+REG_ZZ_ETH_CONFIG 0x1000|1, length bit 15 marks shifted frames, RX_META bit
+12 advertises it, cleared on Amiga reset), image BOOT-rxpf-2156a56-nofast.bin
+5659ba94... (read-ahead bitstream unchanged).  Driver: AmiNetXDuo
+fix/zz9000-rx-offset2 6c28957a (asks for the layout when offered; the copies
+peel a word only when the source is 2 mod 4).  Same firmware in both arms;
+A = origin/main 8bb3dc44 anxzz9000.device (never asks), B = 6c28957a.
+Eight flushed power cycles, ABBA ABBA, driver size verified before each cycle.
+
+| Mbit/s | A (main) | B (offset 2) | median B vs A |
+|---|---|---|---|
+| 50 MHz | 23.10, 23.21, 23.21, 23.19 | 23.80, 23.67, 23.64, 23.63 | **+2.0 %** |
+| 82 MHz | 27.81, 27.94, 27.99, 27.96 | 28.35, 28.20, 28.17, 28.20 | **+0.9 %** |
+
+Every B leg beat every A leg at both clocks; backpressure 0 in all 11200
+samples.  Size matches the z3copy estimate (the 8.5-13 us per frame the +2
+destination cost).  Read-ahead + offset 2 at 50 MHz (23.6-23.8) now matches
+the old unfixed read-ahead peak (23.5-23.7) with the ownership fixes kept.
