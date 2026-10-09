@@ -61,6 +61,16 @@ proc packet_ooc {} {
     report_utilization -hierarchical -file [file join $out routed_utilization.rpt]
     report_timing_summary -delay_type min_max -report_unconstrained \
         -max_paths 10 -file [file join $out routed_timing.rpt]
+    report_timing -delay_type min -max_paths 50 -path_type full_clock_expanded \
+        -input_pins -file [file join $out routed_hold_paths.rpt]
+    report_timing -delay_type max -max_paths 10 -path_type full_clock_expanded \
+        -input_pins -file [file join $out routed_setup_paths.rpt]
+    set registers [all_registers]
+    set inputs [get_ports -filter {DIRECTION == IN && NAME != clk}]
+    report_timing -delay_type min -from $registers -to $registers -max_paths 20 \
+        -path_type full_clock_expanded -input_pins -file [file join $out internal_hold_paths.rpt]
+    report_timing -delay_type min -from $inputs -to $registers -max_paths 20 \
+        -path_type full_clock_expanded -input_pins -file [file join $out input_hold_paths.rpt]
     report_route_status -file [file join $out route_status.rpt]
     report_drc -file [file join $out drc.rpt]
     check_timing -verbose -file [file join $out check_timing.rpt]
@@ -71,6 +81,14 @@ proc packet_ooc {} {
     if {[llength $setup] != 1 || [llength $hold] != 1} { error "Missing setup/hold paths" }
     set setup_slack [get_property SLACK $setup]
     set hold_slack [get_property SLACK $hold]
+    set internal_hold [get_timing_paths -quiet -delay_type min -from $registers \
+        -to $registers -max_paths 1 -nworst 1]
+    set input_hold [get_timing_paths -quiet -delay_type min -from $inputs \
+        -to $registers -max_paths 1 -nworst 1]
+    set internal_hold_slack unavailable
+    set input_hold_slack unavailable
+    if {[llength $internal_hold] == 1} { set internal_hold_slack [get_property SLACK $internal_hold] }
+    if {[llength $input_hold] == 1} { set input_hold_slack [get_property SLACK $input_hold] }
     foreach slack [list $setup_slack $hold_slack] {
         if {![string is double -strict $slack] || abs($slack) > 1.0e6} {
             error "Non-finite or unconstrained slack: $slack"
@@ -81,7 +99,8 @@ proc packet_ooc {} {
     set f [open [file join $out metrics.tsv] w]
     foreach {key value} [list vivado [version -short] part $part period_ns $period \
             ramb18 $bram18 ramb36 $bram36 setup_slack_ns $setup_slack \
-            hold_slack_ns $hold_slack bram_capacity_gate $ram_ok \
+            hold_slack_ns $hold_slack internal_hold_slack_ns $internal_hold_slack \
+            input_hold_slack_ns $input_hold_slack bram_capacity_gate $ram_ok \
             numeric_timing_gate $timing_ok image_ready 0] {
         puts $f "$key\t$value"
     }

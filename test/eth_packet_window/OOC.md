@@ -55,6 +55,10 @@ Retain and inspect:
 * `synth_utilization.rpt`, `routed_utilization.rpt`: actual isolated resource use.
 * `synth_timing.rpt`, `routed_timing.rpt`, `clocks.rpt`, `check_timing.rpt`:
   setup/hold paths, boundary coverage and unconstrained-path diagnostics.
+* `routed_hold_paths.rpt`, `routed_setup_paths.rpt`, `internal_hold_paths.rpt`,
+  `input_hold_paths.rpt`: expanded clock/data path detail, with separate internal
+  register-to-register and input-to-register hold paths. This distinguishes a
+  real internal violation from assumed interface timing; neither is waived.
 * `route_status.rpt`, `drc.rpt`, `console.log`, `vivado.log`: routing completion,
   DRC findings and tool warnings/errors. Review these even after process success.
 
