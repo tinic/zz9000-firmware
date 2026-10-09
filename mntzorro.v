@@ -2597,8 +2597,14 @@ module MNTZorro_v0_1_S00_AXI
             else
               m00_axi_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
   
+            // One request per read: the handshake is arvalid AND arready on
+            // the same edge, and arvalid drops on that edge.  Moving on when
+            // arready alone was high left arvalid up for one more cycle, and
+            // an interconnect whose arready follows arvalid late (as one
+            // coming out of reset does) took that as a second request.
             m00_axi_arvalid  <= 1;
-            if (m00_axi_arready) begin
+            if (m00_axi_arready && m00_axi_arvalid) begin
+              m00_axi_arvalid <= 0;
               zorro_state <= WAIT_READ2;
             end
             
@@ -2948,7 +2954,8 @@ module MNTZorro_v0_1_S00_AXI
             m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
 
           m00_axi_arvalid  <= 1;
-          if (m00_axi_arready) begin
+          if (m00_axi_arready && m00_axi_arvalid) begin // see WAIT_READ
+            m00_axi_arvalid <= 0;
             zorro_state <= WAIT_READ_DMA_Z3B;
           end
         end
