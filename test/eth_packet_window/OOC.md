@@ -1,9 +1,10 @@
 # Standalone packet-bank synthesis and timing probe
 
-Run `run_ooc.py` in a firmware checkout containing its committed inputs. It
-synthesizes **only** `zz_eth_packet_window`, then places and routes that isolated
-module. It does not call `build_bitstream.sh`, generate an image, or include the
-shared arbiter, ARM transport, Zorro adapter or other FPGA clients.
+Run `run_ooc.py` in a firmware checkout containing its committed inputs. The
+default `--top core` synthesizes and routes only `zz_eth_packet_window`;
+`--top engine` includes the AXI-Lite adapter, registered mailbox and shared read
+arbiter. Neither profile calls `build_bitstream.sh`, generates an image, or
+includes the live block design, Zorro adapter or other FPGA clients.
 
 The target is `xc7z020clg400-1`, matching `zz9000_project.tcl`. The primary clock
 is **100 MHz (10 ns)**: the project connects m00/MNTZorro to FCLK0. zz9k-fpga
@@ -75,7 +76,7 @@ FFs and 4/140 BRAM tiles in MNTZorro OOC synthesis, with full-design setup/hold
 slack +0.000/+0.015 ns. Those are **baseline** measurements. They do not include
 these packet banks and cannot be added arithmetically to predict routed timing.
 
-## Measured 100 MHz result, 2026-10-08
+## Measured core result at 100 MHz, 2026-10-08
 
 zz9k-fpga ran Vivado 2018.3 on playhouse2 at exact commit
 `1c6384c7aa343ee8c4c0fd3070e69c4fbefda6e4`. Its detailed-path follow-up kept the
@@ -141,3 +142,48 @@ measure this combined design; actual engine reports must be reviewed separately.
 The combined probe still lacks the live block-design/PS clock and physical port
 context, Zorro adapter and real reset controller. Even an OOC numeric pass is
 not image readiness, full-design closure or a throughput result.
+
+## Measured engine result at 100 MHz, 2026-10-08
+
+Vivado 2018.3 measured exact commit
+`f1fce5ac42e6c9fde504f47a1875a061febd17f9` with `--top engine` on playhouse2.
+The source/archive/report hashes were independently checked after retrieval;
+the generated `boundary.xdc` is byte-identical to the earlier core probe.
+
+| Measurement | Combined engine result |
+| --- | --- |
+| Memory | 2 RAMB18E1, 0 RAMB36, 0 LUTRAM |
+| Logic | 437 LUTs, 617 FFs |
+| Setup slack | +1.466 ns |
+| Internal register-to-register hold slack | +0.107 ns |
+| Registered descriptor setup / hold slack | +8.301 / +0.112 ns |
+| Input-to-register hold slack | -0.552 ns |
+| Overall numeric gate | **FAIL**, exit 1; constraints unchanged |
+
+Both payload arrays remain 36-bit SDP RAMB18E1 primitives (`core/ram0_reg` and
+`core/ram1_reg`). The real mailbox-to-core cookie register paths exist and pass:
+the worst reported setup path is `mailbox/desc_cookie_reg[16]` to
+`core/cookie_reg[1][16]`; worst descriptor hold is bit 21 to bank 1. The worst
+internal hold path is now mailbox shadow-cookie to committed descriptor-cookie.
+
+The input violation is now `s_axi_wdata[12]` to `adapter/wdata_reg[12]/D`, with
+0.924 ns data arrival versus 1.476 ns required time. The descriptor transfer has
+become an internal registered path; the external AXI boundary is still modeled
+without its actual upstream producer and clock/physical context. This is useful
+attribution, not a waiver or a full-design pass. Do not add dummy input registers
+or relax input delays merely to make the isolated report green.
+
+All 930 routable nets route fully, with zero routing errors. `check_timing` finds
+no missing clocks/delays, unconstrained internal endpoints or loops. DRC reports
+only the absent PS7 block. Synthesis also reports deliberately unused AXI-Lite
+AWPROT/ARPROT (access control remains the interconnect's responsibility) and
+constant ARSIZE=2. Missing HD.CLK_SRC/HD.PARTPIN_LOCS warnings and the router's
+inability to repair unroutable boundary hold paths remain in the evidence.
+
+The next timing step is actual block-design integration and full implementation,
+with the real control-bus producer, shared clock and physical routes. OOC resource
+use is now measured for the combined engine, but no live register mapping,
+firmware/host integration, hardware image or throughput gain is established.
+
+Retained remote archive: `playhouse2:/home/turo/ooc-evidence/packet-engine-f1fce5ac-100.tar.gz`;
+SHA-256 `238658a39c0a081029641997835392c53f780833d583df48dad8556b6450cdc1`.

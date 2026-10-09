@@ -1,15 +1,17 @@
 # Packet-sized FPGA receive-window prototype
 
 Status: **offline experiment, not integrated into any firmware build**. No image
-was built or flashed for this prototype. A Vivado 2018.3 isolated 100 MHz probe
-measured two RAMB18s, 293 LUTs and 254 FFs; setup and internal hold passed, but the
-overall hold gate failed on input-boundary timing. See [the measured results and
+was built or flashed for this prototype. Vivado 2018.3 at 100 MHz measured the
+combined engine at two RAMB18s, 437 LUTs and 617 FFs (core alone: 293 LUTs/254 FFs).
+Setup, internal hold and the registered descriptor transfer passed, but the
+overall gate failed on external AXI input hold timing. See [the measured results and
 limits](OOC.md). Full-design routed timing, clock-domain crossings and hardware
 performance remain unverified. The nofast control/read-ahead experiment is separate.
 
 The initial packet core at `e81420cc` received an independent source review from
 zz9k-fpga: no core correctness blocker found; tests were not independently rerun.
-Two RAMB18s is the reviewer's area estimate, not measured synthesis. The isolated
+Two RAMB18s was an area estimate at that review; the later Vivado probes above
+confirmed the inference. The isolated
 foreground/prefetch arbitration model at `7b852b90` also received a source review
 with no correctness blocker identified. That review requested AXI attribute/ID
 preservation and a simultaneous-arrival priority test. This follow-up implements
@@ -123,8 +125,9 @@ has priority over all packet-state operations and logical flush.
 
 ## Integration work before any hardware candidate
 
-The [standalone Vivado probe](OOC.md) measures the packet core's memory inference,
-resources and timing under explicit boundary assumptions. Its runner generates
+The [standalone Vivado probe](OOC.md) measures either the packet core or combined
+engine's memory inference, resources and timing under explicit boundary assumptions.
+Its runner generates
 no image and cannot establish full-design timing or hardware performance.
 
 The standalone AXI master is a simulation harness boundary, not an additional
@@ -212,6 +215,9 @@ python3 test/eth_packet_window/run.py
 python3 test/eth_packet_window/run.py --shared-port --id-width 1
 python3 test/eth_packet_window/run.py --shared-port --id-width 2
 python3 test/eth_packet_window/run.py --mailbox
+python3 test/eth_packet_window/run.py --axilite
+python3 test/eth_packet_window/run.py --engine --id-width 1
+python3 test/eth_packet_window/run.py --engine --id-width 2
 python3 test/eth_packet_window/run_arm.py
 ```
 
