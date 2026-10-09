@@ -810,3 +810,27 @@ B > A in every leg, no overlap: **+2.0 % at 50 MHz, +0.9 % at 82 MHz**
 (model from z3copy predicted ~2-2.5 %).  B legs: 0 bad data, 0 overruns, 0
 size drops; one A leg had 1 bad-data/size drop (also seen on baseline boots).
 Evidence: ~/ooc-evidence/rxoff2/ (SHA256SUMS).
+
+## Read-response fix (codex 0551318) on hardware, 2026-10-09 10:57-11:12Z
+
+0551318 stages a cached RX beat in Z3_IDLE and acknowledges in a separate
+state, so window data is on the pins before /DTACK (pin-level tb: baseline
+629820e had 92 late / 30 early / 31 repeated ACKs of 122, candidate 0).
+Nofast build: TIMING_GATE PASS, overall setup 0.056 / hold 0.020 ns (baseline
+0.000 / 0.015), utilization unchanged (LUT 14970 vs 14975).  Routed pin
+delays (outputs are false_path, measured with reset_timing + fclk0):
+data reg->pin 7.6-12.6 ns slow / 2.2-4.5 fast, DTACK reg->pin 11.6 / 3.7,
+strobes->DTACK 15.7 / 5.6; data loads one clock before DTACK, so DTACK lags
+the latest data bit by ~9 ns at either corner.
+
+Hardware, same 789e9b1 ARM and beta8 driver (series stopped after 5 legs when
+one flash's shell never echoed; bench re-flashed to b6e31172):
+
+| arm | readl ns @50 / @82 | RX Mbit/s @50 | @82 |
+|---|---|---|---|
+| A baseline x3 | 452.1-452.5 / 494.1-496.1 | 23.01-23.09 | 27.57-27.86 |
+| B 0551318 x2 | 452.5 / 494.8 | 22.81-23.15 | 27.82-27.86 |
+
+No measurable latency or throughput change: the ~10 ns internal saving does
+not shorten the Buster/TF4060 bus cycle.  The fix is a correctness fix (data
+valid before DTACK, saturating DTACK timeout), not a speed-up.
