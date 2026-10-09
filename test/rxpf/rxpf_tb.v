@@ -96,6 +96,20 @@ module rxpf_tb;
   end
 
   integer errors = 0, hung = 0, hang = 0;
+  reg first_req_seen = 0, aresetn_d = 1, zorro_started = 0;
+  integer valid_in_reset = 0, early_valid = 0;
+  always @(posedge clk) begin
+    if (arvalid === 1'b1) first_req_seen <= 1;
+    // from configuration until the first Zorro cycle starts, ARVALID is 0 (never X)
+    if (!zorro_started && arvalid !== 1'b0) begin
+      early_valid = early_valid + 1;
+      $display("INFO ARVALID=%b at %t before the first request (zorro_state %0d)", arvalid, $time, dut.zorro_state);
+    end
+    // synchronous reset: ARVALID drops on the first edge with aresetn low;
+    // from the second such edge on it must be low
+    if (!aresetn && aresetn_d == 1'b0 && arvalid !== 1'b0) valid_in_reset = valid_in_reset + 1;
+    aresetn_d <= aresetn;
+  end
 
   MNTZorro_v0_1_S00_AXI dut (
     .ZORRO_ADDR(ZORRO_ADDR), .ZORRO_DATA(ZORRO_DATA),
@@ -127,6 +141,7 @@ module rxpf_tb;
     integer t0;
     begin
       t0 = $time;
+      zorro_started = 1;
       za_drv = {a[23:2], 1'b0}; zd_drv = {a[31:24], 8'h00};
       za_oe = 1; zd_oe = 1; ZORRO_READ = rd;
       #30 ZORRO_NFCS = 0;
@@ -258,7 +273,39 @@ module rxpf_tb;
       expect_read(32'h2008, 11, 2'b11, gen, "B5-c");
       $display("PASS slot change during a fill (data checked above)");
 
+      // B4b: Zorro reset in the middle of a burst (accepted, beats still owed):
+      //      ownership kept, the tail drained and dropped, one new request after.
+      dut.slv_reg4 = 13; repeat (4) @(posedge clk);
+      stall_next = 1; stall_cycles = 600;
+      expect_read(32'h2000, 13, 2'b11, gen, "B4b-a");       // beat 0, then the stall
+      ZORRO_NIORST = 0; repeat (20) @(posedge clk); ZORRO_NIORST = 1; repeat (20) @(posedge clk);
+      dut.z3_ram_low = BOARD; dut.z3_confdone = 1;
+      dut.zorro_state = 9; repeat (4) @(posedge clk); dut.zorro_state = 12; repeat (10) @(posedge clk);
+      n0 = ar_count; hung = 0;
+      expect_read(32'h2080, 13, 2'b11, gen, "B4b-b");       // waits for the old tail, then its own fill
+      $display("%s Zorro reset mid-burst: %0d new request(s) (want 1), %0d hung, data checked",
+               (ar_count - n0 == 1 && hung == 0) ? "PASS" : "FAIL", ar_count - n0, hung);
+      if (!(ar_count - n0 == 1 && hung == 0)) errors = errors + 1;
+
+      // B2b: fabric reset while a request is PENDING (ARREADY low): ARVALID must
+      //      drop and stay low through the reset, and the read is asked again
+      //      exactly once after release.
+      dut.slv_reg4 = 14; repeat (4) @(posedge clk);
+      hold_ar = 1; arready = 0;
+      n0 = ar_count; hung = 0;
+      fork
+        expect_read(32'h2000, 14, 2'b11, gen, "B2b");
+        begin
+          repeat (200) @(posedge clk); aresetn = 0; repeat (16) @(posedge clk);
+          hold_ar = 0; @(posedge clk); #1 arready = 1; repeat (4) @(posedge clk); aresetn = 1;
+        end
+      join
+      $display("%s fabric reset with a request pending: %0d handshake(s) (want 1), %0d hung, data checked",
+               (ar_count - n0 == 1 && hung == 0) ? "PASS" : "FAIL", ar_count - n0, hung);
+      if (!(ar_count - n0 == 1 && hung == 0)) errors = errors + 1;
+
       // B6: SLVERR responses do not wedge the port.
+      dut.slv_reg4 = 11; repeat (4) @(posedge clk);
       rresp_err = 1; hung = 0;
       z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);
       z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
@@ -266,6 +313,10 @@ module rxpf_tb;
       expect_read(32'h2100, 11, 2'b11, gen, "B6-after");
       $display("%s SLVERR beats: %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
       if (hung != 0) errors = errors + 1;
+      $display("%s ARVALID at startup before the first request: %0d cycle(s) not 0 (want 0)", early_valid == 0 ? "PASS" : "FAIL", early_valid);
+      if (early_valid != 0) errors = errors + 1;
+      $display("%s ARVALID while aresetn low: %0d cycle(s) (want 0)", valid_in_reset == 0 ? "PASS" : "FAIL", valid_in_reset);
+      if (valid_in_reset != 0) errors = errors + 1;
       $display("%s rxpf_tb: %0d error(s)", errors == 0 ? "PASS" : "FAIL", errors);
       if (errors == 0) $display("RXPF_VERDICT_OK");
       $finish;
