@@ -38,7 +38,45 @@ module packet_window_tb;
     reg [1:0] rresp = 0;
     reg rlast = 0, rvalid = 0;
 
-    zz_eth_packet_window dut (.*);
+    wire [31:0] core_araddr, core_rdata;
+    wire [7:0] core_arlen;
+    wire [2:0] core_arsize;
+    wire [1:0] core_arburst, core_rresp;
+    wire core_arvalid, core_arready, core_rlast, core_rvalid, core_rready;
+    zz_eth_packet_window dut (
+        .araddr(core_araddr), .arlen(core_arlen), .arsize(core_arsize),
+        .arburst(core_arburst), .arvalid(core_arvalid), .arready(core_arready),
+        .rdata(core_rdata), .rresp(core_rresp), .rlast(core_rlast),
+        .rvalid(core_rvalid), .rready(core_rready), .*
+    );
+`ifdef SHARED_READ_PORT
+    reg foreground_pending = 0;
+    reg [31:0] fg_araddr = 0;
+    reg [7:0] fg_arlen = 0;
+    reg [1:0] fg_arburst = 1;
+    reg fg_arvalid = 0, fg_rready = 1;
+    wire fg_arready, fg_rlast, fg_rvalid;
+    wire [31:0] fg_rdata;
+    wire [1:0] fg_rresp;
+    zz_eth_read_arbiter arbiter (
+        .bg_araddr(core_araddr), .bg_arlen(core_arlen), .bg_arburst(core_arburst),
+        .bg_arvalid(core_arvalid), .bg_arready(core_arready),
+        .bg_rdata(core_rdata), .bg_rresp(core_rresp), .bg_rlast(core_rlast),
+        .bg_rvalid(core_rvalid), .bg_rready(core_rready), .*
+    );
+`else
+    assign araddr = core_araddr;
+    assign arlen = core_arlen;
+    assign arsize = core_arsize;
+    assign arburst = core_arburst;
+    assign arvalid = core_arvalid;
+    assign core_arready = arready;
+    assign core_rdata = rdata;
+    assign core_rresp = rresp;
+    assign core_rlast = rlast;
+    assign core_rvalid = rvalid;
+    assign rready = core_rready;
+`endif
 
     reg [31:0] memory [0:65535];
     reg allow_ar = 1, allow_r = 1, jitter = 0;
@@ -49,6 +87,7 @@ module packet_window_tb;
     integer malformed = 0;
     reg [31:0] rng = 32'h519f02b7;
     integer requests = 0, responses = 0, releases = 0;
+    reg [31:0] address_log [0:4095];
     reg stalled_ar = 0;
     reg [31:0] stalled_addr;
     reg [7:0] stalled_len;
@@ -79,6 +118,7 @@ module packet_window_tb;
                 bus_left <= arlen + 1 + malformed;
                 malformed <= 0;
                 latency <= 3;
+                address_log[requests] <= araddr;
                 requests <= requests + 1;
             end
             if (pending && !rvalid && allow_r && (!jitter || rng[3])) begin
@@ -109,6 +149,10 @@ module packet_window_tb;
     task reset_fabric;
         begin
             @(negedge clk); aresetn = 0;
+`ifdef SHARED_READ_PORT
+            // Fabric reset must reset all clients as well as the shared port.
+            fg_arvalid = 0; foreground_pending = 0; fg_rready = 1;
+`endif
             clocks(3);
             @(negedge clk); aresetn = 1;
             clocks(2);
@@ -205,18 +249,147 @@ module packet_window_tb;
         begin
             cycles = 0;
             while (!flush_done && cycles < 12000) begin clocks(1); cycles = cycles + 1; end
-            if (!flush_done || packet_valid || release_valid || arvalid || pending)
+            // In shared mode a foreground transaction may start as soon as
+            // this client's discarded tail drains; flush need not idle it.
+            if (!flush_done || packet_valid || release_valid || core_arvalid || core_rvalid)
                 $fatal(1, "Incomplete flush");
+`ifndef SHARED_READ_PORT
+            if (arvalid || pending) $fatal(1, "Physical port still owned after flush");
+`endif
         end
     endtask
 
-    integer n, before_requests, start_responses;
+`ifdef SHARED_READ_PORT
+    // Foreground AXI client with independently checked data and response order.
+    task demand_read(input integer word_index, input integer count, input integer stall);
+        integer w, waited;
+        begin
+            @(negedge clk);
+            foreground_pending = 1; fg_arvalid = 1;
+            fg_araddr = BASE + word_index * 4; fg_arlen = count - 1;
+            fg_rready = stall == 0;
+            @(posedge clk);
+            waited = 0;
+            while (!fg_arready && waited < 12000) begin @(posedge clk); waited = waited + 1; end
+            if (!fg_arready) $fatal(1, "Foreground address starved");
+            @(negedge clk); fg_arvalid = 0;
+            if (stall != 0) begin
+                clocks(stall);
+                if (!fg_rvalid || !pending || core_rvalid)
+                    $fatal(1, "Foreground response backpressure lost ownership");
+                @(negedge clk); fg_rready = 1;
+            end
+            for (w = 0; w < count; w = w + 1) begin
+                @(posedge clk);
+                waited = 0;
+                while (!fg_rvalid && waited < 12000) begin @(posedge clk); waited = waited + 1; end
+                if (!fg_rvalid || fg_rdata !== memory[word_index + w] || fg_rresp != 0 ||
+                    fg_rlast !== (w == count - 1) || core_rvalid)
+                    $fatal(1, "Foreground response mixed with prefetch or wrong data");
+            end
+            @(negedge clk); foreground_pending = 0;
+        end
+    endtask
+
+    integer first_request;
+    task shared_port_tests;
+        begin
+            put_packet(127, 60, 100, 900);
+            put_packet(20, 1514, 101, 901);
+            foreground_pending = 1;
+            first_request = requests;
+            submit(20, 1514, 101, 901);
+            while (!core_arvalid) clocks(1);
+            clocks(12);
+            if (arvalid || requests != first_request)
+                $fatal(1, "Prefetch bypassed pending demand");
+            demand_read(127*512, 4, 20);
+            if (requests != first_request+1 || address_log[first_request] != BASE + 127*2048)
+                $fatal(1, "Foreground did not win arbitration");
+            verify_packet(20, 1514, 101, 901); ack(901, 20, 0);
+            $display("PASS shared port: pending demand priority and response backpressure");
+
+            put_packet(21, 1514, 102, 902);
+            allow_r = 0;
+            submit(21, 1514, 102, 902);
+            while (!pending) clocks(1);
+            first_request = requests;
+            fork
+                demand_read(127*512 + 8, 1, 0);
+                begin
+                    clocks(12);
+                    if (requests != first_request || fg_arready || fg_rvalid)
+                        $fatal(1, "Foreground stole an outstanding background burst");
+                    @(negedge clk); allow_r = 1;
+                end
+            join
+            if (address_log[first_request] != BASE + 127*2048 + 32)
+                $fatal(1, "Foreground waited behind another prefetch burst");
+            verify_packet(21, 1514, 102, 902); ack(902, 21, 0);
+            $display("PASS shared port: late demand waits one existing burst, then wins");
+
+            put_packet(22, 1514, 103, 903);
+            allow_ar = 0; allow_r = 0;
+            submit(22, 1514, 103, 903);
+            while (!arvalid) clocks(1);
+            first_request = requests;
+            fork
+                demand_read(127*512 + 9, 1, 0);
+                begin
+                    do_flush(); clocks(10);
+                    if (!arvalid || fg_arready || flush_done)
+                        $fatal(1, "Flush/foreground cancelled stalled background AR");
+                    @(negedge clk); allow_ar = 1;
+                    clocks(2500);
+                    if (requests != first_request+1 || flush_done || fg_arready || fg_rvalid)
+                        $fatal(1, "Reused shared port before delayed background tail");
+                    @(negedge clk); allow_r = 1;
+                    await_flush();
+                end
+            join
+            if (address_log[first_request+1] != BASE + 127*2048 + 36 || packet_valid)
+                $fatal(1, "Flush leaked packet or misrouted next demand");
+            $display("PASS shared port: stalled AR and 25 us discarded tail before demand");
+
+            // A bank-window wait must not assert foreground_pending: that would
+            // block the very prefetch needed to answer this host read.
+            put_packet(23, 61, 104, 904);
+            @(negedge clk); host_read = 1; host_word = 0;
+            submit(23, 61, 104, 904);
+            await_packet(904, 0); clocks(1);
+            if (!host_read_valid || host_data !== memory[23*512])
+                $fatal(1, "Bank-window wait starved its own prefetch");
+            @(negedge clk); host_read = 0;
+            verify_packet(23, 61, 104, 904); ack(904, 23, 0);
+
+            // Reset both port and clients while background is outstanding and
+            // a foreground request is waiting. Neither may leak into the next epoch.
+            put_packet(24, 1514, 105, 905);
+            allow_r = 0;
+            submit(24, 1514, 105, 905);
+            while (!pending) clocks(1);
+            @(negedge clk); foreground_pending = 1; fg_arvalid = 1;
+            fg_araddr = BASE + 127*2048; fg_arlen = 0;
+            clocks(3); reset_fabric(); allow_r = 1;
+            demand_read(127*512 + 10, 1, 0);
+            if (packet_valid || core_rvalid) $fatal(1, "Pre-reset data leaked");
+            clocks(3);
+            $display("PASS shared port: bank-window wait and pending demand across fabric reset");
+        end
+    endtask
+`endif
+
+    integer n, before_requests, start_responses, release_offset;
     initial begin
         // Global watchdog catches all task-level waits too.
         #10000000; $fatal(1, "Test timed out");
     end
     initial begin
         reset_fabric();
+`ifdef SHARED_READ_PORT
+        shared_port_tests();
+`endif
+        release_offset = releases;
         read_word(0, 0, 0);
         put_packet(0, 1514, 2, 100);
         put_packet(1, 2044, 3, 101);
@@ -325,7 +498,8 @@ module packet_window_tb;
         $display("PASS combined logical/fabric reset and fabric reset mid-burst");
         clocks(3);
         if (packet_valid || release_valid || pending || arvalid) $fatal(1, "Not idle at end");
-        if (releases != 39) $fatal(1, "Missing/duplicate release: got %d expected 39", releases);
+        if (releases - release_offset != 39)
+            $fatal(1, "Missing/duplicate release: got %d expected 39", releases-release_offset);
         $display("ALL PASS: requests=%0d responses=%0d releases=%0d", requests, responses, releases);
         $finish;
     end

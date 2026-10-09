@@ -5,6 +5,12 @@ was built or flashed for this prototype. Neither Vivado block-RAM inference nor
 resource usage, routed timing, clock-domain crossings, or hardware performance
 has been verified. The existing nofast control/read-ahead experiment is separate.
 
+The initial packet core at `e81420cc` received an independent source review from
+zz9k-fpga: no core correctness blocker found; tests were not independently rerun.
+Two RAMB18s is the reviewer's area estimate, not measured synthesis. The current
+follow-up adds an isolated foreground/prefetch arbitration model and tests; it
+still does not modify the live m00 engine or its Zorro-pin testbench.
+
 ## What this experiment establishes
 
 The existing RX path has 128 x 2 KB DDR slots and 64 GEM receive descriptors.
@@ -78,6 +84,10 @@ all accepted responses through RLAST. It does not issue another request.
 `flush_done` pulses only once the port is idle. No time-based cancellation is
 used, including when an old tail is delayed more than 10 microseconds.
 
+With the shared-port model below, "idle" here means this packet-fetch client's
+requests have drained. Foreground traffic may already be using the physical
+port when `flush_done` arrives; packet cancellation must not reset that traffic.
+
 The producer/host adapter must coordinate flush: stop submissions, discard host
 operations from the old session, request flush, and wait for `flush_done`
 before reclaiming all old descriptors/slots and starting a new cookie epoch.
@@ -98,6 +108,38 @@ work. Preserve exactly-once AR handshake, response ownership, logical drain and
 fabric-reset priority, including the combined-reset regression. Use the existing
 Zorro-pin testbench to check RX alongside framebuffer, register and other reads;
 those clients must not starve behind prefetch.
+
+### Offline shared-port arbitration model
+
+`experimental/zz_eth_read_arbiter.v` places the packet core behind a single
+physical AXI read owner, alongside an independent foreground client. This is
+an executable integration contract, not a second engine to attach in parallel
+with the existing m00 engine. Both clients use 32-bit reads and must keep their
+request fields stable through handshake; only one transaction is admitted at
+a time. Responses are routed exclusively to that transaction's client through
+the accepted RLAST, including response backpressure and logical flush.
+
+Foreground ARVALID wins every idle arbitration. `foreground_pending` reserves
+an idle port for an imminent foreground AXI read even before its ARVALID is
+asserted. This signal must mean a **demand DDR transaction**, not any unfinished
+Zorro cycle. In particular, a read of an empty packet bank must permit the
+prefetch that will supply its data. Feeding that bank wait into
+`foreground_pending` creates a circular wait; the negative control reproduces it.
+
+Once background ARVALID has been offered to the interconnect, a new foreground
+arrival cannot replace it, even if ARREADY is still low. The offered address
+and its response remain owned through RLAST. Prefetch is limited to 16-beat
+bursts by the packet core; a waiting foreground read therefore wins after at
+most the one already-selected background burst. This is a transaction-count
+bound, **not a time bound**: AXI may delay ARREADY/RVALID indefinitely. Continuous
+foreground demand can starve prefetch, by design; future integration must avoid
+permanently asserting the demand hint and must measure progress under real load.
+
+The model has no logical-reset input: clients drain/discard their own operations.
+Shared `aresetn` resets the owner, both clients and the interconnect together.
+All signals are in one clock domain. Cache/protection attributes must retain
+the live m00 contract when integrating; this model routes address, length, burst
+and response signals only and makes no cache/coherency claim.
 
 Required adapters and decisions:
 
@@ -132,6 +174,7 @@ Requirements: Icarus Verilog 13.0 (tested) and Python 3. Run from any directory:
 
 ```sh
 python3 test/eth_packet_window/run.py
+python3 test/eth_packet_window/run.py --shared-port
 ```
 
 The runner uses a temporary directory under `test/eth_packet_window` and removes
@@ -147,3 +190,18 @@ logical reset, a 25 us delayed tail, combined logical/fabric reset, and fabric
 reset mid-burst. A filled window must not issue further DDR reads while the
 host repeatedly reads it. Simulation does not model caches, CDC, Zorro pins,
 the ARM driver, placement/routing, or end-to-end network throughput.
+
+The shared-port run adds an independent foreground master and checks priority
+before prefetch launch, a late foreground arrival between packet-fill bursts,
+response backpressure, a stalled background address and 25 us discarded tail
+before a foreground read, bank-window reads waiting on their own prefetch,
+and fabric reset with a foreground request pending behind background traffic.
+It then reruns every packet-core case through that shared owner.
+
+Icarus 13.0 results for this follow-up: direct run 386 requests / 5,932 response
+beats / 39 releases; shared run 442 requests / 6,732 response beats / 42 releases.
+Two temporary negative controls were also checked: removing the demand-priority
+hint fails the priority assertion, and incorrectly treating a bank-window wait
+as foreground demand times out waiting for packet 904. These mutations are not
+part of the source or build; they establish that the tests detect those wiring
+errors. No additional hardware measurements were made.
