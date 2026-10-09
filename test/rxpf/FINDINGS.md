@@ -879,3 +879,20 @@ cycling, readl@50 494.8; the series now checks readl@50 ~452 per leg):
 | B 4ba340b x3 | 23.17 23.16 23.05 | 27.63 27.70 27.82 | 452.5-452.8 / 494.8 |
 
 Same throughput and latency within noise, 0 bad data: a clean correctness fix.
+
+## 4ba340b on hardware (2026-10-09 11:36-12:50Z)
+
+Same 789e9b1 ARM + beta8 driver; A = baseline b6e31172, B = 4ba340b BOOT
+9884680a.  Every leg now checks the 50 MHz window readl (452 ns = fresh boot);
+one leg (rr4-3) failed it -- the shop switch reported off/on but the A3000 kept
+running at 82 MHz -- and is excluded.
+
+Throughput, valid legs: B 23.04-23.17 / 27.63-27.91 Mbit/s, A 23.11-23.21 /
+27.81-27.90 Mbit/s at 50 / 82 MHz: no difference, as expected for a
+correctness-only change.
+
+"Frames dropped for size" (driver length check on the window header), legs with
+any: baseline RTL 5 of 25 (one each), 4ba340b 3 of 5 (1, 1, 2).  P(>=3 of 5)
+at the baseline 20 % rate is ~6 %: a weak signal, not a demonstrated
+regression; size drops already occur on the baseline.  Worth a longer B soak
+before 4ba340b is shipped.
