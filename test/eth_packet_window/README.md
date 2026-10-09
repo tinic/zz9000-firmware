@@ -108,6 +108,10 @@ has priority over all packet-state operations and logical flush.
 
 ## Integration work before any hardware candidate
 
+The [standalone Vivado probe](OOC.md) measures the packet core's memory inference,
+resources and timing under explicit boundary assumptions. Its runner generates
+no image and cannot establish full-design timing or hardware performance.
+
 The standalone AXI master is a simulation harness boundary, not an additional
 master to wire onto the live `m00` signals. In the real design, packet fetches
 must be a client of the single-owner `m00` engine from the corrected read-ahead
