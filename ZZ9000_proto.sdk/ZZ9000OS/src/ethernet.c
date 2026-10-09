@@ -586,6 +586,7 @@ int ethernet_restart_dma(const char *reason) {
 	/* XEmacPs_Stop() does not mask the GIC line: keep XEmacPsRecvHandler()
 	 * and its refill off the ring while it is cleared and rebuilt. */
 	int paused = ethernet_pause_rx_irq();
+	ethernet_hw_ready = 0;
 
 	XEmacPs_Stop(EmacPsInstancePtr);
 
@@ -611,6 +612,7 @@ int ethernet_restart_dma(const char *reason) {
 		return XST_FAILURE;
 	}
 
+	ethernet_hw_ready = 1;
 	ethernet_log_status("dma-restart-after");
 	return XST_SUCCESS;
 }
