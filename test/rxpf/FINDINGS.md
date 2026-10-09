@@ -849,3 +849,10 @@ cross-corner.  Pin-level tb: 0 short setup/enable (0551318: 89/89).  It removes
 4ba340b is a correctness fix only.  Packaged BOOT (789e9b1 ARM) 9884680a...,
 not yet on hardware.  Separate, unchanged since upstream: WAIT_READ_DMA_Z3B
 (non-window card-memory reads) sets data, enable and DTACK on one edge.
+
+4ba340b on hardware (same 789e9b1 ARM, beta8 driver), reboot verified per leg
+by readl@50 = 452 ns; leg rr4-3 discarded (no reboot despite HA off/on,
+readl@50 494.8).  B 4ba340b x3: RX 23.05-23.17 / 27.63-27.82 Mbit/s, A
+baseline x3: 22.91-23.14 / 27.81-27.93; readl 452.5-452.8 vs 452.1-452.8.  No
+measurable change, as expected for a correctness-only fix.  Legs rr4b-* were
+started by a bridge-spawned session (see agentnet duplicate-identity memory).
