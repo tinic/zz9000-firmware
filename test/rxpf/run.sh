@@ -28,5 +28,6 @@ arm steady
 arm random-arready -testplusarg RANDOM_ARREADY
 arm ragged -testplusarg RAGGED
 arm ragged+random -testplusarg RAGGED -testplusarg RANDOM_ARREADY
+arm boot -testplusarg BOOT
 [ $status = 0 ] && echo "rxpf: all arms PASS" || echo "rxpf: FAILED"
 exit $status

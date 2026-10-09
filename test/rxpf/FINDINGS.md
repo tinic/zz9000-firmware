@@ -156,3 +156,34 @@ can only clear on RLAST), arlen/arburst moved out of the defaults block and
 now set only in the Z2/Z3 read states (undefined until the first read), and
 any m00 burst issued before the PS/ACP side is up (the 68k probing the card
 during its own boot).  Nothing here is verified.
+
+
+## Update 2026-10-09: two initialization flaws, reproduced in simulation and fixed
+
+`run.sh` gained a `boot` arm modelling what an interconnect does while the PS
+comes up after power-on: ARREADY that follows ARVALID one cycle late, and a
+burst that delivers one beat and loses the rest (no RLAST).
+
+| boot-condition check | upstream 2.8 source | b9c0af5 (flashed) | fixed |
+|---|---|---|---|
+| late ARREADY: AXI requests for one card read | **2** (both paths) | **2** non-window, 1 window | 1 |
+| lost beats, then Zorro reset: card reads afterwards | ok | **hang forever** (state 54, rxpf_busy stuck 1) | ok |
+
+1. **Duplicate read requests (upstream bug, latent).**  WAIT_READ (Z2) and
+   WAIT_READ_DMA_Z3 moved on as soon as ARREADY was high and dropped ARVALID
+   one state later.  If ARREADY rises one cycle after ARVALID, ARVALID is
+   still high on the next edge and a second, unwanted read is issued; its
+   beat arrives later and is taken by the next read as its own data.  Fixed:
+   the handshake is ARVALID && ARREADY on one edge, and ARVALID drops on that
+   edge.  Worth sending upstream on its own.
+2. **`rxpf_busy` could stick forever (ours).**  It cleared only on RLAST; it
+   had no reset and no timeout, and it intentionally survived a Zorro reset.
+   A burst cut off while the PS side comes up left it at 1, and every later
+   card read -- framebuffer included, since non-window reads wait for it --
+   waited for ever.  That is the black-screen boot.  Fixed: a watchdog gives
+   a burst up after 1024 cycles (10 us) without a beat and retires the line;
+   a read waiting on it goes back to DDR.
+
+Whether flaw 1 also explains the slow-boot state (a stray beat shifting every
+later window read by one response) is a hypothesis; the fixed image has not
+been on hardware.

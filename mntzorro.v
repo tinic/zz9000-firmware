@@ -1303,6 +1303,7 @@ module MNTZorro_v0_1_S00_AXI
   reg [20:0] rxpf_select = 0;  // eth_rx_frame_select the line was filled for
   reg [31:0] rxpf_last = 0;    // last window offset the line answered
   reg [3:0]  rxpf_idx = 0;     // beat the current cycle wants
+  reg [9:0]  rxpf_idle = 0;    // cycles since the in-flight burst's last beat
   reg sdk_doorbell_pending;
   reg sdk_irq_ack_pending;
   reg sdk_aperture_layout_ack;
@@ -2197,8 +2198,20 @@ module MNTZorro_v0_1_S00_AXI
     if (rxpf_busy && m00_axi_rvalid) begin
       rxpf_buf[rxpf_got[3:0]] <= m00_axi_rdata;
       rxpf_got <= rxpf_got + 1'b1;
+      rxpf_idle <= 0;
       if (m00_axi_rlast)
         rxpf_busy <= 0;
+    end else if (rxpf_busy) begin
+      /* A burst that stops delivering -- the PS side reset under it while
+       * the card comes up -- must not hold every later card read for good.
+       * After 1024 cycles (10 us) with no beat, give it up and retire the
+       * line; a cycle waiting on it goes back to DDR. */
+      rxpf_idle <= rxpf_idle + 1'b1;
+      if (&rxpf_idle) begin
+        rxpf_busy  <= 0;
+        rxpf_valid <= 0;
+        rxpf_idle  <= 0;
+      end
     end
     if (zorro_state == Z3_WRITE_PRE || zorro_state == Z3_REGWRITE_PRE ||
         rxpf_select != eth_rx_frame_select)
@@ -2644,8 +2657,14 @@ module MNTZorro_v0_1_S00_AXI
             else
               m00_axi_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
   
+            // One request per read: the handshake is arvalid AND arready on
+            // the same edge, and arvalid drops on that edge.  Moving on when
+            // arready alone was high left arvalid up for one more cycle, and
+            // an interconnect whose arready follows arvalid late (as one
+            // coming out of reset does) took that as a second request.
             m00_axi_arvalid  <= 1;
-            if (m00_axi_arready) begin
+            if (m00_axi_arready && m00_axi_arvalid) begin
+              m00_axi_arvalid <= 0;
               zorro_state <= WAIT_READ2;
             end
             
@@ -3020,7 +3039,8 @@ module MNTZorro_v0_1_S00_AXI
               m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
 
             m00_axi_arvalid  <= 1;
-            if (m00_axi_arready) begin
+            if (m00_axi_arready && m00_axi_arvalid) begin // see WAIT_READ
+              m00_axi_arvalid <= 0;
               zorro_state <= WAIT_READ_DMA_Z3B;
             end
           end
@@ -3032,7 +3052,9 @@ module MNTZorro_v0_1_S00_AXI
         end
 
         Z3_RXPF_SERVE: begin
-          if (rxpf_got > {1'b0, rxpf_idx}) begin
+          if (!rxpf_valid && !rxpf_busy && rxpf_got <= {1'b0, rxpf_idx}) begin
+            zorro_state <= WAIT_READ_DMA_Z3;   // the burst was given up: ask again
+          end else if (rxpf_got > {1'b0, rxpf_idx}) begin
             data_z3_hi16  <= {rxpf_buf[rxpf_idx][7:0],   rxpf_buf[rxpf_idx][15:8]};
             data_z3_low16 <= {rxpf_buf[rxpf_idx][23:16], rxpf_buf[rxpf_idx][31:24]};
             dataout_z3 <= 1; // enable data output

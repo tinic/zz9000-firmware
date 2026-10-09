@@ -46,6 +46,12 @@ module rxpf_tb;
   integer lat = 20;
   initial ragged = $test$plusargs("RAGGED");
   always @(posedge clk) if (random_arready) arready <= $random;
+  // late_arready: arready follows arvalid one cycle late, as an interconnect
+  // that is still waking up -- the shape that exposes a handshake that moves
+  // on before arvalid is dropped.  drop_next: deliver one beat of the next
+  // burst and lose the rest with no rlast, as an interconnect reset would.
+  reg late_arready = 0, drop_next = 0;
+  always @(posedge clk) if (late_arready) arready <= arvalid;
   reg [31:0] last_arlen;
   always @(posedge clk) begin
     if (arvalid && arready) begin
@@ -64,6 +70,10 @@ module rxpf_tb;
       end else begin
         rvalid <= 1;
         rdata  <= model(q_addr[q_head % 16] + beat * 4, q_gen[q_head % 16]);
+        if (drop_next && q_len[q_head % 16] > 1) begin
+          // one beat, then the rest of this burst and everything queued is gone
+          drop_next <= 0; q_head <= q_tail; beat <= 0; wait_cnt <= 0;
+        end else
         if (beat + 1 == q_len[q_head % 16]) begin
           rlast <= 1; beat <= 0; q_head <= q_head + 1; wait_cnt <= 0;
           if (ragged) lat <= 5 + ($random & 63);
@@ -72,7 +82,7 @@ module rxpf_tb;
     end
   end
 
-  integer errors = 0;
+  integer errors = 0, hung = 0, hang = 0;
 
   MNTZorro_v0_1_S00_AXI dut (
     .ZORRO_ADDR(ZORRO_ADDR), .ZORRO_DATA(ZORRO_DATA),
@@ -111,13 +121,14 @@ module rxpf_tb;
       if (!rd) begin zd_drv = 16'hdead; za_drv = {16'hbeef, 7'h0}; za_oe = 1; end
       ZORRO_DOE = 1;
       #10 ZORRO_NUDS = !lanes[1]; ZORRO_NLDS = !lanes[1]; ZORRO_NDS1 = !lanes[0]; ZORRO_NDS0 = !lanes[0];
-      wait (ZORRO_NDTACK == 1'b1);
+      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b1; hang = hang + 1) #10;
+      if (ZORRO_NDTACK !== 1'b1) begin hung = hung + 1; $display("INFO z3 cycle at %h got no DTACK in 30 us (state %0d busy %0d in_ram %0d fcs %0d)", a, dut.zorro_state, dut.rxpf_busy, dut.z3addr_in_ram, dut.z3_fcs_state); end
       #20;
       got = {dut.data_z3_hi16, dut.data_z3_low16};
       ZORRO_NUDS = 1; ZORRO_NLDS = 1; ZORRO_NDS1 = 1; ZORRO_NDS0 = 1;
       ZORRO_DOE = 0; za_oe = 0; zd_oe = 0;
       #10 ZORRO_NFCS = 1;
-      wait (ZORRO_NDTACK == 1'b0);
+      for (hang = 0; hang < 3000 && ZORRO_NDTACK !== 1'b0; hang = hang + 1) #10;
       #60;
       cycles_ns = $time - t0;
     end
@@ -145,6 +156,44 @@ module rxpf_tb;
   integer i, n0, ns, k; reg [31:0] got;
   initial begin
     $timeformat(-9, 0, " ns", 8);
+    if ($test$plusargs("BOOT")) begin : boot_arm
+      integer n0b;
+      repeat (20) @(posedge clk);
+      dut.z3_ram_low = BOARD; dut.z3_confdone = 1; dut.slv_reg4 = 2;
+      dut.zorro_state = 9; repeat (4) @(posedge clk); dut.zorro_state = 12; repeat (10) @(posedge clk);
+      // B1: a card-memory read while arready lags arvalid: exactly one request
+      late_arready = 1; arready = 0;
+      n0b = ar_count;
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      repeat (200) @(posedge clk);
+      $display("%s late arready, non-window read: %0d request(s) (want 1)", (ar_count - n0b == 1) ? "PASS" : "FAIL", ar_count - n0b);
+      if (ar_count - n0b != 1) errors = errors + 1;
+      n0b = ar_count;
+      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);
+      repeat (200) @(posedge clk);
+      $display("%s late arready, window read: %0d request(s) (want 1)", (ar_count - n0b == 1) ? "PASS" : "FAIL", ar_count - n0b);
+      if (ar_count - n0b != 1) errors = errors + 1;
+      late_arready = 0; @(posedge clk); #1 arready = 1; @(posedge clk);
+      // B2: a burst loses its beats (interconnect reset); a Zorro reset follows,
+      // as the Amiga resets while the card comes up.  Afterwards card memory
+      // must still be readable.
+      dut.slv_reg4 = 5; repeat (4) @(posedge clk);
+      drop_next = 1;
+      hung = 0;
+      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);   // gets its own beat
+      z3cycle(BOARD + 32'h2004, 1, 2'b11, got, ns);   // wants a beat that never comes
+      ZORRO_NIORST = 0; repeat (20) @(posedge clk); ZORRO_NIORST = 1; repeat (20) @(posedge clk);
+      dut.z3_ram_low = BOARD; dut.z3_confdone = 1;
+      dut.zorro_state = 9; repeat (4) @(posedge clk); dut.zorro_state = 12; repeat (10) @(posedge clk);
+      hung = 0;
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);  // framebuffer-style read
+      z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);   // window read
+      $display("%s after lost beats + Zorro reset: %0d hung read(s) (want 0)", hung == 0 ? "PASS" : "FAIL", hung);
+      if (hung != 0) errors = errors + 1;
+      $display("%s rxpf_tb: %0d error(s)", errors == 0 ? "PASS" : "FAIL", errors);
+      if (errors == 0) $display("RXPF_VERDICT_OK");
+      $finish;
+    end
     repeat (20) @(posedge clk);
     // configured at BOARD, slot 3
     dut.z3_ram_low = BOARD; dut.z3_confdone = 1; dut.slv_reg4 = 3;
