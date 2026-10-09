@@ -590,3 +590,21 @@ most a few tens of ns per longword.  Remaining levers:
 - moving the copy off the 68060 entirely (ZZ9000 bus mastering into
   motherboard RAM; unknown cost of the 060 reading motherboard RAM back --
   measure before considering).
+
+## RX offset 2 (dst+2 removed), A/B on hardware (2026-10-09 10:27-10:55Z)
+
+Firmware `zz9k/rx-offset2` 2156a56 (BOOT 5659ba94...): opt-in GEM RX buffer
+offset 2 (ETH_CONFIG 0x1000|1, length bit 15, RX_META bit 12, off on Amiga
+reset).  Same firmware in both arms; only the driver differs:
+A = anxzz9000.device from AmiNetXDuo origin/main 8bb3dc44 (never asks),
+B = AmiNetXDuo `fix/zz9000-rx-offset2` 6c28957a (asks; payload copy aligned
+on both sides).  ABBA ABBA, 8 flushed power cycles, size-checked install.
+
+| arm | 50 MHz RX Mbit/s | median | 82 MHz RX Mbit/s | median |
+|---|---|---|---|---|
+| A main | 23.10 23.19 23.21 23.21 | 23.20 | 27.81 27.94 27.96 27.99 | 27.95 |
+| B offset2 | 23.63 23.64 23.67 23.80 | 23.66 | 28.17 28.20 28.20 28.35 | 28.20 |
+
+B beats A in every pair, ranges disjoint: **+2.0 % at 50 MHz, +0.9 % at 82
+MHz**, as predicted from z3copy's dst+2 cost (12.9 / 8.5 us per frame).
+Backpressure 0 throughout.  Evidence: ~/ooc-evidence/rxoff2/.
