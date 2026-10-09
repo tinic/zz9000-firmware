@@ -485,3 +485,20 @@ All 8 boots carry RX, backpressure 0 in every sample.  The fixed build is
 the per-refill DSB/handoff, or run-to-run conditions.  Needs a same-session
 A/B (c8786cc vs 789e9b1, interleaved) before claiming either way.
 Logs: ~/ooc-evidence/rxpf-bdfix/.
+
+## Read-ahead + RX ownership fixes on hardware (2026-10-09 09:43-10:07Z)
+
+Image `BOOT-rxpf-789e9b1-nofast.bin` sha256 b6e31172... = read-ahead bitstream
+rxpf4-nofast.bit (d371600e..., unchanged c8786cc RTL) + ARM 789e9b1 (RX BD
+ownership, restart IRQ mask, hw_ready gate, MAC-update clear deferred).
+8 flushed power cycles: **8/8 boots carry RX, no dead or slow boot**,
+backpressure 0 in every sample.
+
+| | RX Mbit/s 50 MHz | RX Mbit/s 82 MHz | window readl ns (50 / 82) |
+|---|---|---|---|
+| read-ahead + fixes 789e9b1 (8 boots) | 23.06-23.18 | 27.81-27.89 | 452 / 494 |
+| read-ahead unfixed c8786cc (6 boots) | 23.5-23.7 | 28.2-28.4 (1 boot 24.6) | 452 / - |
+
+The fixed image is ~1.5 % below the unfixed read-ahead in RX.  Not resolved:
+per-BD handoff after ToHw + DSB in the refill path, or day-to-day variance
+(not an interleaved A/B).  Logs: ~/ooc-evidence/rxpf-bdfix/.
