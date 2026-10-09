@@ -502,3 +502,20 @@ backpressure 0 in every sample.
 The fixed image is ~1.5 % below the unfixed read-ahead in RX.  Not resolved:
 per-BD handoff after ToHw + DSB in the refill path, or day-to-day variance
 (not an interleaved A/B).  Logs: ~/ooc-evidence/rxpf-bdfix/.
+
+## Read-ahead + RX ownership fixes on hardware (2026-10-09 09:43-10:15Z)
+
+Image `BOOT-rxpf-789e9b1-nofast.bin` (b6e31172...; ELF 6f76cd28..., bit
+d371600e... unchanged c8786cc read-ahead).  Eight flushed power cycles,
+50 MHz then `cpuspeed 86` from the shell (82 MHz).  **8/8 boots carry RX, no
+degraded run, backpressure 0 in every sample.**
+
+| | RX 50 MHz | RX 82 MHz | window readl ns 50/82 |
+|---|---|---|---|
+| read-ahead + fixes 789e9b1 (8 boots) | 23.06-23.18 | 27.81-27.89 | 452 / 494 |
+| read-ahead c8786cc, old ARM (6 boots) | 23.5-23.7 | 28.2-28.4 (1/6 degraded 24.6) | 452 |
+| packet window + fix e19c45b (8 boots) | 22.0-22.3 | 27.5-27.8 | n/a (bank+DDR mix) |
+
+The fixed build is ~1.5-2 % below the old read-ahead runs with identical bus
+timing; not attributed (candidate: per-BD ToHw + DSB + NEW clear on refill,
+or run-to-run peer variance).  Evidence `~/ooc-evidence/rxpf-bdfix/`.
