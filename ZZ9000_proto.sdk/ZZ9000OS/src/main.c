@@ -82,8 +82,11 @@ void Xil_AssertNonVoid() {}
  * 2.8: v2.8 release identity — MPEG-1 media sessions, hardware overlay
  * scaling, per-stage pipeline profiling (MEDIA_STATUS page 5), the
  * primary-CLUT query, atomic videocap_profile configuration, reliable
- * display-transmitter retraining during output-mode changes, and the
- * host-visible firmware half of the matched live-videocap contract.
+ * display-transmitter retraining during output-mode changes, the
+ * host-visible firmware half of the matched live-videocap contract, the
+ * A4000 C28 capture variants with runtime phase control, SANA-II
+ * multicast hash programming, and the post-mix stereo audio limiter
+ * with parity boot defaults.
  * Startup operation 16 enters the shared acknowledged RTL control engine;
  * live calibration also requires the bitstream's exact capability. Other
  * SDK additions use service flags and status pages that self-gate. */
@@ -315,6 +318,11 @@ static uint16_t fwup_status = 0;
 static uint16_t fwup_pending_cmd = 0;
 static uint32_t fwup_pending_len = 0;
 static volatile int fwup_pending = 0;
+/* A ZZ9000.CFG save stages the whole file in one FWUP WRITE, and the raw
+ * config read returns it in the same buffer: neither may reach the Zorro II
+ * SDK mailbox, or saving settings would stop every SDK client. */
+typedef char zz_config_must_stay_below_z2_mailbox[
+	(ZZ_CONFIG_MAX_SIZE <= SDK_MAILBOX_Z2_BUFFER_OFFSET) ? 1 : -1];
 // debug things like individual reads/writes, greatly slowing the system down
 uint32_t debug_lowlevel = 0;
 
@@ -409,11 +417,37 @@ static void activate_aperture_layout_if_acknowledged(void)
 	}
 }
 
+static uint8_t amiga_boot_reset_pass = 1;
+
 void handle_amiga_reset(enum amiga_reset_mode mode) {
+	/* Fast-Ram gate (fast-ram-cfg KTD4): close the gate the moment a
+	 * reset is detected -- the fail-safe presentation -- then rederive
+	 * the decision from the SD file with the same bounded, fail-closed
+	 * loader as cold boot and reopen only on an enabling outcome. The
+	 * RTL retains the gate across a warm reset and restarts autoconfig
+	 * once reset releases, so this runs before any other reset work
+	 * and before the banner. ZZTop saves travel the FWUP file-push
+	 * path, so the file (not stale parsed state) is the authority; a
+	 * warm reboot therefore applies a saved fast_ram change, and a
+	 * failed or too-slow re-read boots without Fast RAM. */
+	mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG6, 0);
+	/* Cold boot reaches this handler right after main() decided the
+	 * gate: as media init normally, and as a FAST reset in the
+	 * ZZ9000_SKIP_INITIAL_MEDIA_INIT build where no volume is ever
+	 * registered. Only a genuine later warm reset re-reads the file
+	 * (through sd_storage's live volume -- a private remount would
+	 * break every later SD user); the boot-pass call keeps main()'s
+	 * decision instead of failing closed on an unmounted card. */
+	if (mode != AMIGA_RESET_INIT_MEDIA && !amiga_boot_reset_pass)
+		zz_config_fastram_reload_warm(ZZ_CONFIG_FASTRAM_DEADLINE_MS);
+	amiga_boot_reset_pass = 0;
+	mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG6,
+		zz_config_fastram_advertise() ? 1 : 0);
+
 	printf("    _______________   ___   ___   ___  \n");
 	printf("   |___  /___  / _ \\ / _ \\ / _ \\ / _ \\ \n");
 	printf("      / /   / / (_) | | | | | | | | | |\n");
-	printf("     / /   / / \\__, | | | | | | | | | |\n");
+	printf("     / /   / / \\__, | | | | | | | | |\n");
 	printf("    / /__ / /__  / /| |_| | |_| | |_| |\n");
 	printf("   /_____/_____|/_/  \\___/ \\___/ \\___/ \n\n");
 	printf("[reset] Amiga reset (%s)\r\n",
@@ -457,6 +491,10 @@ void handle_amiga_reset(enum amiga_reset_mode mode) {
 		(mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3) & (1UL << 25)) != 0U);
 	apply_aperture_framebuffer_limit();
 	clear_runtime_gfxdata();
+	/* The alloc-clear protocol handshake is driver-init state: a warm
+	 * reboot re-runs InitCard, so drop the latch until the new driver
+	 * generation announces itself again. */
+	alloc_clear_protocol_v2 = 0;
 
 	// clear audio buffer on reset
 	memset((void*)AUDIO_TX_BUFFER_ADDRESS, 0, AUDIO_TX_BUFFER_SIZE);
@@ -509,26 +547,46 @@ void handle_amiga_reset(enum amiga_reset_mode mode) {
 int main() {
 	init_platform();
 
+	/* Fast-Ram advertisement (fast-ram-cfg plan, KTD1/KTD6): the RTL
+	 * withholds the second Z3 autoconfig PIC (256 MiB Fast RAM) until
+	 * REG6 bit 0 is set (issue #25). The gate now opens only on a
+	 * successful, bounded, fail-closed ZZ9000.CFG decision, and the
+	 * CFG read runs before every other boot step so the decision
+	 * lands as early as possible in the race against the Amiga's
+	 * autoconfig pass. Every other condition -- key absent, off,
+	 * malformed, truncated, unreadable, or past the deadline -- leaves
+	 * the gate closed, so the card presents without Fast RAM (the old
+	 * nofast behavior) rather than advertising RAM an early
+	 * accelerator probe could mark defective. On Zorro II/A500
+	 * bitstreams the write is inert. */
+	XTime fastram_t0, fastram_t1;
+	XTime_GetTime(&fastram_t0);
+	zz_config_load_fastram(ZZ_CONFIG_FASTRAM_DEADLINE_MS, 1);
+	XTime_GetTime(&fastram_t1);
+	mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG6,
+		zz_config_fastram_advertise() ? 1 : 0);
+	{
+		uint64_t load_counts = (uint64_t)(fastram_t1 - fastram_t0);
+		uint32_t load_ms = (uint32_t)((load_counts * 1000U) /
+			COUNTS_PER_SECOND);
+		/* The one bounded boot-timing report (KTD5): printed after
+		 * the gate write so it cannot delay the decision, and the
+		 * only UART output this path produces before the service
+		 * bring-up. */
+		printf("[boot] fastram: %s cfg=%ums diag=%u\n",
+			zz_fastram_outcome_name((enum zz_fastram_outcome)
+				zz_config_get()->fastram_outcome),
+			load_ms, zz_config_diag_count());
+	}
+
 	sd_activity_led_init();
 
-	// issue #25: tell the FPGA the Zynq is up and the Z3 fast-RAM DDR window is
-	// ready, so it may advertise the fast-RAM autoconfig PIC. Until this is set
-	// (e.g. while still cold-booting from SD), the FPGA withholds that PIC so a
-	// fast accelerator's boot-time Zorro III memory test cannot mark the
-	// not-yet-ready RAM as defective. Set as early as possible to minimise the
-	// window in which the card could appear without its fast RAM.
-	mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG6, 1);
 	sdk_aperture_runtime_init(mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG7),
 		(mntzorro_read(MNTZ_BASE_ADDR, MNTZORRO_REG3) & (1UL << 25)) != 0U);
 
 	boot_rom_init();
 
 	disable_reset_out();
-
-	// Read ZZ9000.CFG from the SD card before video/ethernet bring-up so
-	// its settings apply from cold boot (issue #33). Failure of any kind
-	// leaves the built-in defaults untouched.
-	zz_config_load();
 
 	if (zz_config_get()->mac_present) {
 		// seed the MAC before ethernet_init() programs the GEM; the
@@ -577,6 +635,42 @@ int main() {
 		       sample, full, crop_h, crop_v,
 		       (uint32_t)!cfg->videocap_crop_h_present,
 		       (uint32_t)!cfg->videocap_crop_v_present);
+	}
+
+	if (zz_config_get()->videocap_phase_present) {
+		// Push the capture-phase offset through the same op path.
+		// MNTVF_OP_VIDEOCAP_PHASE drives the MMCM fine phase shifter in
+		// mntzorro.v; older bitstreams ignore the op. The offset persists
+		// in the MMCM until power-off, so a single boot-time push is
+		// enough. Safe here for the same reason as the ops above.
+		const struct zz_config *cfg = zz_config_get();
+		video_formatter_write((uint32_t)(uint16_t)cfg->videocap_phase,
+		                      MNTVF_OP_VIDEOCAP_PHASE);
+		printf("[CFG] videocap: phase %d steps\n", (int)cfg->videocap_phase);
+	}
+	if (zz_config_get()->videocap_c28_phase_present) {
+		// Clock-specific op: only the C28 bitstream consumes these units.
+		const struct zz_config *cfg = zz_config_get();
+		video_formatter_write((uint32_t)(uint16_t)cfg->videocap_c28_phase,
+		                      MNTVF_OP_VIDEOCAP_C28_PHASE);
+		printf("[CFG] videocap: C28 phase %d steps\n",
+		       (int)cfg->videocap_c28_phase);
+	}
+	{
+		// Capture-window bounds ride the ARM scanout geometry at the
+		// first stable detection (video_init seeds the overrides);
+		// report them here so a calibration session starts from known
+		// state.
+		const struct zz_config *cfg = zz_config_get();
+
+		if (cfg->videocap_width_present || cfg->videocap_height_present)
+			printf("[CFG] videocap: window %s%u x %s%u\n",
+			       cfg->videocap_width_present ? "" : "auto ",
+			       (unsigned)(cfg->videocap_width_present ?
+			                  cfg->videocap_width : 0),
+			       cfg->videocap_height_present ? "" : "auto ",
+			       (unsigned)(cfg->videocap_height_present ?
+			                  cfg->videocap_height : 0));
 	}
 
 	// RTG rect ops may write anywhere in framebuffer + legacy surface
@@ -742,11 +836,17 @@ int main() {
 			}
 			fwup_status = result;
 			fwup_pending = 0;
-			/* The firmware-update staging buffer is the same legacy
-			 * 0xa000..0xffff window used by the SDK bootstrap mailbox.
-			 * WRITE chunks may overwrite the mailbox, so restore it
-			 * once the chunk has been consumed by FatFs. */
-			sdk_mailbox_init();
+			/* The firmware-update staging buffer is the shared
+			 * 0xa000..0xffff window that also holds the Zorro II SDK
+			 * mailbox. A WRITE chunk long enough to reach it has
+			 * clobbered the descriptor, so rebuild it once FatFs has
+			 * consumed the chunk. Rebuilding tears down every live SDK
+			 * client (an MHI stream stops), so the name-only commands
+			 * and shorter chunks, including every ZZ9000.CFG save,
+			 * leave it alone. */
+			if (fwup_pending_cmd == FWUP_CMD_WRITE &&
+			    sdk_mailbox_io_staging_reaches(fwup_pending_len))
+				sdk_mailbox_init();
 		}
 
 		/* Scene commit machine (P1): one verified-I2C setter step per
@@ -1186,6 +1286,24 @@ int main() {
 								video_set_dpms((uint8_t)zdata);
 							}
 							break;
+						case CARD_FEATURE_VIDEOCAP_GEOMETRY:
+							/* Live capture-window calibration from
+							 * ZZTop: REG_ZZ_USER2 stages the width,
+							 * this write carries the height (both
+							 * are 16-bit bus values). 0/0 restores
+							 * the automatic window; an invalid pair
+							 * is rejected without touching the
+							 * applied geometry. */
+							if (video_set_videocap_geometry(blitter_user2,
+										(uint16_t)zdata))
+								printf("[feature] VIDEOCAP_GEOMETRY: %lux%lu\n",
+									(unsigned long)blitter_user2,
+									(unsigned long)(zdata & 0xffffU));
+							else
+								printf("[feature] VIDEOCAP_GEOMETRY rejected: %lux%lu\n",
+									(unsigned long)blitter_user2,
+									(unsigned long)(zdata & 0xffffU));
+							break;
 						default:
 							break;
 					}
@@ -1285,7 +1403,14 @@ int main() {
 
 				// Ethernet
 				case REG_ZZ_ETH_TX:
-					ethernet_send_result = ethernet_send_frame(zdata);
+					if (zdata & ETH_TX_ASYNC) {
+						/* the bus is given back before the GEM has sent;
+						 * completion is counted in REG_ZZ_ETH_TX_STATUS */
+						ethernet_send_frame_async((zdata >> ETH_TX_SLOT_SHIFT) & ETH_TX_FIELD_MASK,
+						                          zdata & ETH_TX_LEN_MASK);
+					} else {
+						ethernet_send_result = ethernet_send_frame(zdata);
+					}
 					//printf("SEND frame sz: %ld res: %d\n",zdata,ethernet_send_result);
 					break;
 				case REG_ZZ_ETH_RX: {
@@ -1316,6 +1441,12 @@ int main() {
 					ethernet_update_mac_address();
 					break;
 				}
+				case REG_ZZ_ETH_CONFIG:
+					if (((u16)zdata & 0xf000) == ETH_CONFIG_RX_OFFSET2)
+						ethernet_set_rx_offset2((u16)zdata & 1);
+					else
+						ethernet_set_multicast_hash((u16)zdata);
+					break;
 				case REG_ZZ_USBBLK_TX_HI: {
 #if ENABLE_LEGACY_USB_BLOCK_STORAGE
 					usb_storage_write_block = ((u32) zdata) << 16;
@@ -1498,6 +1629,15 @@ int main() {
 				case REG_ZZ_PRINT_HEX: {
 					// print zdata has hex (follow up by \n via chr!)
 					printf("%04x", (unsigned int)(zdata&0xffff));
+					break;
+				}
+				case REG_ZZ_ALLOC_CLEAR_PROTOCOL: {
+					/* Driver init handshake: only after this token
+					 * does the ACC surface allocator honor
+					 * u8_user[3] as a no-clear flag. Any other
+					 * value drops back to always-clear. */
+					alloc_clear_protocol_v2 =
+						(zdata == ZZ_REG_ZZ_ALLOC_CLEAR_TOKEN);
 					break;
 				}
 				case REG_ZZ_AUDIO_CONFIG: {
@@ -1729,9 +1869,17 @@ int main() {
 					}
 					case REG_ZZ_ETH_MAC_LO: {
 						uint8_t* mac = ethernet_get_mac_address_ptr();
-						data = mac[4] << 24 | mac[5] << 16;
+						data = ethernet_mac_lo_word(mac);
 						break;
 					}
+					case REG_ZZ_ETH_TX_STATUS:
+						/* aligned: the status is the high half */
+						data = (u32)ethernet_get_tx_status() << 16;
+						break;
+					case REG_ZZ_ETH_RX_FRAMES:
+						/* aligned: the value is the high half */
+						data = (u32)ethernet_get_rx_frames() << 16;
+						break;
 					case REG_ZZ_ETH_TX:
 						// FIXME this is probably wrong (doesn't need swapping?)
 						data = (ethernet_send_result & 0xff) << 24
@@ -1793,15 +1941,29 @@ int main() {
 						data |= video_firmware_capabilities();
 						break;
 					}
-					case REG_ZZ_CONFIG_KEY: {
-						// value of the selected ZZ9000.CFG key in the
-						// upper half, present flag in the lower half
-						// (REG_ZZ_CONFIG_PRESENT on Z2)
-						uint16_t present = 0;
-						uint16_t value = zz_config_query(config_query_key, &present);
-						data = ((uint32_t)value << 16) | present;
-						break;
+				case REG_ZZ_CONFIG_KEY: {
+					// value of the selected ZZ9000.CFG key in the
+					// upper half, present flag in the lower half
+					// (REG_ZZ_CONFIG_PRESENT on Z2)
+					uint16_t present = 0;
+					uint16_t value;
+					if (config_query_key >= ZZ_CONFIG_KEY_RTG_GEOM_LINE &&
+					    config_query_key <= ZZ_CONFIG_KEY_RTG_GEOM_MODESEL) {
+						value = video_rtg_diag_value(
+							config_query_key, &present);
+					} else if (config_query_key >=
+					           ZZ_CONFIG_KEY_VCAP_GEOMETRY_REQUEST_WIDTH &&
+					           config_query_key <=
+					           ZZ_CONFIG_KEY_VCAP_GEOMETRY_STATUS) {
+						value = video_videocap_geometry_value(
+							config_query_key, &present);
+					} else {
+						value = zz_config_query(
+							config_query_key, &present);
 					}
+					data = ((uint32_t)value << 16) | present;
+					break;
+				}
 					case REG_ZZ_CONFIG_FILE: {
 						// status in the upper half, staged byte count
 						// in the lower half (REG_ZZ_CONFIG_FILE_LEN on Z2)
@@ -1846,6 +2008,12 @@ int main() {
 						data = 0;
 						break;
 					}
+					/* 0xa6 is the low word of the 0xa4 group; 0xa4 itself is
+					 * the write-only ARM argv interface and reads 0. */
+					case REG_ZZ_ARM_ARGV7: {
+						data = ethernet_get_rx_meta();
+						break;
+					}
 					case REG_ZZ_ETH_RX_STATUS: {
 						data = ((uint32_t)ethernet_get_rx_status() << 16)
 						     | ethernet_get_rx_stats();
@@ -1884,13 +2052,8 @@ int main() {
 				if (z3) {
 					mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG1, data);
 				} else {
-					if (zaddr & 2) {
-						// lower 16 bit
-						mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG1, data);
-					} else {
-						// upper 16 bit
-						mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG1, data >> 16);
-					}
+					mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG1,
+						ethernet_zorro16(data, zaddr));
 				}
 			}
 
@@ -2026,6 +2189,11 @@ int main() {
 			// keep the AX TX ring fed from a bound audio-stream session
 			// (SDK_OP_AUDIO_STREAM_PLAY); no-op when nothing is bound
 			sdk_mailbox_audio_playback_pump();
+			// convert whole source periods for rate-converted
+			// AHI/MHI leases on the main loop so the fabric ISR
+			// only copies (drivers#83 follow-up); no-op without
+			// converting leases
+			audio_fabric_lease_poll();
 
 			if (sdk_mailbox_register_events) {
 				uint32_t events = sdk_mailbox_register_events;

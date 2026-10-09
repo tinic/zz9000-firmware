@@ -51,6 +51,7 @@ reg [255:0] jitter_name;
 localparam integer CAPTURE_INPUT_OFFSET = 4;
 
 reg cap_clk = 0;
+reg cap_reset = 1;
 reg grid_ref = 0;
 reg axi_clk = 0;
 reg vsync = 1;
@@ -89,6 +90,8 @@ wire [9:0] probe_line;
 wire [11:0] probe_source_x;
 wire [31:0] probe_context;
 wire [31:0] probe_config;
+wire diag_valid;
+wire [383:0] diag_data;
 wire probe_precrop_valid;
 wire [31:0] probe_precrop_context;
 reg [5:0] probe_precrop_raddr = 0;
@@ -98,7 +101,7 @@ reg control_request_event = 0;
 reg [31:0] control_request_raw = 0;
 reg control_request_token_valid = 1;
 wire control_send;
-wire [26:0] control_payload;
+wire [28:0] control_payload;
 wire control_received;
 wire control_busy;
 wire [7:0] control_request_sequence;
@@ -108,7 +111,7 @@ wire control_applied_valid;
 wire [31:0] control_applied_raw;
 wire [31:0] control_applied_effective;
 wire legacy_control_send;
-wire [26:0] legacy_control_payload;
+wire [28:0] legacy_control_payload;
 wire legacy_control_received;
 wire legacy_control_busy;
 wire [7:0] legacy_control_request_sequence;
@@ -152,8 +155,7 @@ videocap_control_source #(
     .applied_sequence(control_applied_sequence),
     .last_commit_rejected(control_rejected),
     .applied_valid(control_applied_valid),
-    .applied_raw(control_applied_raw),
-    .applied_effective_crop(control_applied_effective)
+    .applied_raw(control_applied_raw)
 );
 
 videocap_control_source #(
@@ -171,8 +173,7 @@ videocap_control_source #(
     .applied_sequence(legacy_control_applied_sequence),
     .last_commit_rejected(legacy_control_rejected),
     .applied_valid(legacy_control_applied_valid),
-    .applied_raw(legacy_control_applied_raw),
-    .applied_effective_crop(legacy_control_applied_effective)
+    .applied_raw(legacy_control_applied_raw)
 );
 
 videocap_standard_cdc standard_tracker (
@@ -191,7 +192,8 @@ videocap_sampler #(
     .PROBE_LINE(0),
     .PROBE_SOURCE_X(32)
 ) dut (
-    .cap_clk(cap_clk),
+    .cap_clk(cap_clk), .cap_reset(cap_reset), .axi_resetn(1'b1),
+    .cal_arm(1'b0), .cal_address(10'd0),
     .grid_ref(grid_ref),
     .vcap_vsync(vsync),
     .vcap_hsync(hsync),
@@ -203,6 +205,7 @@ videocap_sampler #(
     .ctl_received(control_received),
     .ctl_read_full_width(control_applied_raw[2]),
     .detected_standard(detected_standard),
+    .live_effective_crop(control_applied_effective),
     .cap_x(cap_x),
     .cap_y(cap_y),
     .cap_ymax(cap_ymax),
@@ -223,6 +226,8 @@ videocap_sampler #(
     .probe_source_x(probe_source_x),
     .probe_context(probe_context),
     .probe_config(probe_config),
+    .diag_valid(diag_valid),
+    .diag_data(diag_data),
     .probe_precrop_valid(probe_precrop_valid),
     .probe_precrop_context(probe_precrop_context),
     .probe_precrop_raddr(probe_precrop_raddr),
@@ -241,7 +246,8 @@ videocap_sampler #(
     .CSYNC_VSYNC(0),
     .FULLRATE(0)
 ) legacy_dut (
-    .cap_clk(cap_clk),
+    .cap_clk(cap_clk), .cap_reset(cap_reset), .axi_resetn(1'b1),
+    .cal_arm(1'b0), .cal_address(10'd0),
     .grid_ref(1'b0),
     .vcap_vsync(vsync),
     .vcap_hsync(hsync),
@@ -253,6 +259,7 @@ videocap_sampler #(
     .ctl_received(legacy_control_received),
     .ctl_read_full_width(legacy_control_applied_raw[2]),
     .detected_standard(legacy_detected_standard),
+    .live_effective_crop(legacy_control_applied_effective),
     .cap_x(),
     .cap_y(),
     .cap_ymax(),
@@ -273,6 +280,8 @@ videocap_sampler #(
     .probe_source_x(),
     .probe_context(),
     .probe_config(),
+    .diag_valid(),
+    .diag_data(),
     .probe_precrop_valid(),
     .probe_precrop_context(),
     .probe_precrop_raddr(6'd0),
@@ -357,6 +366,7 @@ task force_control_frame_boundary;
         release legacy_dut.frame_sync;
     end
 endtask
+
 
 task pulse_standard_frame;
     input ntsc;
@@ -446,14 +456,10 @@ task check_full_width_bank_entry;
     end
 endtask
 
-task check_completed_bank_during_next_line;
+task check_completed_bank_after_next_line;
     input completed_bank;
     input integer pattern_seed;
     begin
-        wait (hsync == 0);
-        wait (cap_x < 16);
-        wait (cap_x >= 900);
-
         checks = checks + 1;
         if (cap_write_bank === completed_bank) begin
             errors = errors + 1;
@@ -507,6 +513,14 @@ integer last_frame_sync_x;
 integer last_frame_phase_abs_delta;
 integer last_frame_phase_changed;
 
+integer hsync_rise_count = 0;
+integer hsync_fall_count = 0;
+
+always @(posedge hsync)
+    hsync_rise_count = hsync_rise_count + 1;
+
+always @(negedge hsync)
+    hsync_fall_count = hsync_fall_count + 1;
 always @(posedge cap_clk) begin
     if (dut.frame_sync) begin
         last_frame_sync_x = dut.phase_x;
@@ -546,7 +560,7 @@ task drive_line;
              * SuperHires content. */
             if (GRIDSHIFT != 0) begin
                 /* Odd-period bars varying only in blue: edges a
-                /* red-only phase metric cannot see (PR review).
+                 * red-only phase metric cannot see (PR review).
                  */
                 r = 8'h80;
                 g = 8'h80;
@@ -582,7 +596,10 @@ task drive_line;
          * monitor below (a vsync serration line emits two tokens, so
          * end-of-line sampling cannot check alternation). */
 
-        if (FULLWIDTH && vsync) begin
+        if (FULLWIDTH && vsync && !dut.capture_ready) begin
+            check_eq("recovery_suppresses_full_width_token",
+                     cap_line_toggle, line_toggle_before);
+        end else if (FULLWIDTH && vsync) begin
             /* cap_y holds a field-parity sentinel until vertical crop has
              * completed.  Those pre-crop rows must never reach DDR.  The
              * first completed visible row is normalized back to row 0/1 so
@@ -637,11 +654,9 @@ task drive_field;
         for (ln = 0; ln < LINES; ln = ln + 1) begin
             if (FULLWIDTH && check_vertical && ln == 2) begin
                 completed_bank_before_line = cap_write_bank;
-                fork
-                    drive_line(seed + ln);
-                    check_completed_bank_during_next_line(
-                        completed_bank_before_line, seed + ln - 1);
-                join
+                drive_line(seed + ln);
+                check_completed_bank_after_next_line(
+                    completed_bank_before_line, seed + ln - 1);
             end else begin
                 drive_line(seed + ln);
             end
@@ -664,7 +679,7 @@ task drive_field;
                      (LINES - CROPV + 1) * (cap_interlace ? 2 : 1));
         check_eq("one_anchor_per_field",
                  frame_anchor_count - anchors_before_field,
-                 FULLWIDTH && LINES >= CROPV ? 1 : 0);
+                 FULLWIDTH && LINES >= CROPV && dut.capture_ready ? 1 : 0);
         check_eq("filtered_only_has_no_anchor", legacy_frame_anchor_toggle, 0);
     end
 endtask
@@ -753,6 +768,129 @@ task drive_plain_field;
     end
 endtask
 
+/*
+ * Characterize the two measured Video Toaster timing shapes without making
+ * either edge orientation the oracle.  The reporter saw one rise and one fall
+ * for every one of 262/263 field lines in both modes; genlock changed the
+ * pulse orientation and VSYNC phase, not the edge count.
+ */
+task drive_characterization_line;
+    input integer pattern_seed;
+    input integer pulse_clks;
+    input integer inverted_pulse;
+    input integer vsync_drop_phase;
+    integer i;
+    integer px;
+    begin
+        for (i = 0; i < LINECLKS; i = i + 1) begin
+            if (inverted_pulse)
+                hsync = (i < pulse_clks);
+            else
+                hsync = (i >= pulse_clks);
+            if (i == vsync_drop_phase)
+                vsync = 0;
+            px = (i / PIXSPAN) + pattern_seed;
+            r = px[7:0];
+            g = ~px[7:0];
+            b = {px[3:0], px[7:4]};
+            @(posedge cap_clk);
+        end
+    end
+endtask
+
+task drive_characterization_field;
+    input integer seed;
+    input integer total_lines;
+    input integer pulse_clks;
+    input integer inverted_pulse;
+    input integer vsync_drop_phase;
+    integer ln;
+    integer rises_before;
+    integer falls_before;
+    begin
+        /* Put the input on the opposite level before counting so every driven
+         * line contributes exactly one rising and one falling edge.  Do not
+         * insert an extra clock between same-polarity fields: that would be a
+         * synthetic one-clock line-period outlier in the telemetry oracle. */
+        if (hsync !== (inverted_pulse ? 1'b0 : 1'b1)) begin
+            hsync = inverted_pulse ? 0 : 1;
+            @(posedge cap_clk);
+        end
+        rises_before = hsync_rise_count;
+        falls_before = hsync_fall_count;
+
+        vsync = 1;
+        drive_characterization_line(seed, pulse_clks, inverted_pulse,
+                                    vsync_drop_phase);
+        drive_characterization_line(seed + 1, pulse_clks, inverted_pulse, -1);
+        vsync = 1;
+        for (ln = 2; ln < total_lines; ln = ln + 1)
+            drive_characterization_line(seed + ln, pulse_clks,
+                                        inverted_pulse, -1);
+
+        check_eq("characterization_rise_lines",
+                 hsync_rise_count - rises_before, total_lines);
+        check_eq("characterization_fall_lines",
+                 hsync_fall_count - falls_before, total_lines);
+        check_eq("characterization_capture_complete", cap_x_done, 1);
+        if (FULLWIDTH)
+            check_eq("characterization_full_width_extent",
+                     (cap_x >= 1280), 1);
+        else
+            check_eq("characterization_filtered_extent",
+                     (cap_x > 512), 1);
+    end
+endtask
+
+/* Jittered line-length variants for the horizontal-jitter telemetry: each
+ * line still contributes exactly one HSYNC rise and fall, but the
+ * line-to-line period alternates between short_len and long_len. Only the
+ * diagnostic min/max period fields are asserted by callers; capture
+ * geometry is intentionally not checked here. */
+task drive_jitter_line;
+    input integer pattern_seed;
+    input integer line_clks;
+    input integer pulse_clks;
+    input integer vsync_drop_phase;
+    integer i;
+    integer px;
+    begin
+        for (i = 0; i < line_clks; i = i + 1) begin
+            hsync = (i >= pulse_clks);
+            if (i == vsync_drop_phase)
+                vsync = 0;
+            px = (i / PIXSPAN) + pattern_seed;
+            r = px[7:0];
+            g = ~px[7:0];
+            b = {px[3:0], px[7:4]};
+            @(posedge cap_clk);
+        end
+    end
+endtask
+
+task drive_jitter_field;
+    input integer seed;
+    input integer total_lines;
+    input integer pulse_clks;
+    input integer short_len;
+    input integer long_len;
+    integer ln;
+    begin
+        if (hsync !== 1'b1) begin
+            hsync = 1;
+            @(posedge cap_clk);
+        end
+        vsync = 1;
+        drive_jitter_line(seed, short_len, pulse_clks, 400);
+        drive_jitter_line(seed + 1, long_len, pulse_clks, -1);
+        vsync = 1;
+        for (ln = 2; ln < total_lines; ln = ln + 1)
+            drive_jitter_line(seed + ln,
+                              (ln % 2 == 0) ? short_len : long_len,
+                              pulse_clks, -1);
+    end
+endtask
+
 integer sample_idx;
 integer pix_even;
 integer pix_odd;
@@ -811,9 +949,10 @@ reg [7:0] odd_g;
 reg [7:0] odd_b;
 reg interlace_field_parity;
 reg [31:0] raw_before;
-reg [26:0] payload_before;
+reg [27:0] payload_before;
 reg [7:0] sequence_before;
 reg [31:0] focused_raw;
+reg [15:0] diag_sequence_before;
 
 initial begin
     PIXSPAN = DEFAULT_PIXSPAN;
@@ -841,6 +980,7 @@ initial begin
     if ($value$plusargs("GRIDSHIFT=%d", GRIDSHIFT)) ;
 
     repeat (10) @(posedge cap_clk);
+    @(negedge cap_clk); cap_reset = 0;
     probe_arm_toggle = 1;
 
     control_request_raw = (CROPV << 16) | (CROPH << 4) |
@@ -879,12 +1019,12 @@ initial begin
     end
 
     drive_field(0, 0);
+    drive_field(0, 1);
     wait_control_complete;
     check_eq("initial_applied_valid", control_applied_valid, 1);
     check_eq("initial_applied_sequence", control_applied_sequence, 1);
     check_eq("initial_applied_raw", control_applied_raw,
              control_request_raw);
-    drive_field(0, 1);
 
     /* GRIDSHIFT runs re-phase over the first frame; cap_shres settles
      * one frame after the odd-period bars are pure again. */
@@ -1037,6 +1177,86 @@ initial begin
     check_eq("fullrate_field_parity_a", cap_y[0],
              !interlace_field_parity);
 
+
+    /*
+     * Run the full 262/263-line reporter characterization only in the two
+     * representative hires configurations.  Repeating it for every crop and
+     * sample-mode permutation adds simulation time but no timing coverage.
+     *
+     * Normal video uses the established half-line phase alternation.  The
+     * Toaster-like pair keeps the reported phase fixed while inverting the
+     * narrow pulse, matching hspol=1/fall=1/lowWide=1.  Current master
+     * completes both capture windows, so this model does not reproduce the
+     * visible duplication; the missing discriminator belongs in the passive
+     * telemetry round rather than in a speculative polarity assertion.
+     */
+    if (PIXSPAN == 2 && SAMPLEMODE == 0 && CROPH == 188 && CROPV == 26) begin
+        diag_sequence_before = diag_data[351:336];
+        probe_arm_toggle = ~probe_arm_toggle;
+        wait (probe_arm_seen == probe_arm_toggle);
+        drive_characterization_field(500, 262, 67, 0, 400);
+        drive_characterization_field(600, 263, 67, 0,
+                                     400 + LINECLKS / 2);
+        check_eq("characterization_normal_interlace", cap_interlace, 1);
+        check_eq("diag_normal_valid", diag_valid, 1);
+        check_eq("diag_normal_rise_count", diag_data[31:0], 262);
+        check_eq("diag_normal_fall_count", diag_data[63:32], 262);
+        check_eq("diag_normal_low_min_max", diag_data[95:64],
+                 {16'd67, 16'd67});
+        check_eq("diag_normal_high_min", diag_data[111:96],
+                 LINECLKS - 67);
+        check_eq("diag_normal_high_max", diag_data[127:112],
+                 LINECLKS - 67);
+        check_eq("diag_normal_rise_period_min", diag_data[143:128],
+                 LINECLKS);
+        check_eq("diag_normal_rise_period_max", diag_data[159:144],
+                 LINECLKS);
+        check_eq("diag_normal_fall_period_min", diag_data[175:160],
+                 LINECLKS);
+        check_eq("diag_normal_fall_period_max", diag_data[191:176],
+                 LINECLKS);
+        check_eq("diag_normal_sequence", diag_data[351:336],
+                 diag_sequence_before + 1'b1);
+        diag_sequence_before = diag_data[351:336];
+
+        probe_arm_toggle = ~probe_arm_toggle;
+        wait (probe_arm_seen == probe_arm_toggle);
+        drive_characterization_field(700, 262, 67, 1, 114);
+        check_eq("diag_toaster_stale_invalid", diag_valid, 0);
+        check_eq("diag_toaster_prior_payload_frozen",
+                 diag_data[351:336], diag_sequence_before);
+        drive_characterization_field(800, 263, 67, 1, 114);
+        check_eq("characterization_toaster_repeat_phase", cap_interlace, 0);
+        check_eq("diag_toaster_valid", diag_valid, 1);
+        check_eq("diag_toaster_rise_count", diag_data[31:0], 262);
+        check_eq("diag_toaster_fall_count", diag_data[63:32], 262);
+        check_eq("diag_toaster_low_min", diag_data[79:64],
+                 LINECLKS - 67);
+        check_eq("diag_toaster_low_max", diag_data[95:80],
+                 LINECLKS - 67);
+        check_eq("diag_toaster_high_min_max", diag_data[127:96],
+                 {16'd67, 16'd67});
+        check_eq("diag_sequence_advanced", diag_data[351:336],
+                 diag_sequence_before + 1'b1);
+        diag_sequence_before = diag_data[351:336];
+        $display("CHARACTERIZATION Toaster-like edges complete the capture window; telemetry required");
+        probe_arm_toggle = ~probe_arm_toggle;
+        wait (probe_arm_seen == probe_arm_toggle);
+        drive_jitter_field(900, 262, 67, LINECLKS - 5, LINECLKS + 5);
+        drive_jitter_field(950, 262, 67, LINECLKS - 5, LINECLKS + 5);
+        check_eq("diag_jitter_valid", diag_valid, 1);
+        check_eq("diag_jitter_rise_period_min", diag_data[143:128],
+                 LINECLKS - 5);
+        check_eq("diag_jitter_rise_period_max", diag_data[159:144],
+                 LINECLKS + 5);
+        check_eq("diag_jitter_fall_period_min", diag_data[175:160],
+                 LINECLKS - 5);
+        check_eq("diag_jitter_fall_period_max", diag_data[191:176],
+                 LINECLKS + 5);
+        check_eq("diag_jitter_sequence", diag_data[351:336],
+                 diag_sequence_before + 1'b1);
+        $display("CHARACTERIZATION Alternating line periods tracked by telemetry min/max");
+    end
     /* The standalone tracker makes the two-frame validity rule explicit
      * without lengthening every pixel-format raster configuration. */
     check_eq("standard_startup_invalid", tracked_standard, 0);
@@ -1059,7 +1279,6 @@ initial begin
     pulse_control_request(focused_raw, 1'b1);
     wait (dut.ctl_dest_req && legacy_dut.ctl_dest_req);
     force_control_frame_boundary;
-    check_eq("control_ack_held_at_boundary", dut.ctl_dest_ack, 1);
     wait_control_complete;
     check_eq("writeback_owner_filtered", control_applied_raw[2], 0);
 
@@ -1090,12 +1309,11 @@ initial begin
     check_eq("busy_commit_rejected", control_rejected, 1);
 
     force_control_frame_boundary;
-    check_eq("control_ack_stays_high", dut.ctl_dest_ack, 1);
     wait_control_complete;
     check_eq("control_ack_returned_low", dut.ctl_dest_ack, 0);
     check_eq("mixed_auto_raw", control_applied_raw, focused_raw);
     check_eq("mixed_auto_fullrate_effective", control_applied_effective,
-             (4095 << 16) | 279);
+             (4095 << 16) | 278);
     check_eq("mixed_auto_compat_effective", legacy_control_applied_effective,
              (4095 << 16) | 188);
     check_eq("writeback_owner_full_width", control_applied_raw[2], 1);
@@ -1210,21 +1428,15 @@ initial begin
         wait (dut.ctl_dest_req && legacy_dut.ctl_dest_req);
         force_control_frame_boundary;
         wait_control_complete;
-        check_eq("width_only_auto_base", control_applied_effective,
-                 (26 << 16) | 188);
 
         pulse_control_request(32'h80000000 | (1 << 2), 1'b1);
         wait (dut.ctl_dest_req && legacy_dut.ctl_dest_req);
         check_eq("width_only_auto_payload", control_payload,
-                 (40 << 15) | (279 << 3) | (1 << 2) | 2);
+                 (3 << 27) | (40 << 15) | (278 << 3) | (1 << 2) | 2);
         force_control_frame_boundary;
         wait_control_complete;
         check_eq("width_only_auto_set_raw", control_applied_raw,
                  focused_raw | (1 << 2));
-        check_eq("width_only_auto_fullrate", control_applied_effective,
-                 (40 << 16) | 279);
-        check_eq("width_only_auto_compat",
-                 legacy_control_applied_effective, (26 << 16) | 188);
     end
 
     /* A width request colliding with an in-flight ordinary commit is

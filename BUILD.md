@@ -45,6 +45,14 @@ or from a POSIX shell:
 The Docker wrappers cache the official Arm GNU Toolchain and bootgen in Docker
 volumes named `zz9000-arm-toolchain` and `zz9000-bootgen`.
 
+The firmware linker keeps low DDR below the framebuffer at `0x00200000`.
+Video/HDMI control code and constants use the existing high-DDR code region;
+mutable state retains the normal data/BSS placement. Keep the
+`firmware low sections overlap framebuffer memory` assertion intact: a
+failure means the image layout must be repaired, not the framebuffer boundary
+increased. Both normal and legacy-bitstream firmware targets depend on
+`src/lscript.ld`, so linker-script changes trigger relinking.
+
 **USB proxy change** — run the bounded host models before building the ARM
 artifact:
 
@@ -85,6 +93,35 @@ default. SD HDF boot and the Poseidon USB proxy remain enabled. For an
 old-driver regression test, rebuild firmware with
 `EXTRA_CFLAGS=-DENABLE_LEGACY_USB_BLOCK_STORAGE=1`.
 
+### Timing gates
+
+`build_bitstream.sh` / `build_bitstream.ps1` source three gate scripts after
+implementation (before `write_bitstream`): `verify_formatter_ooc_timing.tcl`,
+`verify_vcap_cdc_timing.tcl`, and `verify_runtime_pixel_timing.tcl`. The
+release timing gate fails the build on **any** negative setup or hold slack in
+**any** clock group (a per-clock loop over `get_clocks`, including port
+clocks such as `i2s_mclk` and `zorro_fcs` that launch input-delay paths), in
+addition to the dedicated 150 MHz runtime pixel-clock checks. The final
+`TIMING_GATE: PASS - ...` line is what CI-style greps key on; a failure
+raises a Tcl error naming the violating group and slack.
+
+The build runs implementation through the post-route `phys_opt_design` step
+before the gates execute. That step is load-bearing for the ADAU1701 I2S
+input capture (`tSODM` = 40 ns consumes the whole BCLK half period, so the
+fast-corner margin is only BCLK insertion minus pin-to-register delay; the
+trial build moved from −0.090 ns routed to +0.143 ns after post-route
+phys_opt). Treat a routed-checkpoint WNS of a few hundred picoseconds
+negative on `i2s_mclk` as "let phys_opt finish" rather than a real
+regression; the gated (final) netlist is the authority.
+
+Clock-domain crossings are bounded with `set_max_delay -datapath_only`
+instead of blanket false paths so XPM/FIFO-generated CDC constraints keep
+precedence (Vivado otherwise reports methodology TIMING-24 and leaves the
+boundary unanalyzed). Every exception in `ZZ9000_proto.srcs/constrs_1/new/`
+carries a comment stating its rationale; `check_timing` is expected to
+report no unconstrained input or output ports.
+
+
 **Native-PAL videocap default (issue #7)** — for setups that boot
 without the host driver (no startup-sequence, floppy-only demo
 sessions), the standard 60 Hz videocap default produces visible
@@ -107,15 +144,22 @@ the built-in default stays at 60 Hz.
 ```bash
 ./build_variant_bitstreams.sh
 ```
+
 These are hardware/autoconfig bitstream variants, not separate firmware
-behavior flavors. Build them when an HDL/block-design change must ship
-across supported boards. The script builds the default Zorro III
-bitstream and the Zorro III no-RAM / Zorro II / A500 / 2MB variants,
-copies them to the release paths under `bootimage_work/`, and restores
-`mntzorro.v` afterward. You can also pass one or more variant names, for
-example:
+behavior flavors. The standard Zorro III build uses E7M capture; the
+A4000-only build uses the video-slot C28 capture clock. Zorro III FastRAM
+is a `fast_ram` `ZZ9000.CFG` setting, not a variant: the former
+`zorro3-nofast` pair is gone and its behavior is the fail-closed default.
+The script restores `mntzorro.v` and the canonical E7M bitstream afterward.
+To rebuild selected variants on Linux, for example:
 ```bash
-./build_variant_bitstreams.sh zorro3-nofast zorro2 zorro2-2mb a500plus
+./build_variant_bitstreams.sh zorro2 zorro3-aga
+```
+On Windows with Git Bash, pass both builders when selecting a C28 variant:
+```bash
+BITSTREAM_BUILDER="powershell -NoProfile -ExecutionPolicy Bypass -File ./build_bitstream.ps1" \
+C28_BITSTREAM_BUILDER="powershell -NoProfile -ExecutionPolicy Bypass -File ./build_bitstream.ps1 -CaptureC28 -OutputBitstream" \
+  ./build_variant_bitstreams.sh zorro3-aga
 ```
 
 **Clean rebuild** — no Vivado, uses the committed bitstream:
@@ -130,7 +174,23 @@ example:
 Host-side suites (any machine with a C compiler):
 ```bash
 make -C test/rtg test        # RTG correctness regression
-make -C test/video test      # VDMA math + video_formatter source invariants
+make -C test/video test      # VDMA, native modes, overlays
+```
+
+Capture RTL simulations also run in CI with Verilator. They exercise the
+production C28/E7M clock controller, filtered and full-width PAL-shaped
+capture, the 28 MHz line origin, writeback layout, diagnostics, and the
+video-slot/Denise/Zorro II RGB pin mappings:
+```bash
+bash test/video/run_videocap_clock_verilator.sh
+bash test/video/run_videocap_verilator_sim.sh
+```
+The sampler CI suite uses a test-only XPM handshake model. It does not
+replace vendor XPM, MMCM phase, IOB placement, routed timing, or physical
+capture qualification. Run the full sampler matrix against Vivado's XPM
+library before rebuilding FPGA bitstreams:
+```bash
+test/video/run_videocap_sim.sh
 ```
 
 Functional simulation of the video formatter (needs Vivado 2018.3 for
@@ -145,6 +205,24 @@ compares every displayed pixel against expected framebuffer contents
 across all color modes (8/15/16/32 bpp), scale_x/scale_y, odd-width
 tkeep tails, the native videocap shape and 1920-wide 32 bpp lines. The
 sweep fails if any configuration mismatches or fails to report.
+
+Capture-clock phase regression (Vivado 2018.3 UNISIM; set `VIVADO_BIN` for a
+non-default installation):
+```bash
+python3 test/video/run_videocap_phase_sim.py
+```
+This runs the production phase engine and MMCM, measuring both capture and
+grid clock displacement for positive, negative, and restored-zero targets.
+A completed phase request is not sufficient: enabling fine phase shift on
+both feedback and outputs cancels the intended clock movement.
+
+Variant elaboration (Vivado 2018.3 xvlog/xelab; set `VIVADO_BIN` for a
+non-default installation): compiles `MNTZorro` once for each release
+variant, using the `define blocks from `build_variant_bitstreams.sh`. Run it
+after RTL changes, before an hours-long variant rebuild:
+```bash
+python3 test/video/run_variant_elaboration.py
+```
 
 ## Flashing
 
@@ -219,14 +297,14 @@ git push origin v2.2.0
 Tags containing `-` are marked as pre-releases.
 
 CI cannot run Vivado, so it packages variants from committed bitstreams.
-The default Zorro III bitstream is `bootimage_work/zz9000_ps_wrapper.bit`.
-The Zorro III no-RAM, Zorro II, A500, and 2MB variant bitstreams live under
-`bootimage_work/variants/`; see
-[`bootimage_work/variants/README.md`](bootimage_work/variants/README.md).
+The default Zorro III E7M bitstream is
+`bootimage_work/zz9000_ps_wrapper.bit`; the Zorro III no-RAM, A4000 C28,
+Zorro II, A500, and 2MB variants live under `bootimage_work/variants/`;
+see [`bootimage_work/variants/README.md`](bootimage_work/variants/README.md).
 Build them with `./build_variant_bitstreams.sh` on a Vivado machine.
-Tagged release builds require all listed variant bitstreams, while
-branch/PR builds package whatever is present. The deprecated
-no-USB-autoboot variant is intentionally skipped.
+Tagged release builds require all listed bitstreams; branch/PR builds
+package whatever is present. The deprecated no-USB-autoboot variant
+is intentionally skipped.
 
 ## Why `bootimage_work/` is the canonical output dir
 

@@ -69,6 +69,7 @@
  * (docs/audio-fabric.md); now advertised in the audio service word and
  * the global capability set. */
 #define SDK_CAP_AUDIO_FABRIC           (1U << 27)
+#define SDK_CAP_CONSOLE_ENCODE         (1U << 28)
 
 // SDK_OP_ALLOC_SHARED flags. HOST_WINDOW places the buffer in the
 // host-window heap so a Zorro 2 host can map it; CARD_ONLY is a
@@ -119,6 +120,7 @@
 #define SDK_SERVICE_CRYPTO             0x0800U
 #define SDK_SERVICE_DIAG               0x0900U
 #define SDK_SERVICE_VIDEO              0x0b00U
+#define SDK_SERVICE_CONSOLE            0x8200U   /* AmiNetXDuo console encoder */
 
 #define SDK_SERVICE_FLAG_FIRMWARE      (1U << 0)
 #define SDK_SERVICE_FLAG_MODULE        (1U << 1)
@@ -181,6 +183,7 @@
 #define SDK_OP_PING                    0x0002U
 #define SDK_OP_QUERY_SERVICE           0x0004U
 #define SDK_OP_QUERY_APERTURE_LAYOUT   0x0005U
+#define SDK_OP_CONSOLE_ENCODE          0x8200U
 
 #define SDK_OP_ALLOC_SHARED            0x0100U
 #define SDK_OP_FREE_SHARED             0x0101U
@@ -676,17 +679,22 @@ typedef char SDKAudioControlStateSaveStatus_must_be_at_offset_44[
 #define SDK_AUDIO_RING_CONTRACT_NONE             0U
 #define SDK_AUDIO_RING_CONTRACT_48K_STEREO_S16LE 1U
 #define SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16LE 2U
+#define SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16BE 4U
 
 /* Acquire-request flags. SOURCE_RATE makes the carved
- * source_rate_hz word meaningful: the lease delivers stereo S16LE at
+ * source_rate_hz word meaningful: the lease delivers stereo S16 at
  * that rate and the compositor converts per-slot with the qualified
- * kernel (AHI migration). The rate vocabulary is the conversion
+ * kernel (AHI migration). SOURCE_S16BE names m68k-native order; the
+ * firmware swaps before the FIR. Without that bit the source is
+ * S16LE. The rate vocabulary is the conversion
  * table: 8000/12000/24000/32000/44100/48000 Hz. Advertised through
  * SDK_SERVICE_FLAG_AUDIO_FABRIC_RATE; firmware without it still
  * rejects any nonzero flags word with SDK_STATUS_BAD_REQUEST. */
 #define SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE (1U << 0)
+#define SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE (1U << 1)
 #define SDK_AUDIO_RING_ACQUIRE_FLAG_KNOWN \
-	SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE
+	(SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE | \
+	 SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE)
 
 /* Highest leaseable direct-ring slot index. Slot 0 is the firmware
  * pump and is never granted; the acquire result's slot_count reports
@@ -1217,6 +1225,10 @@ void sdk_mailbox_irq_disable(void);
 void sdk_mailbox_task(void);
 uint16_t sdk_mailbox_status(void);
 uint32_t sdk_mailbox_address(void);
+/* Nonzero when host staging of `staged_bytes` from the start of the shared
+ * 0xa000..0xffff I/O buffer overwrote the live mailbox. Only the Zorro II
+ * mailbox lives in that buffer; storage and firmware-update staging share it. */
+int sdk_mailbox_io_staging_reaches(uint32_t staged_bytes);
 /* After a core-1 fault: mark core-1-affine audio streams faulted so their
  * feeds/reads fail cleanly (the embedded decoder may be mid-frame). */
 void sdk_mailbox_poison_core1_audio_streams(void);

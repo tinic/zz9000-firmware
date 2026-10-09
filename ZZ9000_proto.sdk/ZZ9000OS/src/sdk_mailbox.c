@@ -8,11 +8,16 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include "xil_cache.h"
+#include <rfb/rfb_encode.h>
+#include "xil_mmu.h"
 #include "xtime_l.h"
 #include "sdk_palette.h"
 #include "sdk_mailbox.h"
+#include "sdk_service_catalog.h"
 #include "sdk_compression.h"
+#include <zlib.h>
 #include "lzh/zz9k_lzh.h"
 #include "sdk_crypto.h"
 #include "sdk_offload_params.h"
@@ -70,9 +75,12 @@
  * again: a permanent stall. */
 #define SDK_AUDIO_STREAM_MIN_INPUT_BYTES (4U * 1024U)
 
-typedef char SDKMailbox_must_fit_legacy_io_window[
-	((SDK_MAILBOX_WINDOW_OFFSET + SDK_MAILBOX_TOTAL_SIZE) <= 0x00010000U) ?
+typedef char SDKMailbox_must_fit_z2_io_window[
+	((SDK_MAILBOX_Z2_WINDOW_OFFSET + SDK_MAILBOX_TOTAL_SIZE) <= 0x00010000U) ?
 	1 : -1
+];
+typedef char SDKMailbox_must_fit_z3_reservation[
+	(SDK_MAILBOX_TOTAL_SIZE <= SDK_MAILBOX_Z3_RESERVE_SIZE) ? 1 : -1
 ];
 
 struct SDKMailboxDescriptor {
@@ -135,27 +143,6 @@ struct SDKQueryApertureLayoutPayload {
 	uint8_t host_window_size[4];
 	uint8_t audio_base[4];
 	uint8_t audio_size[4];
-};
-
-struct SDKServiceInfoPayload {
-	uint8_t service_id[4];
-	uint8_t version[4];
-	uint8_t capability_bits[4];
-	uint8_t flags[4];
-	uint8_t opcode_base[4];
-	uint8_t opcode_count[4];
-	uint8_t max_inline_payload[4];
-	uint8_t name[20];
-};
-
-struct SDKServiceDescriptor {
-	uint32_t service_id;
-	uint32_t version;
-	uint32_t capability_bits;
-	uint32_t flags;
-	uint32_t opcode_base;
-	uint32_t opcode_count;
-	const char *name;
 };
 
 struct SDKAllocSharedPayload {
@@ -1211,141 +1198,6 @@ static uint32_t mailbox_capability_bits(void)
 	return capabilities;
 }
 
-static const struct SDKServiceDescriptor sdk_services[] = {
-	{
-		SDK_SERVICE_CORE,
-		0x00020000U,
-		SDK_CAP_MAILBOX | SDK_CAP_POLLING_COMPLETION |
-			SDK_CAP_SERVICE_DISCOVERY,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_CORE,
-		6,
-		"core"
-	},
-	{
-		SDK_SERVICE_MEMORY,
-		0x00020000U,
-		SDK_CAP_SHARED_ALLOC | SDK_CAP_MEMORY_OPS,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_MEMORY,
-		4,
-		"memory"
-	},
-	{
-		SDK_SERVICE_SURFACE,
-		0x00020000U,
-		SDK_CAP_SURFACES | SDK_CAP_FRAMEBUFFER_SURFACE |
-			SDK_CAP_SURFACE_OPS,
-		SDK_SERVICE_FLAG_FIRMWARE | SDK_SERVICE_FLAG_ZERO_COPY |
-			SDK_SERVICE_FLAG_SURFACE_PALETTE_QUERY,
-		SDK_SERVICE_SURFACE,
-		6,
-		"surface"
-	},
-	{
-		SDK_SERVICE_IMAGE,
-		0x00020000U,
-		SDK_CAP_IMAGE_SCALE | SDK_CAP_IMAGE_DECODE,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_IMAGE_STREAMING_INPUT |
-			SDK_SERVICE_FLAG_IMAGE_TILE_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_FRAMEBUFFER_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_BILINEAR |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_CLIPPED |
-			SDK_SERVICE_FLAG_IMAGE_PNG_DIRECT_BGRA |
-			SDK_SERVICE_FLAG_IMAGE_RGB888_OUTPUT |
-			SDK_SERVICE_FLAG_IMAGE_SCALE_BGRA_TO_RGB555_RGB565,
-		SDK_SERVICE_IMAGE,
-		8,
-		"image"
-	},
-	{
-		SDK_SERVICE_CODEC,
-		0x00020000U,
-		SDK_CAP_COMPRESSION,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_CODEC_DEFLATE_RAW |
-			SDK_SERVICE_FLAG_CODEC_ZLIB |
-			SDK_SERVICE_FLAG_CODEC_GZIP |
-			SDK_SERVICE_FLAG_CODEC_LZMA_ALONE |
-			SDK_SERVICE_FLAG_CODEC_LZMA2 |
-			SDK_SERVICE_FLAG_CODEC_CHECKSUM |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_TEST |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_STREAM |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_FEED |
-			SDK_SERVICE_FLAG_CODEC_DEFLATE_FEED |
-			SDK_SERVICE_FLAG_CODEC_ZLIB_FEED |
-			SDK_SERVICE_FLAG_CODEC_GZIP_FEED |
-			SDK_SERVICE_FLAG_CODEC_LZH |
-			SDK_SERVICE_FLAG_CODEC_DECOMPRESS_BATCH,
-		SDK_SERVICE_CODEC,
-		7,	/* 0x0600..0x0606 incl. SDK_OP_DECOMPRESS_BATCH */
-		"codec"
-	},
-	{
-		SDK_SERVICE_AUDIO,
-		0x00020001U,
-		SDK_CAP_AUDIO_DECODE | SDK_CAP_AUDIO_PLAYBACK |
-			SDK_CAP_AUDIO_CONTROL | SDK_CAP_AUDIO_METERING |
-			SDK_CAP_AUDIO_FABRIC,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_AUDIO_MP3_DECODE |
-			SDK_SERVICE_FLAG_AUDIO_MP3_STREAM |
-			SDK_SERVICE_FLAG_AUDIO_CONTROL |
-			SDK_SERVICE_FLAG_AUDIO_FABRIC |
-			SDK_SERVICE_FLAG_AUDIO_FABRIC_RATE,
-		21,	/* 0x0500..0x0514 incl. audio control plane and the
-			 * fabric lease plane (0x0512-0x0514; 0x050f..0x0511
-			 * reserved gaps); the on-hardware qualification gate
-			 * passed 2026-08-28 (docs/audio-fabric.md), so the
-			 * lease opcodes are counted and advertised */
-		"audio"
-	},
-	{
-		SDK_SERVICE_CRYPTO,
-		0x00020000U,
-		SDK_CAP_CRYPTO,
-		SDK_SERVICE_FLAG_FIRMWARE | SDK_SERVICE_FLAG_CRYPTO_X25519 |
-			SDK_SERVICE_FLAG_CRYPTO_P256 |
-			SDK_SERVICE_FLAG_CRYPTO_P256_KEYGEN |
-			SDK_SERVICE_FLAG_CRYPTO_ECDSA_P256 |
-			SDK_SERVICE_FLAG_CRYPTO_RSA_2048 |
-			SDK_SERVICE_FLAG_CRYPTO_AES_GCM,
-		SDK_SERVICE_CRYPTO,
-		5,
-		"crypto"
-	},
-	{
-		SDK_SERVICE_DIAG,
-		0x00020000U,
-		SDK_CAP_DIAGNOSTICS,
-		SDK_SERVICE_FLAG_FIRMWARE,
-		SDK_SERVICE_DIAG,
-		4,
-		"diag"
-	},
-	{
-		SDK_SERVICE_VIDEO,
-		0x00020000U,
-		SDK_CAP_VIDEO_DECODE | SDK_CAP_MEDIA_SESSION,
-		SDK_SERVICE_FLAG_FIRMWARE |
-			SDK_SERVICE_FLAG_ASYNC |
-			SDK_SERVICE_FLAG_VIDEO_MPEG1 |
-			SDK_SERVICE_FLAG_VIDEO_MPEG_PS |
-			SDK_SERVICE_FLAG_VIDEO_DIRECT_OVERLAY |
-			SDK_SERVICE_FLAG_VIDEO_STREAMING_INPUT |
-			SDK_SERVICE_FLAG_VIDEO_CORE1 |
-			SDK_SERVICE_FLAG_VIDEO_MEDIA_SESSION |
-			SDK_SERVICE_FLAG_VIDEO_MEDIA_MP2 |
-			SDK_SERVICE_FLAG_VIDEO_EXPLICIT_PRESENT |
-			SDK_SERVICE_FLAG_VIDEO_TIMELINE_90KHZ |
-			SDK_SERVICE_FLAG_VIDEO_PCM_RING_STATUS,
-		SDK_SERVICE_VIDEO,
-		14,
-		"video"
-	}
-};
-
 static inline uint16_t get_be16(const volatile void *p)
 {
 	const volatile uint8_t *b = (const volatile uint8_t *)p;
@@ -1431,9 +1283,14 @@ static void record_request_timing(uint32_t opcode, uint32_t elapsed_us)
 	}
 }
 
+/* ARM address of the live mailbox; chosen per bus by sdk_mailbox_init()
+ * (see SDK_MAILBOX_Z3_ADDRESS in memorymap.h) and stable for the lifetime
+ * that init starts. Read/written by core 0 only. */
+static uintptr_t mailbox_base = SDK_MAILBOX_Z2_ADDRESS;
+
 static inline volatile struct SDKMailboxDescriptor *descriptor(void)
 {
-	return (volatile struct SDKMailboxDescriptor *)SDK_MAILBOX_ADDRESS;
+	return (volatile struct SDKMailboxDescriptor *)mailbox_base;
 }
 
 void sdk_mailbox_refresh_capabilities(void)
@@ -1448,13 +1305,13 @@ void sdk_mailbox_refresh_capabilities(void)
 static inline volatile struct SDKMailboxEntry *request_ring(void)
 {
 	return (volatile struct SDKMailboxEntry *)
-		(SDK_MAILBOX_ADDRESS + SDK_MAILBOX_REQUEST_OFFSET);
+		(mailbox_base + SDK_MAILBOX_REQUEST_OFFSET);
 }
 
 static inline volatile struct SDKMailboxEntry *completion_ring(void)
 {
 	return (volatile struct SDKMailboxEntry *)
-		(SDK_MAILBOX_ADDRESS + SDK_MAILBOX_COMPLETION_OFFSET);
+		(mailbox_base + SDK_MAILBOX_COMPLETION_OFFSET);
 }
 
 static uint32_t next_index(uint32_t index)
@@ -1509,30 +1366,6 @@ static void copy_payload(volatile uint8_t *dst, const volatile uint8_t *src,
 	uint32_t i;
 	for (i = 0; i < length; i++)
 		dst[i] = src[i];
-}
-
-static void copy_name(volatile uint8_t *dst, const char *src)
-{
-	uint32_t i;
-
-	for (i = 0; i < 20U; i++) {
-		if (src && src[i] != '\0')
-			dst[i] = (uint8_t)src[i];
-		else
-			dst[i] = 0;
-	}
-}
-
-static const struct SDKServiceDescriptor *find_service(uint32_t service_id)
-{
-	uint32_t i;
-
-	for (i = 0; i < sizeof(sdk_services) / sizeof(sdk_services[0]); i++) {
-		if (sdk_services[i].service_id == service_id)
-			return &sdk_services[i];
-	}
-
-	return 0;
 }
 
 static uint32_t service_flags(const struct SDKServiceDescriptor *service)
@@ -2508,11 +2341,16 @@ static int fill_framebuffer_surface(struct SDKSurface *surface_info)
 	                        state->framebuffer_pan_offset;
 	surface_info->width = state->vmode_hsize ?
 	                      state->vmode_hsize : (uint32_t)mode->hres;
-	surface_info->height = state->vmode_vsize ?
-	                       state->vmode_vsize : (uint32_t)mode->vres;
+	surface_info->height = state->vmode_vdma_rows;
+	if (!surface_info->height) {
+		surface_info->height = state->vmode_vsize ?
+		                       state->vmode_vsize :
+		                       (uint32_t)mode->vres;
+		surface_info->height /=
+			video_vertical_scale_factor(state->scalemode);
+	}
 	if (state->scalemode & 1)
 		surface_info->width /= 2U;
-	surface_info->height /= video_vertical_scale_factor(state->scalemode);
 	if (surface_info->width == 0 || surface_info->height == 0)
 		return 0;
 
@@ -4422,6 +4260,9 @@ static uint16_t handle_audio_ring_acquire(
 	if (gain > 255U ||
 	    (flags & ~SDK_AUDIO_RING_ACQUIRE_FLAG_KNOWN) != 0U)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U &&
+	    (flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) == 0U)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
 	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) != 0U) {
 		if (rate != 8000U && rate != 12000U && rate != 24000U &&
 		    rate != 32000U && rate != 44100U && rate != 48000U)
@@ -4440,6 +4281,8 @@ static uint16_t handle_audio_ring_acquire(
 		return complete_status(req, comp, SDK_STATUS_UNSUPPORTED);
 	if (rc != AUDIO_FABRIC_LEASE_OK)
 		return complete_status(req, comp, SDK_STATUS_BUSY);
+	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U)
+		audio_fabric_lease_source_be(slot, 1);
 	write_completion(comp, req, SDK_STATUS_OK, sizeof(*result));
 	memset((void *)comp->payload, 0, sizeof(comp->payload));
 	result = (volatile struct SDKAudioRingAcquireResultPayload *)
@@ -4459,7 +4302,9 @@ static uint16_t handle_audio_ring_acquire(
 	put_be32(result->period_us, SDK_AUDIO_RING_PERIOD_US);
 	if ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_RATE) != 0U) {
 		put_be32(result->sample_contract,
-		         SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16LE);
+		         ((flags & SDK_AUDIO_RING_ACQUIRE_FLAG_SOURCE_S16BE) != 0U)
+		             ? SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16BE
+		             : SDK_AUDIO_RING_CONTRACT_SOURCE_RATE_STEREO_S16LE);
 		put_be32(result->source_rate, rate);
 	} else {
 		put_be32(result->sample_contract,
@@ -7499,7 +7344,7 @@ static uint16_t handle_diag_read(volatile struct SDKMailboxEntry *req,
 	put_be32(diag->shared_heap_total, SDK_SHARED_HEAP_SIZE);
 	put_be32(diag->shared_heap_free, free_total);
 	put_be32(diag->shared_heap_largest_free, largest_free);
-	put_be32(diag->mailbox_arm_addr, SDK_MAILBOX_ADDRESS);
+	put_be32(diag->mailbox_arm_addr, (uint32_t)mailbox_base);
 	put_be32(diag->mailbox_ring_entries, SDK_MAILBOX_RING_ENTRIES);
 	put_be32(diag->surfaces_used, count_used_surfaces());
 	put_be32(diag->allocator_invalid_slots, invalid_slots);
@@ -7632,6 +7477,7 @@ static uint16_t handle_query_service(volatile struct SDKMailboxEntry *req,
 	volatile struct SDKServiceInfoPayload *info;
 	const struct SDKServiceDescriptor *service;
 	uint32_t service_id;
+	uint32_t capabilities;
 
 	if (payload_len < 4U)
 		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
@@ -7643,25 +7489,16 @@ static uint16_t handle_query_service(volatile struct SDKMailboxEntry *req,
 		return complete_status(req, comp, SDK_STATUS_NOT_FOUND);
 
 	write_completion(comp, req, SDK_STATUS_OK, sizeof(*info));
-	memset((void *)comp->payload, 0, sizeof(comp->payload));
 	info = (volatile struct SDKServiceInfoPayload *)comp->payload;
-	put_be32(info->service_id, service->service_id);
-	put_be32(info->version, service->version);
-	{
-		uint32_t capabilities = service->capability_bits;
-		if (service->service_id == SDK_SERVICE_CORE)
-			capabilities |= mailbox_capability_bits() &
-				SDK_CAP_APERTURE_LAYOUT;
-		if (service->service_id == SDK_SERVICE_MEMORY)
-			capabilities |= mailbox_capability_bits() &
-				SDK_CAP_HOST_WINDOW_HEAP;
-		put_be32(info->capability_bits, capabilities);
-	}
-	put_be32(info->flags, service_flags(service));
-	put_be32(info->opcode_base, service->opcode_base);
-	put_be32(info->opcode_count, service->opcode_count);
-	put_be32(info->max_inline_payload, sizeof(req->payload));
-	copy_name(info->name, service->name);
+	capabilities = service->capability_bits;
+	if (service->service_id == SDK_SERVICE_CORE)
+		capabilities |= mailbox_capability_bits() &
+			SDK_CAP_APERTURE_LAYOUT;
+	if (service->service_id == SDK_SERVICE_MEMORY)
+		capabilities |= mailbox_capability_bits() &
+			SDK_CAP_HOST_WINDOW_HEAP;
+	sdk_service_write_info(info, service, capabilities, service_flags(service),
+			       sizeof(req->payload));
 	return SDK_STATUS_OK;
 }
 
@@ -7716,6 +7553,337 @@ static int opcode_reserves_request_id_zero(uint16_t opcode)
 		return 0;
 	}
 }
+
+/* ==== AmiNetXDuo console encoder (vendor service 0x8200) ===================
+ * Offload of the httpd web-console framebuffer encode.  The 68k host maps the
+ * displayed framebuffer, allocates a shared output buffer, and sends one
+ * tile-row band [ty0,ty1) per call together with the encoder geometry it
+ * configured; we run the shared RFB encoder (src/rfb, byte-identical to the
+ * 68k fallback path) over the framebuffer into that buffer.  Wire contract:
+ * AmiNetXDuo src/tools/httpzz.h (HttpZzEncodeReq/Reply), all ints big-endian,
+ * fields at fixed offsets (the layout is asserted host-side). */
+#define HTTPZZ_F_RESET      0x0001u   /* drop the delta baseline (keyframe) */
+#define HTTPZZ_RF_KEYFRAME  0x0001u
+#define HTTPZZ_CODEC_NONE   0u
+
+static rfb_encoder cenc_enc;
+static rfb_geom    cenc_geom;
+static rfb_u32     cenc_flags;
+static rfb_u8     *cenc_shadow;
+static rfb_u8     *cenc_scratch;
+static uint32_t    cenc_shadow_len;
+static uint32_t    cenc_scratch_len;
+static int         cenc_ready;
+static rfb_u8     *cenc_snap;       /* one coherent whole-frame copy per pass */
+static uint32_t    cenc_snap_len;
+
+/* A 32-bit screen (BGRA8888: memory bytes B, G, R, A) served as RGB565, the
+ * wire's truecolour format, big-endian.  Converting while the snapshot is
+ * taken costs the ARM about what the copy did; without it the host reads four
+ * bytes a pixel over Zorro and converts every one on the 68k. */
+static void cenc_snap_bgra_rgb565(rfb_u8 *dst, uint32_t dst_pitch,
+                                  const uint8_t *src, uint32_t src_pitch,
+                                  uint32_t width, uint32_t height)
+{
+	uint32_t y;
+
+	for (y = 0u; y < height; y++) {
+		const uint8_t *s = src + y * src_pitch;
+		rfb_u8 *d = dst + y * dst_pitch;
+		uint32_t x;
+
+		for (x = 0u; x < width; x++, s += 4, d += 2) {
+			uint32_t v = ((uint32_t)(s[2] & 0xf8u) << 8) |
+			             ((uint32_t)(s[1] & 0xfcu) << 3) |
+			             ((uint32_t)s[0] >> 3);
+			d[0] = (rfb_u8)(v >> 8);
+			d[1] = (rfb_u8)v;
+		}
+	}
+}
+/* The snapshot was taken by a band 0 under the current geometry and covers
+ * it.  Cleared when the geometry changes: a later band of a new geometry
+ * must not encode from a copy of the old, smaller frame. */
+static int         cenc_snap_ok;
+/* The client the encoder state belongs to, by its output buffer: the
+ * request has no session field, and each client allocates its own shared
+ * buffer.  Another buffer is another client. */
+static uint32_t    cenc_owner;
+static uint8_t    *cenc_defl;        /* per-message deflate scratch */
+static uint32_t    cenc_defl_len;
+
+static int cenc_geom_same(const rfb_geom *a, const rfb_geom *b)
+{
+	return a->width == b->width && a->height == b->height &&
+	       a->bytes_per_row == b->bytes_per_row && a->depth == b->depth &&
+	       a->tile_w == b->tile_w && a->tile_h == b->tile_h &&
+	       a->format == b->format;
+}
+
+/* (Re)configure the persistent encoder for geometry g + flags.  The sequence
+ * number is preserved across a reconfigure so the viewer never sees a spurious
+ * gap.  Returns 1 on success, 0 if geometry is unusable or memory is short. */
+static int cenc_configure(const rfb_geom *g, rfb_u32 flags)
+{
+	rfb_scroll_cfg cfg;
+	uint32_t shadow_len;
+	uint32_t scratch_len;
+	rfb_u16 seq_keep = cenc_ready ? cenc_enc.seq : 0;
+
+	rfb_scroll_defaults(&cfg);
+	shadow_len = rfb_shadow_size(g);
+	scratch_len = rfb_scratch_size(g, flags, &cfg);
+	if (shadow_len == 0u || scratch_len == 0u)
+		return 0;
+
+	/* Build the replacement first and swap only on success.  Freeing
+	 * the old buffers before the new ones existed left cenc_ready and the
+	 * encoder pointing at freed memory when an allocation failed. */
+	{
+		rfb_u8 *shadow = cenc_shadow;
+		rfb_u8 *scratch = cenc_scratch;
+		rfb_encoder enc;
+
+		if (shadow_len != cenc_shadow_len)
+			shadow = (rfb_u8 *)malloc(shadow_len);
+		if (scratch_len != cenc_scratch_len)
+			scratch = (rfb_u8 *)malloc(scratch_len);
+		if (!shadow || !scratch) {
+			if (shadow && shadow != cenc_shadow)
+				free(shadow);
+			if (scratch && scratch != cenc_scratch)
+				free(scratch);
+			cenc_ready = 0;		/* the old state stays allocated, unused */
+			return 0;
+		}
+
+		/* Zeroed shadow => the first band codes as a full frame from the
+		 * same all-zero the viewer starts from. */
+		memset(shadow, 0, shadow_len);
+		if (rfb_encoder_init(&enc, g, flags, &cfg, shadow, shadow_len,
+		                     scratch, scratch_len) != 0) {
+			if (shadow != cenc_shadow)
+				free(shadow);
+			if (scratch != cenc_scratch)
+				free(scratch);
+			cenc_ready = 0;
+			return 0;
+		}
+
+		if (shadow != cenc_shadow) {
+			free(cenc_shadow);
+			cenc_shadow = shadow;
+			cenc_shadow_len = shadow_len;
+		}
+		if (scratch != cenc_scratch) {
+			free(cenc_scratch);
+			cenc_scratch = scratch;
+			cenc_scratch_len = scratch_len;
+		}
+		cenc_enc = enc;
+	}
+
+	/* A new geometry voids the snapshot; a reset of the same one (the
+	 * viewer's refresh, which may arrive on any band) does not. */
+	if (!cenc_ready || !cenc_geom_same(g, &cenc_geom))
+		cenc_snap_ok = 0;
+	cenc_enc.seq = seq_keep;
+	cenc_geom = *g;
+	cenc_flags = flags;
+	cenc_ready = 1;
+	return 1;
+}
+
+static uint16_t handle_console_encode(volatile struct SDKMailboxEntry *req,
+                                      volatile struct SDKMailboxEntry *comp,
+                                      uint16_t payload_len)
+{
+	const volatile uint8_t *p = req->payload;
+	uint32_t surface_handle;
+	uint32_t out_handle;
+	uint32_t out_capacity;
+	uint32_t enc_flags;
+	uint16_t width, height, bpr, ty0, ty1, rflags;
+	uint8_t conv;
+	struct SDKSurface fb;
+	struct SDKSharedBuffer *out;
+	rfb_geom g;
+	const rfb_u8 *planes[1];
+	rfb_u8 *outp;
+	long n;
+	int reinit = 0;
+	uint16_t reply_flags = 0;
+
+	if (payload_len < 34u)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	surface_handle = get_be32(p + 0);
+	out_handle     = get_be32(p + 4);
+	out_capacity   = get_be32(p + 8);
+	enc_flags      = get_be32(p + 12);
+	width          = get_be16(p + 16);
+	height         = get_be16(p + 18);
+	bpr            = get_be16(p + 20);
+	ty0            = get_be16(p + 22);
+	ty1            = get_be16(p + 24);
+	rflags         = get_be16(p + 26);
+	/* p+28 codec (requested wire codec) -- v1 answers NONE only */
+	g.depth  = p[30];
+	g.tile_w = p[31];
+	g.tile_h = p[32];
+	g.format = p[33];
+
+	/* The surface the host mapped (ZZ9KMapFramebufferSurface).  A
+	 * stale handle is refused rather than quietly replaced by whatever the
+	 * display shows now, so the caller knows which pixels it would get; it
+	 * maps the framebuffer again, or falls back to its own encoder. */
+	if (!get_surface_info(surface_handle, &fb))
+		return complete_status(req, comp, SDK_STATUS_BAD_HANDLE);
+
+	out = find_shared_buffer(out_handle);
+	if (!out || out_capacity == 0u || !buffer_range_valid(out, 0u, out_capacity))
+		return complete_status(req, comp, SDK_STATUS_BAD_HANDLE);
+
+	/* The host frames bands from the geometry it sent; it must match the real
+	 * surface or the pixel stride and tiling disagree.  Mismatch => let the
+	 * host fall back to its own encode. */
+	/* RGB565 asked of a 32-bit screen is converted into the snapshot, whose
+	 * rows are the host's (bpr), not the card's. */
+	conv = (uint8_t)(g.format == RFB_FMT_RGB565 &&
+	                 fb.format == SDK_SURFACE_FORMAT_BGRA8888);
+	if (width != fb.width || height != fb.height ||
+	    (!conv && bpr != fb.pitch) ||
+	    (conv && (uint32_t)width * 4u > fb.pitch))
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	g.width = width;
+	g.height = height;
+	g.bytes_per_row = bpr;
+
+	/* The encoder is handed one plane, the snapshot, so only the
+	 * chunky formats are served (one plane whatever the depth); a planar
+	 * request would make it read planes[1..depth-1], which do not exist.
+	 * For chunky formats depth is bits per pixel (8 CLUT8, 16 RGB565) and
+	 * must agree with the format, whose pixel size must be the
+	 * framebuffer's. */
+	if (!RFB_FMT_IS_CHUNKY(g.format) ||
+	    g.depth != 8u * RFB_FMT_PIXEL_BYTES(g.format) ||
+	    (!conv &&
+	     RFB_FMT_PIXEL_BYTES(g.format) != surface_format_bytes(fb.format)) ||
+	    (uint32_t)width * RFB_FMT_PIXEL_BYTES(g.format) > bpr ||
+	    (!conv && (uint32_t)height * bpr > fb.length) ||
+	    (conv && (uint32_t)height * fb.pitch > fb.length))
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	/* One encoder, one owner.  A request through another output
+	 * buffer starts a new session from a zeroed shadow and a fresh band 0,
+	 * so no client is sent deltas computed against another's screen state. */
+	if (cenc_ready && out_handle != cenc_owner) {
+		cenc_ready = 0;
+		cenc_snap_ok = 0;
+	}
+
+	if (!cenc_ready || cenc_flags != enc_flags ||
+	    !cenc_geom_same(&g, &cenc_geom) || (rflags & HTTPZZ_F_RESET)) {
+		if (!cenc_configure(&g, enc_flags))
+			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
+		cenc_owner = out_handle;
+		reinit = 1;
+	}
+
+	/* One coherent snapshot of the whole framebuffer per pass.  The card reads
+	 * the live framebuffer and an encode spans ~10-30 ms -- long enough for a
+	 * dragged window to smear across it.  A single memcpy is a ~1 ms read that a
+	 * drag cannot noticeably move, so band 0 copies the frame and every band of
+	 * the pass encodes off the stable copy: clean AND live, no layer lock. */
+	if (ty0 == 0) {
+		uint32_t snap_need = conv ? (uint32_t)height * bpr : fb.length;
+
+		if (cenc_snap_len < snap_need) {
+			free(cenc_snap);
+			cenc_snap = (rfb_u8 *)malloc(snap_need);
+			cenc_snap_len = cenc_snap ? snap_need : 0u;
+		}
+		if (!cenc_snap)
+			return complete_status(req, comp, SDK_STATUS_NO_MEMORY);
+		/* Read the live RTG framebuffer COHERENTLY -- do NOT invalidate.
+		 * The Amiga's RTG pixel writes enter the PS through the cache-coherent
+		 * ACP port (MNTZorro m00_axi, AWCACHE=0x3), so they snoop/update the ARM
+		 * caches directly while DDR can stay stale.  An invalidate here would
+		 * DISCARD those freshly host-written lines and re-read stale DDR -- the
+		 * "top rows live, everything below frozen" bug.  This matches overlay.c
+		 * overlay_run_compose(), which reads this exact address with no
+		 * invalidate; whole-frame coherency is kept by the per-vblank
+		 * Xil_L1DCacheFlush()/Xil_L2CacheFlush() in video.c's isr_video(). */
+		if (conv)
+			cenc_snap_bgra_rgb565(cenc_snap, bpr,
+			                      (const uint8_t *)(uintptr_t)fb.address,
+			                      fb.pitch, width, height);
+		else
+			memcpy(cenc_snap, (const void *)(uintptr_t)fb.address,
+			       fb.length);
+		cenc_snap_ok = 1;
+	}
+	/* A band past 0 encodes from the snapshot its pass's band 0 took; with
+	 * none since the last reconfigure there is nothing valid to read. */
+	if (!cenc_snap || !cenc_snap_ok ||
+	    cenc_snap_len < (uint32_t)height * bpr)
+		return complete_status(req, comp, SDK_STATUS_BAD_REQUEST);
+
+	planes[0] = (const rfb_u8 *)cenc_snap;
+	outp = (rfb_u8 *)(uintptr_t)out->address;
+	n = rfb_encode_band(&cenc_enc, planes, outp, out_capacity, ty0, ty1);
+	if (n < 0) {
+		/* The encoder may already have advanced its sequence and
+		 * shadow for bytes that were never delivered.  An error therefore
+		 * ends the session: the next request reconfigures from a zeroed
+		 * shadow, and the caller restarts from band 0 with
+		 * HTTPZZ_F_RESET, which yields a keyframe -- never a retry of the
+		 * same band against a half-applied delta. */
+		cenc_ready = 0;
+		return complete_status(req, comp, SDK_STATUS_INTERNAL_ERROR);
+	}
+
+	/* Deflate the ops payload (everything after the 4-byte header) in place, so
+	 * the wire carries the header raw -- version/flags/seq stay readable for the
+	 * viewer's seq-gap recovery -- and the compressed body follows.  The ARM has
+	 * spare cycles; the 68030 does not, which is exactly why compressing here
+	 * (not host-side) is the right place.  flags bit 0 tells the viewer to
+	 * inflate.  Kept raw if compression does not shrink it (tiny bands). */
+	if (n > 4L) {
+		uLong bound = compressBound((uLong)(n - 4L));
+		if (cenc_defl_len < (uint32_t)bound) {
+			free(cenc_defl);
+			cenc_defl = (uint8_t *)malloc(bound);
+			cenc_defl_len = cenc_defl ? (uint32_t)bound : 0u;
+		}
+		if (cenc_defl) {
+			uLongf clen = (uLongf)cenc_defl_len;
+			if (compress2(cenc_defl, &clen, (const Bytef *)(outp + 4),
+			              (uLong)(n - 4L), 6) == Z_OK &&
+			    (long)(4UL + clen) < n) {
+				memcpy(outp + 4, cenc_defl, clen);
+				outp[1] |= 0x01u;          /* flags: ops are zlib-deflated */
+				n = (long)(4UL + clen);
+			}
+		}
+	}
+
+	/* Publish to the 68k: flush the written span (Xil_DCacheFlushRange ends in
+	 * a DSB, so the store is ordered before the completion is posted). */
+	Xil_DCacheFlushRange((INTPTR)(uintptr_t)outp, (uint32_t)n);
+
+	if (reinit && ty0 == 0)
+		reply_flags |= HTTPZZ_RF_KEYFRAME;
+
+	write_completion(comp, req, SDK_STATUS_OK, 8);
+	memset((void *)comp->payload, 0, sizeof(comp->payload));
+	put_be32(comp->payload + 0, (uint32_t)n);        /* out_len */
+	put_be16(comp->payload + 4, HTTPZZ_CODEC_NONE);  /* codec   */
+	put_be16(comp->payload + 6, reply_flags);        /* flags   */
+	return SDK_STATUS_OK;
+}
+
 
 static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
                                volatile struct SDKMailboxEntry *comp,
@@ -7869,6 +8037,8 @@ static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
 		return handle_decompress_stream_close(req, comp, payload_len);
 	case SDK_OP_DECOMPRESS_BATCH:
 		return handle_decompress_batch(req, comp, payload_len);
+	case SDK_OP_CONSOLE_ENCODE:
+		return handle_console_encode(req, comp, payload_len);
 	case SDK_OP_CRYPTO_HASH:
 		return handle_crypto_hash(req, comp, payload_len);
 	case SDK_OP_CRYPTO_STREAM:
@@ -7893,9 +8063,36 @@ static uint16_t handle_request(volatile struct SDKMailboxEntry *req,
 	}
 }
 
+/* Zorro III keeps the mailbox out of the shared I/O buffer that USB proxy,
+ * zzsd and firmware-update staging overwrite (issue #129). The bus is fixed
+ * by the bitstream, so the placement never changes under a live client. */
+static void select_mailbox_placement(void)
+{
+	static uint8_t z3_section_uncached;
+
+	if (!sdk_aperture_runtime_is_zorro3()) {
+		mailbox_base = SDK_MAILBOX_Z2_ADDRESS;
+		return;
+	}
+	if (!z3_section_uncached) {
+		/* ax.c remaps this same section for the Z3 direct rings when
+		 * audio starts; remapping it twice is harmless. */
+		Xil_SetTlbAttributes((UINTPTR)SDK_MAILBOX_Z3_ADDRESS,
+		                     NORM_NONCACHE);
+		z3_section_uncached = 1U;
+	}
+	mailbox_base = SDK_MAILBOX_Z3_ADDRESS;
+}
+
+int sdk_mailbox_io_staging_reaches(uint32_t staged_bytes)
+{
+	return mailbox_base == SDK_MAILBOX_Z2_ADDRESS &&
+	       staged_bytes > SDK_MAILBOX_Z2_BUFFER_OFFSET;
+}
+
 void sdk_mailbox_init(void)
 {
-	volatile struct SDKMailboxDescriptor *desc = descriptor();
+	volatile struct SDKMailboxDescriptor *desc;
 
 	/* Drain any in-flight core-1 task before we tear the mailbox down. A task
 	 * still executing on core 1 is mid-write into its resolved data buffers;
@@ -7909,7 +8106,9 @@ void sdk_mailbox_init(void)
 	 * queue and will never post their deferred completion */
 	overlay_scheduler_reset();
 
-	memset((void *)SDK_MAILBOX_ADDRESS, 0, SDK_MAILBOX_TOTAL_SIZE);
+	select_mailbox_placement();
+	desc = descriptor();
+	memset((void *)mailbox_base, 0, SDK_MAILBOX_TOTAL_SIZE);
 	put_be32(desc->magic, SDK_MAILBOX_MAGIC);
 	put_be16(desc->abi_major, SDK_MAILBOX_ABI_MAJOR);
 	put_be16(desc->abi_minor, SDK_MAILBOX_ABI_MINOR);
@@ -7996,7 +8195,7 @@ void sdk_mailbox_init(void)
 	sdk_media_session_init();
 	amiga_interrupt_clear(AMIGA_INTERRUPT_SDK);
 
-	Xil_DCacheFlushRange(SDK_MAILBOX_ADDRESS, SDK_MAILBOX_TOTAL_SIZE);
+	Xil_DCacheFlushRange(mailbox_base, SDK_MAILBOX_TOTAL_SIZE);
 	__asm__ __volatile__("dsb" ::: "memory");
 }
 
@@ -8061,7 +8260,7 @@ void sdk_mailbox_task(void)
 	 * completion ring appear full. ARM-owned descriptor/completion writes
 	 * are flushed at their write sites.
 	 */
-	Xil_DCacheInvalidateRange(SDK_MAILBOX_ADDRESS, SDK_MAILBOX_TOTAL_SIZE);
+	Xil_DCacheInvalidateRange(mailbox_base, SDK_MAILBOX_TOTAL_SIZE);
 	__asm__ __volatile__("dsb" ::: "memory");
 
 	if (!descriptor_valid(desc)) {
@@ -8272,5 +8471,5 @@ uint16_t sdk_mailbox_status(void)
 
 uint32_t sdk_mailbox_address(void)
 {
-	return SDK_MAILBOX_ADDRESS;
+	return (uint32_t)mailbox_base;
 }

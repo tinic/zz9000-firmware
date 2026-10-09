@@ -65,7 +65,7 @@ enum zz_reg_offsets {
   REG_ZZ_SPRITE_BITMAP  = 0x48,
   REG_ZZ_SPRITE_COLORS  = 0x4A,
   REG_ZZ_VBLANK_STATUS  = 0x4C,
-  REG_ZZ_UNUSED_REG4E   = 0x4E,
+  REG_ZZ_VIDEOCAP_STATS = 0x4E,
 
   REG_ZZ_SCRATCH_COPY   = 0x50,
   REG_ZZ_CVMODE_PARAM   = 0x52,
@@ -80,9 +80,15 @@ enum zz_reg_offsets {
   REG_ZZ_UNUSED_REG62   = 0x62,
   REG_ZZ_UNUSED_REG64   = 0x64,
   REG_ZZ_UNUSED_REG66   = 0x66,
-  REG_ZZ_UNUSED_REG68   = 0x68,
+  /* read: asynchronous-send status, bit 15 = present, 14..0 frames done
+     (ethernet.h ETH_TX_ASYNC).  Its own aligned register: the value is the
+     high half of the longword the read switch answers with. */
+  REG_ZZ_ETH_TX_STATUS  = 0x68,
   REG_ZZ_UNUSED_REG6A   = 0x6A,
-  REG_ZZ_UNUSED_REG6C   = 0x6C,
+  /* read: receive capacity, bit 15 = present, bits 14..0 = frames the
+     firmware takes from the wire without dropping or pausing (ethernet.h
+     ETH_RX_FRAMES_*).  Aligned register: the value is the high half. */
+  REG_ZZ_ETH_RX_FRAMES  = 0x6C,
   REG_ZZ_UNUSED_REG6E   = 0x6E,
 
   REG_ZZ_AUDIO_SWAB     = 0x70,
@@ -99,7 +105,8 @@ enum zz_reg_offsets {
   REG_ZZ_ETH_MAC_HI     = 0x84,
   REG_ZZ_ETH_MAC_HI2    = 0x86,
   REG_ZZ_ETH_MAC_LO     = 0x88,
-  REG_ZZ_UNUSED_REG8A   = 0x8A,
+  /* Read: capability bits. Write: multicast hash set/clear/reset command. */
+  REG_ZZ_ETH_CONFIG     = 0x8A,
   REG_ZZ_ETH_RX_STATUS  = 0x8C,
   REG_ZZ_ETH_RX_STATS   = 0x8E,
 
@@ -115,7 +122,9 @@ enum zz_reg_offsets {
   REG_ZZ_ARM_ARGV5      = 0xA0,
   REG_ZZ_ARM_ARGV6      = 0xA2,
   REG_ZZ_ARM_ARGV7      = 0xA4,
-  REG_ZZ_UNUSED_REGA6   = 0xA6,
+  /* read: GEM checksum capabilities and the presented frame's RX verdict
+     (ethernet.h ETH_RX_META_*); the low half of the 0xA4 longword. */
+  REG_ZZ_ETH_RX_META    = 0xA6,
   REG_ZZ_UNUSED_REGA8   = 0xA8,
   REG_ZZ_UNUSED_REGAA   = 0xAA,
   REG_ZZ_UNUSED_REGAC   = 0xAC,
@@ -174,7 +183,12 @@ enum zz_reg_offsets {
   REG_ZZ_AUDIO_CONFIG   = 0xF4,
   REG_ZZ_AUDIO_RX_STATUS = 0xF6,
   REG_ZZ_AUDIO_TX_STATUS = 0xF8,
-  REG_ZZ_UNUSED_REGFA   = 0xFA,
+  /* Allocation-clear protocol handshake (firmware 2.8.1): the RTG
+   * driver writes the token once at init; until then the firmware
+   * zero-fills every ACC surface unconditionally (legacy drivers
+   * leave stale DrawLine padding in u8_user[3] and must keep the
+   * always-clear behavior their ABMA_Clear relies on). */
+  REG_ZZ_ALLOC_CLEAR_PROTOCOL = 0xFA,
   REG_ZZ_DEBUG          = 0xFC,
   REG_ZZ_DEBUG_TIMER    = 0xFE,
 
@@ -190,6 +204,10 @@ enum zz_reg_offsets {
   REG_ZZ_SDK_DIAG_ZADDR = 0x118,
 };
 
+/* Token written by the RTG driver to REG_ZZ_ALLOC_CLEAR_PROTOCOL at
+ * init to activate the conditional ACC surface clear. */
+#define ZZ_REG_ZZ_ALLOC_CLEAR_TOKEN 0x5AC1U
+
 #define ZZ_FW_CAP_VIDEOCAP_PROFILE (1U << 0)
 #define ZZ_FW_CAP_VIDEOCAP_LIVE    (1U << 1)
 #define ZZ_FW_CAP_Z2_APERTURE_LAYOUT (1U << 2)
@@ -197,6 +215,9 @@ enum zz_reg_offsets {
 #define ZZ_FW_CAP_VIDEOCAP_CENTERED_1080P_50 (1U << 4)
 #define ZZ_FW_CAP_VIDEOCAP_SOURCE_SYNC (1U << 5)
 #define ZZ_FW_CAP_VIDEOCAP_SCANOUT_ORIGIN (1U << 6)
+#define ZZ_FW_CAP_VIDEOCAP_GEOMETRY (1U << 8)
+#define ZZ_FW_CAP_VIDEOCAP_STATS (1U << 9)
+#define ZZ_FW_CAP_VIDEOCAP_GEOMETRY_ACK (1U << 10)
 /* The centered 1080p profiles are intentionally excluded here: firmware
  * advertises them dynamically only when the loaded bitstream exposes both
  * required paths (viewport layout AND full-rate capture). Bit 3 stays the
@@ -217,6 +238,28 @@ enum zz_reg_offsets {
  * (IDLE/OK/INVALID/CLOCK_FAILED) reads back from the 0x58 group's
  * upper half. Older firmware reports 0 here: drivers without the bit
  * must stay on the preset-only path.
+ *
+ * Bits 8 and 10 are dynamic, like the centered profiles: firmware
+ * advertises the capture-window override and its ACK only when the
+ * loaded bitstream exposes the viewport path. A legacy image keeps
+ * REG3 bit 15 clear and must not be told that a narrowed window will
+ * be applied. Drivers require bits 8 and 10 together.
+ *
+ * Bit 8 is the capture-window override (videocap_width / videocap_height):
+ * the caller first stages the width (captured words) in REG_ZZ_USER2,
+ * then writes the feature with the height as the 16-bit value; the
+ * pair applies at the next stable frame boundary and the scanout
+ * letterboxes the smaller window. Older firmware ignores the feature;
+ * drivers gate the calibration UI on it.
+ *
+ * Bit 9 is live videocap stats: REG_ZZ_VIDEOCAP_STATS (0x4E) returns
+ * {12'h0, cap_ymax[9:0]}; the low ten bits are the live line count and
+ * bits[15:10] are reserved. Older firmware, and the legacy-bitstream
+ * image, return REVISION here, so drivers gate the readout on this bit.
+ * The current-bitstream image ORs it at runtime; it is not part of the
+ * unconditional mask. Bit 10 adds the native-vblank ACK contract:
+ * queries 28--34 report requested and successfully applied VDMA
+ * geometry, serials, and status.
  */
 #define ZZ_FW_CAPABILITIES \
   (ZZ_FW_CAP_VIDEOCAP_PROFILE | ZZ_FW_CAP_VIDEOCAP_LIVE | \
@@ -229,7 +272,18 @@ enum zz9k_card_features {
   CARD_FEATURE_NONSTANDARD_VSYNC,
   CARD_FEATURE_VIDEO_OVERLAY,
   CARD_FEATURE_DPMS,
+  /* Capture-window override (ZZTop calibration): REG_ZZ_USER2 stages
+   * the width and the feature value carries the height, both in
+   * captured words / source lines and validated by video_scale.h;
+   * 0/0 restores the automatic window. Gated by
+   * ZZ_FW_CAP_VIDEOCAP_GEOMETRY. */
+  CARD_FEATURE_VIDEOCAP_GEOMETRY,
   CARD_FEATURE_NUM,
 };
+
+_Static_assert((REG_ZZ_ETH_TX_STATUS & 3) == 0,
+               "REG_ZZ_ETH_TX_STATUS has its own read case: keep it aligned");
+_Static_assert((REG_ZZ_ETH_RX_FRAMES & 3) == 0,
+               "REG_ZZ_ETH_RX_FRAMES has its own read case: keep it aligned");
 
 #endif

@@ -18,6 +18,19 @@
 #define MNTZORRO_REG5 20
 #define MNTZORRO_REG6 24
 #define MNTZORRO_REG7 28
+/* REG1 read returns the 32-bit Zorro RAM write payload
+ * (zorro_ram_write_data); REG1 write supplies the ARM Zorro-read reply. */
+
+/* REG2 write direction remains the formatter strobe. Its read direction
+ * publishes capture geometry: [31:21] is the marker, [20:10] is the
+ * completed captured width in words, and [9:0] is the completed post-crop
+ * field row count. Older bitstreams lack the marker, so both values fall
+ * back to zero; width then retains its 1280-word default. */
+#define MNTZORRO_REG2_LIVE_GEOMETRY_MAGIC       0x4ca00000U
+#define MNTZORRO_REG2_LIVE_GEOMETRY_MASK        0xffe00000U
+#define MNTZORRO_REG2_LIVE_GEOMETRY_ROWS_MASK   0x3ffU
+#define MNTZORRO_REG2_LIVE_GEOMETRY_WORDS_MASK  0x7ffU
+#define MNTZORRO_REG2_LIVE_GEOMETRY_WORDS_SHIFT 10U
 
 /* Read direction of REG6: generation-2 host aperture acknowledgement. */
 #define MNTZORRO_APERTURE_ACK_STATUS 0xa5020001UL
