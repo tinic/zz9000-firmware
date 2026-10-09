@@ -1106,7 +1106,9 @@ int ethernet_get_backlog() {
 }
 
 u16 ethernet_get_rx_status() {
-	u16 ready = frames_backlog;
+	/* DDR backlog is not readable until a packet bank is complete. Keep the
+	 * status ready field consistent with the Ethernet interrupt predicate. */
+	u16 ready = (u16)ethernet_get_backlog();
 	u16 reserved = frames_backlog_reserved;
 
 	if (ready > 0xff) {

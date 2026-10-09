@@ -58,7 +58,13 @@ a lease-pinned slot or a slot still inside completed backlog before touching DDR
 
 Current packet checksum metadata comes from the FPGA head (0x24 bits 6:5), not
 `frames_backlog_read`, which can lag after a host ACK until ARM consumes release.
-The Amiga interrupt likewise follows completed packet-valid, not raw DDR backlog.
+The Amiga interrupt and RX_STATUS ready field both follow completed packet-valid,
+not raw DDR backlog. In packet mode, RX_STATUS reports zero while the banks are
+empty, stopped or faulted, and one when a bank is ready; reserved/backpressure
+diagnostics retain their previous layout. Reporting queued DDR packets as ready
+would trigger the driver's stale-window wait (up to 2 ms) inside its interrupt
+handler even though the FPGA window is correctly empty. Legacy mode retains its
+backlog count and saturation.
 
 ## Reset and startup
 
@@ -99,7 +105,10 @@ controller or GEM DMA.
 
 `run_live.py` also extracts the exact firmware reset-fence function and runs
 four MMIO-stub checks: successful ordered drain, host timeout, core timeout and
-GEM still-enabled rejection. All failures keep leases pinned. These tests do not
+GEM still-enabled rejection. All failures keep leases pinned. Two additional groups
+exercise the actual RX status/get-backlog bodies across empty/ready/drained/stopped/
+faulted banks, legacy backlog saturation and unchanged pressure diagnostics. The
+empty-bank/nonempty-DDR assertion fails before the RX_STATUS fix. These tests do not
 prove the hardware fence signals or XEmacPs DMA-stop implementation.
 
 The actual `ethernet.c` cross-compiles with Arm GNU 15.3.1 Cortex-A9 flags. `-Wall -Werror` passes. With
