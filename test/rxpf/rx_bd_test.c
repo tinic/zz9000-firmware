@@ -23,6 +23,7 @@ typedef u32 XEmacPs_Bd[2];
 #define FRAME_SIZE 2048
 #define RX_FRAME_PAD 4
 #define ETH_RX_LEN_OFFSET2 0x8000
+static u32 expected_publish_length, payload_publications, header_publications;
 static u32 rx_offset_ring; /* 0: the default layout these cases cover */
 #define ETH_INVALID_BACKLOG_SLOT 0xffffu
 #define ETH_BACKLOG_HIGH_WATERMARK 120
@@ -70,7 +71,26 @@ static void ethernet_clear_backlog_slot(u16 slot) { assert(slot < FRAME_MAX_BACK
 static u8 *ethernet_backlog_payload_ptr(u16 slot) { return (u8 *)(UINTPTR)(0x100000u + slot * FRAME_SIZE + RX_FRAME_PAD); }
 static u8 *ethernet_backlog_slot_ptr(u16 slot) { assert(slot < FRAME_MAX_BACKLOG); return frame_bytes[slot]; }
 static void ethernet_backlog_slot_publish_from(u16 slot, u32 from, u32 bytes)
-{ assert(slot < FRAME_MAX_BACKLOG && from + bytes <= FRAME_SIZE); }
+{
+    assert(slot < FRAME_MAX_BACKLOG && from + bytes <= FRAME_SIZE);
+    if (expected_publish_length) {
+        if (from == 32) {
+            assert(!payload_publications && !header_publications);
+            for (unsigned i = 0; i < 4; i++) assert(frame_bytes[slot][i] == 0);
+            assert(bytes == expected_publish_length + RX_FRAME_PAD + rx_offset_ring - 32);
+            payload_publications++;
+        } else {
+            assert(from == 0 && bytes == 32 && !header_publications);
+            assert(payload_publications == (expected_publish_length + RX_FRAME_PAD + rx_offset_ring > 32));
+            unsigned lengthword = expected_publish_length | (rx_offset_ring ? 0x8000 : 0);
+            assert(frame_bytes[slot][0] == (lengthword >> 8));
+            assert(frame_bytes[slot][1] == (lengthword & 255));
+            assert(frame_bytes[slot][2] == (frame_serial >> 8));
+            assert(frame_bytes[slot][3] == (frame_serial & 255));
+            header_publications++;
+        }
+    }
+}
 static u32 XEmacPs_ReadReg(u32 base, u32 offset) { (void)base; (void)offset; return 0; }
 static void XEmacPs_WriteReg(u32 base, u32 offset, u32 value) { (void)base; (void)offset; (void)value; }
 /* RX_FUNCTIONS */
@@ -108,14 +128,28 @@ int main(int argc, char **argv)
     assert(argc == 2); setup();
     XEmacPs_BdRing *r = &EmacPsInstance.RxRing;
     if (!strcmp(argv[1], "pressure")) {
-        arm_last_slot(); complete(0); XEmacPsRecvHandler(&EmacPsInstance);
-        assert(frames_backlog == 120 && !frames_backlog_reserved && !r->HwCnt && r->FreeCnt == 64);
-        assert(descriptors[0][0] & XEMACPS_RXBUF_NEW_MASK);
-        /* The header the 68k polls: big-endian length, then serial (2, the
-           generator skips 0 and 1), written as one word. */
-        assert(frame_bytes[119][0] == 0x05 && frame_bytes[119][1] == 0xea &&
-               frame_bytes[119][2] == 0x00 && frame_bytes[119][3] == 0x02);
-        puts("PASS pressure: completed descriptor stays CPU-owned while refill is withheld");
+        const unsigned sizes[] = {14, 60, 1514, 2042};
+        const unsigned serials[] = {0, 1, 0xfe, 0xff, 0xfffe, 0xffff};
+        unsigned cases = 0;
+        for (unsigned offset = 0; offset <= 2; offset += 2)
+          for (unsigned n = 0; n < sizeof(sizes)/sizeof(sizes[0]); n++)
+            for (unsigned k = 0; k < sizeof(serials)/sizeof(serials[0]); k++) {
+                setup(); memset(frame_bytes, 0, sizeof(frame_bytes));
+                rx_offset_ring = offset;
+                frame_serial = serials[k];
+                expected_publish_length = sizes[n];
+                payload_publications = header_publications = 0;
+                arm_last_slot(); complete(0);
+                descriptors[0][1] = XEMACPS_RXBUF_EOF_MASK | sizes[n];
+                XEmacPsRecvHandler(&EmacPsInstance);
+                unsigned expected_serial = (serials[k] + 1) & 65535;
+                if (expected_serial < 2) expected_serial = 2;
+                assert(frame_serial == expected_serial && header_publications == 1);
+                assert(frames_backlog == 120 && !frames_backlog_reserved && !r->HwCnt && r->FreeCnt == 64);
+                assert(!frames_dropped && (descriptors[0][0] & XEMACPS_RXBUF_NEW_MASK));
+                cases++;
+            }
+        printf("PASS publication: %u actual-handler cases, plain+offset2, serial rollover, payload-before-header\n", cases);
     } else if (!strcmp(argv[1], "scan")) {
         arm_last_slot(); complete(0);
         /* Software-owned descriptors may retain old EOF/NEW from prior laps. */
