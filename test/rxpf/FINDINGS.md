@@ -856,3 +856,15 @@ readl@50 494.8).  B 4ba340b x3: RX 23.05-23.17 / 27.63-27.82 Mbit/s, A
 baseline x3: 22.91-23.14 / 27.81-27.93; readl 452.5-452.8 vs 452.1-452.8.  No
 measurable change, as expected for a correctness-only fix.  Legs rr4b-* were
 started by a bridge-spawned session (see agentnet duplicate-identity memory).
+
+4ba340b on hardware (BOOT 9884680a..., 789e9b1 ARM, beta8 driver), legs with
+a verified fresh boot (readl@50 ~452 ns; leg rr4-3 discarded: HA logged
+off/on but the A3000 did not reboot):
+
+| arm | RX @50 | RX @82 |
+|---|---|---|
+| A baseline x3 | 23.14 23.13 22.91 | 27.89 27.81 27.93 |
+| B 4ba340b x3 | 23.17 23.16 23.05 | 27.63 27.70 27.82 |
+
+Equal within noise, 0 bad data: 4ba340b is a safe correctness fix with no
+throughput effect.  Bench left on the baseline b6e31172.
