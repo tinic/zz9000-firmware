@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the exact firmware reset function with MMIO stubs and sanitizers."""
+"""Exercise the exact firmware reset/status functions with MMIO stubs and sanitizers."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -17,6 +17,13 @@ def main():
     test = (here / "packet_reset_test.c").read_text()
     assert test.count("/* EXACT_FENCE_BODY */") == 1
     test = test.replace("/* EXACT_FENCE_BODY */", source[start:end])
+    start = source.index("int ethernet_get_backlog() {")
+    end = source.index("u16 ethernet_get_rx_stats()", start)
+    # Keep both function bodies verbatim; give the legacy empty parameter lists
+    # explicit void prototypes so the strict host C99 fixture accepts them.
+    getters = source[start:end].replace("() {", "(void) {")
+    assert test.count("/* EXACT_STATUS_BODIES */") == 1
+    test = test.replace("/* EXACT_STATUS_BODIES */", getters)
     with tempfile.TemporaryDirectory(prefix="arm-live-", dir=here) as build:
         generated = Path(build) / "reset.c"
         generated.write_text(test)
