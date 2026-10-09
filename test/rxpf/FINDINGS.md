@@ -468,3 +468,20 @@ clocks.  Versus the old-ARM read-ahead: ~2 % lower at 50 MHz and ~1.5 % at
 82 MHz but no outliers.  Not yet attributed: the ownership fix hands each
 refilled BD to the GEM with a DSB after BdRingToHw (one barrier per BD); that
 per-frame ARM cost is the first suspect, untested.
+
+## Read-ahead + RX ownership fixes on hardware (2026-10-09 09:43-10:15Z)
+
+Image `BOOT-rxpf-789e9b1-nofast.bin` (b6e31172..., ELF 6f76cd28..., bit
+d371600e... unchanged c8786cc read-ahead).  8 flushed power cycles, 50 MHz
+then `cpuspeed 86` from the shell (82 MHz):
+
+| | RX 50 MHz | RX 82 MHz | window readl 50/82 | bad boots |
+|---|---|---|---|---|
+| 789e9b1 (8 boots) | 23.06-23.18 | 27.81-27.89 | 452 / 494 ns | 0 |
+| c8786cc old ARM (6 boots) | 23.5-23.7 | 28.2-28.4 (one 24.6) | 452 ns | 1 |
+
+All 8 boots carry RX, backpressure 0 in every sample.  The fixed build is
+~1.5-2 % below the c8786cc numbers taken on 10-09 01:xx; NOT attributed:
+the per-refill DSB/handoff, or run-to-run conditions.  Needs a same-session
+A/B (c8786cc vs 789e9b1, interleaved) before claiming either way.
+Logs: ~/ooc-evidence/rxpf-bdfix/.
