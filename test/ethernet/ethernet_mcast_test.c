@@ -33,6 +33,8 @@ static int restart_count;
 static int pause_count;
 static int clear_count;
 static int resume_count;
+static int offset2_count;
+static int last_offset2 = -1;
 static const char *last_restart;
 
 int ethernet_task_state = ETH_TASK_SETUP;
@@ -90,6 +92,12 @@ void ethernet_resume_rx_irq(int paused)
 {
 	resume_count++;
 	CHECK(paused == 1);
+}
+
+void ethernet_set_rx_offset2_quiet(int on)
+{
+	offset2_count++;
+	last_offset2 = on;
 }
 
 static void gem_reset(void)
@@ -204,7 +212,10 @@ static int test_reset_and_amiga_reset_clear_gate(void)
 	ethernet_set_multicast_hash(ETH_CONFIG_HASH_SET | 0);
 	ethernet_set_multicast_hash(ETH_CONFIG_HASH_SET | 32);
 	ethernet_task_state = ETH_TASK_SETUP;
+	offset2_count = 0;
 	ethernet_reset_for_amiga();
+	CHECK(offset2_count == 1);
+	CHECK(last_offset2 == 0);
 	CHECK(hashl() == 0);
 	CHECK(hashh() == 0);
 	CHECK(!gate_on());
