@@ -2230,6 +2230,8 @@ module MNTZorro_v0_1_S00_AXI
           rxpf_got <= rxpf_got + 1'b1;
         end
         if (m00_axi_rlast) begin
+          if (rd_fill && rd_discard)
+            rxpf_valid <= 0;            // its beats were dropped: the line is empty
           rd_out     <= 0;
           rd_fill    <= 0;
           rd_discard <= 0;
@@ -3071,7 +3073,10 @@ module MNTZorro_v0_1_S00_AXI
             rxpf_last <= z3_mapped_addr;
             zorro_state <= Z3_ENDCYCLE;
           end else if (!rxpf_valid || (!rd_out && !m00_axi_arvalid)) begin
-            zorro_state <= WAIT_READ_DMA_Z3;   // the fabric reset took the fill: ask again
+            // the fill ended (or a reset took it) without this beat: retire
+            // the line so the retry misses instead of hitting it again
+            rxpf_valid <= 0;
+            zorro_state <= WAIT_READ_DMA_Z3;
           end
         end
 
@@ -3490,6 +3495,22 @@ module MNTZorro_v0_1_S00_AXI
           sdk_last_regwrite_strobes <= {z3_ds3, z3_ds2, z3_ds1, z3_ds0};
         end
       endcase
+
+    /* Resets have the last word.  They are applied again here, after the
+     * case, so that no state's assignment in the same cycle -- a transition
+     * out of RESET, or RESET marking a pending read rd_discard -- can undo
+     * them: a Zorro reset holds the machine in RESET for as long as it is
+     * asserted, and the fabric reset leaves the read port idle with nothing
+     * marked for discard. */
+    if (z_reset)
+      zorro_state <= RESET;
+    if (!m00_axi_aresetn) begin
+      m00_axi_arvalid <= 0;
+      rd_out     <= 0;
+      rd_fill    <= 0;
+      rd_discard <= 0;
+      rxpf_valid <= 0;
+    end
 
 
     // ARM video control

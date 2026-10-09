@@ -304,6 +304,39 @@ module rxpf_tb;
                (ar_count - n0 == 1 && hung == 0) ? "PASS" : "FAIL", ar_count - n0, hung);
       if (!(ar_count - n0 == 1 && hung == 0)) errors = errors + 1;
 
+      // B7 (codex 00:43): Zorro RESET while ARVALID is held by ARREADY=0,
+      //     with the fabric reset pulsed for a single sampled edge during it.
+      //     Afterwards the port must be fully idle: the next window fill and a
+      //     non-window read return their own data, nothing hangs.
+      dut.slv_reg4 = 15; repeat (4) @(posedge clk);
+      hold_ar = 1; arready = 0;
+      hung = 0;
+      fork
+        z3cycle(BOARD + 32'h2000, 1, 2'b11, got, ns);   // requests; no handshake
+        begin
+          repeat (100) @(posedge clk);
+          ZORRO_NIORST = 0;
+          repeat (10) @(posedge clk);
+          @(negedge clk) aresetn = 0; @(negedge clk) aresetn = 1;   // one sampled edge
+          repeat (10) @(posedge clk);
+          ZORRO_NIORST = 1;
+        end
+      join
+      hold_ar = 0; @(posedge clk); #1 arready = 1; repeat (20) @(posedge clk);
+      dut.z3_ram_low = BOARD; dut.z3_confdone = 1;
+      dut.zorro_state = 9; repeat (4) @(posedge clk); dut.zorro_state = 12; repeat (10) @(posedge clk);
+      $display("INFO B7 port after resets: arvalid=%b rd_out=%b rd_discard=%b rxpf_valid=%b", arvalid, dut.rd_out, dut.rd_discard, dut.rxpf_valid);
+      hung = 0;
+      gen = gen + 1;
+      expect_read(32'h2400, 15, 2'b11, gen, "B7-a");
+      expect_read(32'h2404, 15, 2'b11, gen, "B7-b");
+      z3cycle(BOARD + 32'h20000, 1, 2'b11, got, ns);
+      if (got !== swapped(model(last_araddr, gen))) begin
+        $display("FAIL B7 non-window read: got %h want %h", got, swapped(model(last_araddr, gen))); errors = errors + 1;
+      end
+      $display("%s Zorro reset + 1-edge fabric reset with a pending request: data checked, %0d hung", hung == 0 ? "PASS" : "FAIL", hung);
+      if (hung != 0) errors = errors + 1;
+
       // B6: SLVERR responses do not wedge the port.
       dut.slv_reg4 = 11; repeat (4) @(posedge clk);
       rresp_err = 1; hung = 0;
