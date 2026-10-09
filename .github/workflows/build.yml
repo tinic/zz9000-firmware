@@ -131,6 +131,13 @@ jobs:
         run: make -C test/palette test
       - name: Ethernet multicast hash suite
         run: make -C test/ethernet test
+      - name: Ethernet RX ring and copy-probe suites
+        run: |
+          for r in run_rx_bd run_rx_init run_rx_restart run_rx_mac_restart \
+                   run_rx_offset2_retry run_z3copy_verdict; do
+            echo "== $r"
+            python3 "test/rxpf/$r.py" || exit 1
+          done
       - name: SDK surface helper suite
         run: |
           cc -std=c99 -Wall -Wextra -Werror \
