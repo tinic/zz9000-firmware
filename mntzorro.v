@@ -35,7 +35,7 @@
 `endif
 
 `define C_S_AXI_DATA_WIDTH 32
-`define C_S_AXI_ADDR_WIDTH 5
+`define C_S_AXI_ADDR_WIDTH 8
 
 `ifndef VCAP_DIAG_BUILD_ID
 `define VCAP_DIAG_BUILD_ID 32'h00000000
@@ -216,17 +216,17 @@ module MNTZorro_v0_1_S00_AXI
 
    // read address channel
    input wire m00_axi_arready,
-   output reg [`C_M00_AXI_ADDR_WIDTH-1 : 0] m00_axi_araddr,
-   output reg [3 : 0] m00_axi_arlen,
-   output reg [2 : 0] m00_axi_arsize,
-   output reg [1 : 0] m00_axi_arburst,
-   output reg m00_axi_arlock,
-   output reg [3 : 0] m00_axi_arcache,
-   output reg [2 : 0] m00_axi_arprot,
+   output wire [`C_M00_AXI_ADDR_WIDTH-1 : 0] m00_axi_araddr,
+   output wire [3 : 0] m00_axi_arlen,
+   output wire [2 : 0] m00_axi_arsize,
+   output wire [1 : 0] m00_axi_arburst,
+   output wire m00_axi_arlock,
+   output wire [3 : 0] m00_axi_arcache,
+   output wire [2 : 0] m00_axi_arprot,
    //output reg [3 : 0] m00_axi_arqos,
-   output reg m00_axi_arvalid,
+   output wire m00_axi_arvalid,
 
-   output reg m00_axi_rready,
+   output wire m00_axi_rready,
    input wire [`C_M00_AXI_DATA_WIDTH-1 : 0] m00_axi_rdata,
    input wire [1 : 0] m00_axi_rresp,
    input wire m00_axi_rlast,
@@ -355,7 +355,20 @@ module MNTZorro_v0_1_S00_AXI
   // ADDR_LSB = 2 for 32 bits (n downto 2)
   // ADDR_LSB = 3 for 64 bits (n downto 3)
   localparam integer ADDR_LSB = (`C_S_AXI_DATA_WIDTH/32) + 1;
-  localparam integer OPT_MEM_ADDR_BITS = 2;
+  localparam integer OPT_MEM_ADDR_BITS = 5; // 64 words: 0-7 legacy, 16-25 packet mailbox
+  // m00 read channel as driven by the Zorro state machine (arbiter foreground).
+  reg  [31:0] zfg_araddr = 0;
+  reg  [3:0]  zfg_arlen = 0;
+  reg  [2:0]  zfg_arsize = 2;
+  reg  [1:0]  zfg_arburst = 0;
+  reg         zfg_arlock = 0;
+  reg  [3:0]  zfg_arcache = 4'hf;
+  reg  [2:0]  zfg_arprot = 0;
+  reg         zfg_arvalid = 0;
+  reg         zfg_rready = 1;
+  wire        zfg_arready, zfg_rvalid, zfg_rlast;
+  wire [31:0] zfg_rdata;
+  wire [1:0]  zfg_rresp;
   //----------------------------------------------
   //-- Signals for user logic register space example
   //------------------------------------------------
@@ -1241,6 +1254,9 @@ module MNTZorro_v0_1_S00_AXI
   localparam Z3_WRITE_FINALIZE2 = 60;
   localparam Z2_REGREAD_DTACK = 62;
   localparam Z2_WRITE_FINALIZE2 = 61;
+  localparam Z3_PKT_READ = 63;   // packet window: wait for head READY, issue host_read
+  localparam Z3_PKT_READ2 = 64;  // host_read sampled by the core
+  localparam Z3_PKT_READ3 = 65;  // host_read_valid/host_data available
 
   reg [7:0] zorro_state = COLD;
   reg [7:0] dtack_counter;
@@ -1857,14 +1873,14 @@ module MNTZorro_v0_1_S00_AXI
     m00_axi_wlast <= 'h1;
     m00_axi_bready <= 'h1;
 
-    m00_axi_arlen <= 'h0;
-    m00_axi_arsize <= 'h2;
-    m00_axi_arburst <= 'h0;
-    m00_axi_arcache <= 'hf; //was 3
-    m00_axi_arlock <= 'h0;
-    m00_axi_arprot <= 'h0;
+    zfg_arlen <= 'h0;
+    zfg_arsize <= 'h2;
+    zfg_arburst <= 'h0;
+    zfg_arcache <= 'hf; //was 3
+    zfg_arlock <= 'h0;
+    zfg_arprot <= 'h0;
     //m00_axi_arqos <= 'h0;
-    m00_axi_rready <= 1;
+    zfg_rready <= 1;
 
     m01_axi_awlen <= 'hf; // 16 beats
     m01_axi_awsize <= 'h2; // 2^2 == 4 bytes
@@ -2153,8 +2169,111 @@ module MNTZorro_v0_1_S00_AXI
   end
 
   // -- main zorro fsm ---------------------------------------------
+  // ---------------------------------------------------------------------
+  // Packet receive window (experimental).  The Zorro state machine is the
+  // arbiter's foreground client on m00; the two-bank packet core is the
+  // background client.  The ARM drives the mailbox through S_AXI words
+  // 16-25.  While the mailbox is not RUNNING the window and ACK use the
+  // legacy DDR path unchanged.
+  // ---------------------------------------------------------------------
+
+  wire [5:0] s_axi_wword = axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB];
+  wire [5:0] s_axi_rword = axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB];
+  wire pkt_csr_write = slv_reg_wren && s_axi_wword >= 16 && s_axi_wword < 26;
+  wire [3:0] pkt_csr_word = s_axi_wword - 6'd16;
+  wire [3:0] pkt_csr_read_word = s_axi_rword - 6'd16;
+  wire [31:0] pkt_csr_rdata;
+  wire pkt_csr_error, pkt_core_flush, pkt_core_flush_done, pkt_running;
+  wire pkt_desc_valid, pkt_desc_ready, pkt_release_valid, pkt_release_ready, pkt_release_error;
+  wire [6:0] pkt_desc_slot, pkt_release_slot;
+  wire [11:0] pkt_desc_length, pkt_packet_length;
+  wire [15:0] pkt_desc_serial, pkt_packet_serial;
+  wire [31:0] pkt_desc_cookie, pkt_release_cookie, pkt_packet_cookie;
+  wire [1:0] pkt_desc_csum, pkt_packet_csum;
+  wire pkt_packet_valid, pkt_packet_error, pkt_head_busy;
+  reg  pkt_host_read = 0;
+  reg  [8:0] pkt_host_word = 0;
+  wire pkt_host_read_valid;
+  wire [31:0] pkt_host_data;
+  reg  pkt_ack_valid = 0;
+  reg  [31:0] pkt_ack_cookie = 0;
+  wire pkt_ack_ready;
+  reg  pkt_ack_req = 0;          // set by the state machine on a 68k RX ACK write
+  reg  [15:0] pkt_ack_serial = 0;
+  reg  [12:0] pkt_wait = 0;      // bounded wait for a filling head packet
+  wire [31:0] pkt_bg_araddr, pkt_bg_rdata;
+  wire [7:0] pkt_bg_arlen, pkt_arlen8;
+  wire [2:0] pkt_bg_arsize;
+  wire [1:0] pkt_bg_arburst, pkt_bg_rresp;
+  wire pkt_bg_arvalid, pkt_bg_arready, pkt_bg_rlast, pkt_bg_rvalid, pkt_bg_rready;
+  wire [0:0] pkt_fg_rid, pkt_bg_rid, pkt_arid;
+
+  zz_eth_packet_mailbox pkt_mailbox (
+    .clk(S_AXI_ACLK), .aresetn(m00_axi_aresetn),
+    .csr_write(pkt_csr_write), .csr_word(pkt_csr_word), .csr_wdata(S_AXI_WDATA),
+    .csr_wstrb(S_AXI_WSTRB), .csr_error(pkt_csr_error), .csr_read_word(pkt_csr_read_word),
+    .csr_rdata(pkt_csr_rdata), .flush_request(1'b0), .core_flush(pkt_core_flush),
+    .running(pkt_running), .core_flush_done(pkt_core_flush_done),
+    .desc_valid(pkt_desc_valid), .desc_ready(pkt_desc_ready), .desc_slot(pkt_desc_slot),
+    .desc_length(pkt_desc_length), .desc_serial(pkt_desc_serial), .desc_cookie(pkt_desc_cookie),
+    .desc_csum(pkt_desc_csum), .release_valid(pkt_release_valid), .release_ready(pkt_release_ready),
+    .release_slot(pkt_release_slot), .release_cookie(pkt_release_cookie), .release_error(pkt_release_error)
+  );
+  zz_eth_packet_window #(.RX_BASE(`RX_BACKLOG_ADDRESS)) pkt_core (
+    .clk(S_AXI_ACLK), .aresetn(m00_axi_aresetn), .flush(pkt_core_flush), .flush_done(pkt_core_flush_done),
+    .desc_valid(pkt_desc_valid), .desc_ready(pkt_desc_ready), .desc_slot(pkt_desc_slot),
+    .desc_length(pkt_desc_length), .desc_serial(pkt_desc_serial), .desc_cookie(pkt_desc_cookie),
+    .desc_csum(pkt_desc_csum), .packet_valid(pkt_packet_valid), .head_busy(pkt_head_busy),
+    .packet_error(pkt_packet_error), .packet_length(pkt_packet_length), .packet_serial(pkt_packet_serial),
+    .packet_cookie(pkt_packet_cookie), .packet_csum(pkt_packet_csum),
+    .host_read(pkt_host_read), .host_word(pkt_host_word), .host_read_valid(pkt_host_read_valid),
+    .host_data(pkt_host_data), .ack_valid(pkt_ack_valid), .ack_cookie(pkt_ack_cookie), .ack_ready(pkt_ack_ready),
+    .release_valid(pkt_release_valid), .release_ready(pkt_release_ready), .release_slot(pkt_release_slot),
+    .release_cookie(pkt_release_cookie), .release_error(pkt_release_error),
+    .araddr(pkt_bg_araddr), .arlen(pkt_bg_arlen), .arsize(pkt_bg_arsize), .arburst(pkt_bg_arburst),
+    .arvalid(pkt_bg_arvalid), .arready(pkt_bg_arready), .rdata(pkt_bg_rdata), .rresp(pkt_bg_rresp),
+    .rlast(pkt_bg_rlast), .rvalid(pkt_bg_rvalid), .rready(pkt_bg_rready)
+  );
+  zz_eth_read_arbiter #(.ID_WIDTH(1)) pkt_arbiter (
+    .clk(S_AXI_ACLK), .aresetn(m00_axi_aresetn), .foreground_pending(1'b0),
+    .fg_araddr(zfg_araddr), .fg_arlen({4'b0, zfg_arlen}), .fg_arburst(zfg_arburst),
+    .fg_arcache(zfg_arcache), .fg_arprot(zfg_arprot), .fg_arid(1'b0), .fg_arvalid(zfg_arvalid),
+    .fg_arready(zfg_arready), .fg_rdata(zfg_rdata), .fg_rresp(zfg_rresp), .fg_rid(pkt_fg_rid),
+    .fg_rlast(zfg_rlast), .fg_rvalid(zfg_rvalid), .fg_rready(zfg_rready),
+    .bg_araddr(pkt_bg_araddr), .bg_arlen(pkt_bg_arlen), .bg_arburst(pkt_bg_arburst),
+    .bg_arcache(4'hf), .bg_arprot(3'h0), .bg_arid(1'b0), .bg_arvalid(pkt_bg_arvalid),
+    .bg_arready(pkt_bg_arready), .bg_rdata(pkt_bg_rdata), .bg_rresp(pkt_bg_rresp), .bg_rid(pkt_bg_rid),
+    .bg_rlast(pkt_bg_rlast), .bg_rvalid(pkt_bg_rvalid), .bg_rready(pkt_bg_rready),
+    .araddr(m00_axi_araddr), .arlen(pkt_arlen8), .arsize(m00_axi_arsize), .arburst(m00_axi_arburst),
+    .arcache(m00_axi_arcache), .arprot(m00_axi_arprot), .arid(pkt_arid), .arvalid(m00_axi_arvalid),
+    .arready(m00_axi_arready), .rdata(m00_axi_rdata), .rresp(m00_axi_rresp), .rid(1'b0),
+    .rlast(m00_axi_rlast), .rvalid(m00_axi_rvalid), .rready(m00_axi_rready)
+  );
+  assign m00_axi_arlen = pkt_arlen8[3:0]; // AXI3 ACP; packet bursts are <= 16 beats
+  assign m00_axi_arlock = 1'b0;
+
   always @(posedge S_AXI_ACLK) begin
     videocap_mode <= videocap_mode_in;
+    pkt_host_read <= 1'b0; // one-cycle request pulse, set by Z3_PKT_READ
+
+    // Host ACK: an error packet is dropped by the FPGA (the driver never
+    // sees its serial); a good packet is released when the 68k writes its
+    // serial to the RX ACK register.  A stale serial is discarded.
+    if (!m00_axi_aresetn || !pkt_running) begin
+      pkt_ack_valid <= 0;
+      pkt_ack_req <= 0;
+    end else if (pkt_ack_valid) begin
+      if (pkt_ack_ready) pkt_ack_valid <= 0;
+    end else if (pkt_packet_valid && pkt_packet_error) begin
+      pkt_ack_valid <= 1;
+      pkt_ack_cookie <= pkt_packet_cookie;
+    end else if (pkt_ack_req) begin
+      pkt_ack_req <= 0;
+      if (pkt_packet_valid && pkt_ack_serial == pkt_packet_serial) begin
+        pkt_ack_valid <= 1;
+        pkt_ack_cookie <= pkt_packet_cookie;
+      end
+    end
     videocap_control_live_event <= 1'b0;
     videocap_control_zorro_event <= 1'b0;
     video_control_axi_strobe_d <= axi_reg2[31];
@@ -2587,21 +2706,21 @@ module MNTZorro_v0_1_S00_AXI
           else begin
             // read via AXI DMA
             if (last_addr>='ha000 && last_addr<'h10000)
-              m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + {last_addr[23:2],2'b00};
+              zfg_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + {last_addr[23:2],2'b00};
             else
             if (last_addr>='h8000 && last_addr<'hA000)
-              m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + {last_addr[23:2],2'b00};
+              zfg_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + {last_addr[23:2],2'b00};
             else
             if (last_addr>='h2000 && last_addr<'h6000)
-              m00_axi_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + {last_addr[23:2],2'b00} + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
+              zfg_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + {last_addr[23:2],2'b00} + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
             else
             if (last_addr>='h6000 && last_addr<'h8000)
-              m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + {last_addr[23:2],2'b00};
+              zfg_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + {last_addr[23:2],2'b00};
             else
-              m00_axi_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
+              zfg_araddr  <= `ARM_MEMORY_START + {last_addr[23:2],2'b00};
   
-            m00_axi_arvalid  <= 1;
-            if (m00_axi_arready) begin
+            zfg_arvalid  <= 1;
+            if (zfg_arready) begin
               zorro_state <= WAIT_READ2;
             end
             
@@ -2609,15 +2728,15 @@ module MNTZorro_v0_1_S00_AXI
         end
         
         WAIT_READ2: begin
-          m00_axi_arvalid <= 0;
-          if (m00_axi_rvalid) begin
+          zfg_arvalid <= 0;
+          if (zfg_rvalid) begin
             zorro_state <= WAIT_READ2D;
             
             // le endian swap
             if (last_addr[1] == 1)
-              data_out <= {m00_axi_rdata[23:16], m00_axi_rdata[31:24]};
+              data_out <= {zfg_rdata[23:16], zfg_rdata[31:24]};
             else
-              data_out <= {m00_axi_rdata[7:0], m00_axi_rdata[15:8]};
+              data_out <= {zfg_rdata[7:0], zfg_rdata[15:8]};
           end
         end
         
@@ -2916,6 +3035,12 @@ module MNTZorro_v0_1_S00_AXI
           zorro_ram_write_bytes <= {z3_ds3,z3_ds2,z3_ds1,z3_ds0};
           zorro_ram_write_data  <= {z3_din_high_s2,z3_din_low_s2};
           zorro_ram_write_request <= 1;
+          // RX ACK (0x82, low half of 0x80): the ARM still sees the write,
+          // and the packet window releases the matching head packet.
+          if (pkt_running && z3_mapped_addr[15:2] == 14'h20 && (z3_ds0 || z3_ds1)) begin
+            pkt_ack_serial <= z3_din_low_s2;
+            pkt_ack_req <= 1;
+          end
 
           zorro_state <= Z3_WRITE_FINALIZE;
         end
@@ -2936,35 +3061,75 @@ module MNTZorro_v0_1_S00_AXI
         end
 
         WAIT_READ_DMA_Z3: begin
+          if (pkt_running && z3_mapped_addr>='h2000 && z3_mapped_addr<'h2800) begin
+            // One 2 KB packet slot (header + frame) served from the FPGA bank.
+            pkt_wait <= 0;
+            zorro_state <= Z3_PKT_READ;
+          end else begin
           if (z3_mapped_addr>='ha000 && z3_mapped_addr<'h10000)
-            m00_axi_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + z3_mapped_addr;
+            zfg_araddr  <= (`USB_BLOCK_STORAGE_ADDRESS - 32'ha000) + z3_mapped_addr;
           else
           if (z3_mapped_addr>='h8000 && z3_mapped_addr<'hA000)
-            m00_axi_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + z3_mapped_addr;
+            zfg_araddr  <= (`TX_FRAME_ADDRESS - 32'h8000) + z3_mapped_addr;
           else
           if (z3_mapped_addr>='h2000 && z3_mapped_addr<'h6000)
-            m00_axi_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + z3_mapped_addr + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
+            zfg_araddr  <= (`RX_BACKLOG_ADDRESS - 32'h2000) + z3_mapped_addr + {eth_rx_frame_select, 11'h0}; // 11'h0 is FRAME_SIZE = 2048
           else
           if (z3_mapped_addr>='h6000 && z3_mapped_addr<'h8000)
-            m00_axi_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + z3_mapped_addr;
+            zfg_araddr  <= (`BOOT_ROM_ADDRESS - 32'h6000) + z3_mapped_addr;
           else
-            m00_axi_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
+            zfg_araddr  <= `ARM_MEMORY_START + (z3_mapped_addr/*&32'hfffffffc*/); // max 256MB
 
-          m00_axi_arvalid  <= 1;
-          if (m00_axi_arready) begin
+          zfg_arvalid  <= 1;
+          if (zfg_arready) begin
             zorro_state <= WAIT_READ_DMA_Z3B;
+          end
           end
         end
 
         WAIT_READ_DMA_Z3B: begin
-          m00_axi_arvalid <= 0;
-          if (m00_axi_rvalid) begin
+          zfg_arvalid <= 0;
+          if (zfg_rvalid) begin
             zorro_state <= Z3_ENDCYCLE;
-            data_z3_hi16 <= {m00_axi_rdata[7:0], m00_axi_rdata[15:8]};
-            data_z3_low16 <= {m00_axi_rdata[23:16], m00_axi_rdata[31:24]};
+            data_z3_hi16 <= {zfg_rdata[7:0], zfg_rdata[15:8]};
+            data_z3_low16 <= {zfg_rdata[23:16], zfg_rdata[31:24]};
             dataout_z3 <= 1; // enable data output
             dtack <= 1;
           end
+        end
+
+        // A head packet that is still filling is waited for (bounded, ~80 us
+        // at 100 MHz) so the driver never sees a half-published slot; with
+        // no packet the window reads as zero (serial 0 = nothing presented).
+        Z3_PKT_READ: begin
+          if (pkt_packet_valid) begin
+            pkt_host_read <= 1;
+            pkt_host_word <= z3_mapped_addr[10:2];
+            zorro_state <= Z3_PKT_READ2;
+          end else if (pkt_head_busy && pkt_wait != 13'h1fff) begin
+            pkt_wait <= pkt_wait + 1'b1;
+          end else begin
+            data_z3_hi16 <= 16'h0;
+            data_z3_low16 <= 16'h0;
+            dataout_z3 <= 1;
+            dtack <= 1;
+            zorro_state <= Z3_ENDCYCLE;
+          end
+        end
+
+        Z3_PKT_READ2: begin
+          zorro_state <= Z3_PKT_READ3;
+        end
+
+        Z3_PKT_READ3: begin
+          // Rejected reads (past the padded frame, error packet) return zero.
+          data_z3_hi16 <= pkt_host_read_valid ?
+                          {pkt_host_data[7:0], pkt_host_data[15:8]} : 16'h0;
+          data_z3_low16 <= pkt_host_read_valid ?
+                          {pkt_host_data[23:16], pkt_host_data[31:24]} : 16'h0;
+          dataout_z3 <= 1;
+          dtack <= 1;
+          zorro_state <= Z3_ENDCYCLE;
         end
 
         WAIT_WRITE_DMA_Z3: begin
@@ -3503,7 +3668,9 @@ module MNTZorro_v0_1_S00_AXI
         // Exact compile-time aperture bytes. Z3 reports zero: its established
         // 128 MB layout is deliberately outside this Z2 contract.
         3'h7   : reg_data_out <= SDK_APERTURE_SIZE_VALUE;
-        default : reg_data_out <= 'h0;
+        // Words 16-25: packet receive mailbox (zz_eth_packet_mailbox words 0-9).
+        default : reg_data_out <= (s_axi_rword >= 16 && s_axi_rword < 26) ?
+                                  pkt_csr_rdata : 'h0;
       endcase
     end
 

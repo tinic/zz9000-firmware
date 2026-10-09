@@ -19,6 +19,8 @@ module zz_eth_packet_window #(
     input wire [1:0] desc_csum,
 
     output wire packet_valid,
+    // Head packet accepted but not yet READY: a host read may wait for it.
+    output wire head_busy,
     output wire packet_error,
     output wire [11:0] packet_length,
     output wire [15:0] packet_serial,
@@ -86,6 +88,8 @@ module zz_eth_packet_window #(
     assign rready = outstanding && aresetn;
     assign desc_ready = aresetn && !flush && !flushing && state[tail] == FREE;
     assign packet_valid = aresetn && !flush && !flushing && state[head] == READY;
+    assign head_busy = aresetn && !flush && !flushing &&
+                       (state[head] == QUEUED || state[head] == FILLING);
     assign packet_error = bad[head];
     assign packet_length = length[head];
     assign packet_serial = serial[head];

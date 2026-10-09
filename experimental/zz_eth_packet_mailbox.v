@@ -15,6 +15,7 @@ module zz_eth_packet_mailbox (
     output reg [31:0] csr_rdata,
     input wire flush_request, // A level is edge-detected; REARM waits for it to fall.
     output wire core_flush,
+    output wire running, // mode == RUNNING: host adapter may use the packet window.
     input wire core_flush_done,
 
     output wire desc_valid,
@@ -46,6 +47,7 @@ module zz_eth_packet_mailbox (
                          csr_wstrb == 4'hf && csr_wdata == 1;
     wire start_flush = aresetn && mode != DRAINING &&
                        (flush_command || (flush_request && !external_seen));
+    assign running = aresetn && mode == RUNNING;
     assign core_flush = start_flush; // Pulse once, then wait for the core's drain.
     assign desc_valid = aresetn && mode == RUNNING && !start_flush && pending;
     assign release_ready = aresetn && mode == RUNNING && !start_flush && !held;
