@@ -75,6 +75,44 @@ FFs and 4/140 BRAM tiles in MNTZorro OOC synthesis, with full-design setup/hold
 slack +0.000/+0.015 ns. Those are **baseline** measurements. They do not include
 these packet banks and cannot be added arithmetically to predict routed timing.
 
+## Measured 100 MHz result, 2026-10-08
+
+zz9k-fpga ran Vivado 2018.3 on playhouse2 at exact commit
+`1c6384c7aa343ee8c4c0fd3070e69c4fbefda6e4`. Its detailed-path follow-up kept the
+RTL and generated constraints identical to the first completed `777cc71` run.
+The source and report hashes were checked independently after retrieval.
+
+| Measurement | Isolated core result |
+| --- | --- |
+| Memory | 2 RAMB18E1, 0 RAMB36, 0 LUTRAM |
+| Logic | 293 LUTs, 254 FFs |
+| Setup slack | +1.490 ns |
+| Internal register-to-register hold slack | +0.063 ns |
+| Input-to-register hold slack | -0.552 ns |
+| Overall numeric gate | **FAIL**, exit 1; constraints unchanged |
+
+`ram0_reg` and `ram1_reg` infer as 36-bit simple-dual-port RAMB18E1 primitives
+for the two 512 x 32-bit banks. The worst setup path reaches BRAM write enable
+from `fill_bank_reg`. The worst input hold path is `desc_cookie[12]` to
+`cookie_reg[0][12]/D`: 0 ns assumed input delay, 0.924 ns data delay, 0.973 ns
+destination clock delay and a 1.476 ns total required time yield -0.552 ns slack.
+The worst internal hold path is a cookie register to its release-cookie register;
+the next reported path into a RAM write address passes at +0.076 ns.
+
+There are no missing-clock/delay or unconstrained-internal-endpoint findings in
+`check_timing`; 438 nets route fully with zero routing errors. DRC reports only
+the absent PS7 block, expected for this isolated core. However, Vivado warns
+that **HD.CLK_SRC and HD.PARTPIN_LOCS are absent**: the clock source and external
+boundary partial routes have no full-design physical context. Thus the input
+failure identifies an unresolved interface assumption, not a proven internal
+logic defect or a proven harmless hardware path. Internal slack also remains
+conditional on the OOC context. Preserve the failure; do not waive it or infer
+full-design timing closure from these numbers.
+
+The next timing step needs the actual registered descriptor producer/transport
+and shared clock context, followed by full-design implementation. No 150 MHz
+probe, new FPGA image, hardware run or throughput measurement was made here.
+
 Vivado reference: [UG835 timing-path queries](https://docs.amd.com/r/2020.2-English/ug835-vivado-tcl-commands/get_timing_paths)
 describe querying slack from path objects; the lane's actual Vivado 2018.3 run
 must establish command compatibility and the measured result. Local syntax or

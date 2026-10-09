@@ -1,9 +1,11 @@
 # Packet-sized FPGA receive-window prototype
 
 Status: **offline experiment, not integrated into any firmware build**. No image
-was built or flashed for this prototype. Neither Vivado block-RAM inference nor
-resource usage, routed timing, clock-domain crossings, or hardware performance
-has been verified. The existing nofast control/read-ahead experiment is separate.
+was built or flashed for this prototype. A Vivado 2018.3 isolated 100 MHz probe
+measured two RAMB18s, 293 LUTs and 254 FFs; setup and internal hold passed, but the
+overall hold gate failed on input-boundary timing. See [the measured results and
+limits](OOC.md). Full-design routed timing, clock-domain crossings and hardware
+performance remain unverified. The nofast control/read-ahead experiment is separate.
 
 The initial packet core at `e81420cc` received an independent source review from
 zz9k-fpga: no core correctness blocker found; tests were not independently rerun.
@@ -11,7 +13,7 @@ Two RAMB18s is the reviewer's area estimate, not measured synthesis. The isolate
 foreground/prefetch arbitration model at `7b852b90` also received a source review
 with no correctness blocker identified. That review requested AXI attribute/ID
 preservation and a simultaneous-arrival priority test. This follow-up implements
-both; independent review of this delta is pending. It still does not modify the
+both at `efc04df2`, with no blocker in the subsequent source review. It still does not modify the
 live m00 engine or its Zorro-pin testbench.
 
 ## What this experiment establishes
@@ -46,7 +48,8 @@ All module signals use one clock. Cross-domain transport is an integration task.
 The separate [ARM integration contract](ARM_CONTRACT.md) now provides a portable
 ownership helper and host tests for publication order, matching releases,
 contiguous ring retirement and coordinated reset fences. It is not linked into
-firmware or connected to this RTL; its independent review is pending.
+firmware or connected to this RTL. Source review of `df70ad8` found no blocker;
+its tests were not independently rerun by that reviewer.
 
 1. The producer reserves a DDR ring slot and waits for GEM DMA completion. It
    publishes payload, the four-byte length/serial header, and checksum metadata
