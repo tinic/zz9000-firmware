@@ -896,3 +896,22 @@ any: baseline RTL 5 of 25 (one each), 4ba340b 3 of 5 (1, 1, 2).  P(>=3 of 5)
 at the baseline 20 % rate is ~6 %: a weak signal, not a demonstrated
 regression; size drops already occur on the baseline.  Worth a longer B soak
 before 4ba340b is shipped.
+
+## Full candidate on hardware: firmware 7700554 + driver ba7fe37a (2026-10-09 13:36-13:56Z)
+
+Firmware `zz9k/rx-offset2` 7700554 = read-ahead + RX BD ownership fixes +
+RX offset 2 + one 32-bit big-endian header store (0d87d8c: the 68k now
+reads the serial first, and byte stores could expose half a serial).
+Driver AmiNetXDuo `fix/zz9000-rx-offset2` ba7fe37a = offset 2 + stop
+restores layout + serial-before-length header read.  Six flushed power
+cycles, every leg passed the reboot check (readl@50 452 ns).
+
+| | 50 MHz Mbit/s | 82 MHz Mbit/s | bad data / size drops / serial gaps |
+|---|---|---|---|
+| baseline 789e9b1 + beta8 (today) | 23.0-23.2 | 27.6-27.9 | size drops in ~1/3 of legs |
+| full candidate | **23.66-23.77** | **27.94-28.33** | **0 / 0 / 0 on all 6** |
+
+About +2.5 % at 50 MHz and +1 % at 82 MHz over the baseline, with the
+occasional "frames dropped for size" gone.  Evidence:
+~/ooc-evidence/rx-atomic-header/ (SHA256SUMS).  Bench restored to b6e31172 +
+beta8 driver afterwards.
