@@ -687,3 +687,20 @@ Every B leg beats every A leg at both clocks; backpressure 0 in all
 samples.  The 50 MHz gain matches the z3copy prediction (13 us of 524 us per
 frame); at 82 MHz it is smaller than predicted (8.5 of 435 us = 2 %).
 Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2: A/B on hardware (2156a56 firmware, 2026-10-09 10:27-10:55Z)
+
+Firmware `zz9k/rx-offset2` 2156a56 (read-ahead baseline + opt-in GEM RX
+buffer offset 2), same image in both arms.  Driver A = AmiNetXDuo
+origin/main 8bb3dc44 (never asks), B = `fix/zz9000-rx-offset2` 6c28957a
+(asks; payload copy aligned on both sides).  ABBA ABBA, flushed power
+cycle per leg, installed size checked before each cycle.
+
+| | A (default layout) | B (offset 2) | B vs A |
+|---|---|---|---|
+| 50 MHz RX Mbit/s | 23.10 23.21 23.21 23.19 (23.18) | 23.80 23.67 23.64 23.63 (23.68) | +2.2 % |
+| 82 MHz RX Mbit/s | 27.81 27.94 27.99 27.96 (27.93) | 28.35 28.20 28.17 28.20 (28.23) | +1.1 % |
+
+Every B leg beats every A leg at both clocks.  Matches the z3copy
+prediction (dst+2 = 8.5-13 us of ~435-524 us per frame) and recovers the
+~2 % the ownership fix cost against the old-ARM read-ahead peak.
