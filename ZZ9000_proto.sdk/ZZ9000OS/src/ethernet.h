@@ -26,6 +26,12 @@
 #define ETH_CONFIG_HASH_CLEAR          0x4000
 #define ETH_CONFIG_HASH_RESET          0x2000
 #define ETH_CONFIG_HASH_INDEX          0x003f
+/* Command 0x1000|on: place received frames 2 bytes further into the slot
+ * (GEM RX buffer offset), so the payload behind the 14-byte Ethernet header
+ * starts on a longword in the window.  Off after every Amiga reset; frames
+ * written that way carry ETH_RX_LEN_OFFSET2 in their length word. */
+#define ETH_CONFIG_RX_OFFSET2          0x1000
+#define ETH_RX_LEN_OFFSET2             0x8000
 
 enum {
 	ETH_TASK_SETUP,
@@ -39,6 +45,8 @@ extern int ethernet_hw_ready;
 
 int ethernet_init();
 void ethernet_set_multicast_hash(u16 command);
+void ethernet_set_rx_offset2(int on);
+void ethernet_set_rx_offset2_quiet(int on);
 u16 ethernet_get_multicast_config(void);
 u32 ethernet_emac_base(void);
 u32 ethernet_mac_lo_word(const uint8_t mac[6]);
@@ -128,6 +136,8 @@ u16 ethernet_get_tx_status(void);
 /* Bit 13: shifted TX slots (ETH_TX_OFFSET2) with checksum consent
  * (ETH_TX_CSUM) are understood. */
 #define ETH_TX_OFFSET2_PRESENT 0x2000u
+/* Bit 12: ETH_CONFIG_RX_OFFSET2 is understood. */
+#define ETH_RX_OFFSET2_PRESENT 0x1000u
 #define ETH_RX_META_MASK    0x0003u
 #define ETH_RX_META_NONE    0u
 #define ETH_RX_META_IP      1u

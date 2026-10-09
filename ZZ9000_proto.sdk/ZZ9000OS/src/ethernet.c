@@ -249,6 +249,11 @@ void XEmacPsClkSetup(XEmacPs *EmacPsInstancePtr, u16 EmacPsIntrId, int link_spee
 	}
 }
 
+/* Requested RX buffer offset (0 or 2) and the one programmed into the ring
+ * that is running; the receive handler uses the latter. */
+static u32 rx_offset_req;
+static u32 rx_offset_ring;
+
 int init_ethernet_buffers() {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
 	XEmacPs_Bd BdTemplate;
@@ -330,6 +335,13 @@ int init_ethernet_buffers() {
 	for (int i=0; i<RXBD_CNT; i++) {
 		XEmacPs_BdClearRxNew(BdRxPtr);
 		BdRxPtr = XEmacPs_BdRingNext(&(XEmacPs_GetRxRing(EmacPsInstancePtr)), BdRxPtr);
+	}
+
+	{
+		u32 base = EmacPsInstancePtr->Config.BaseAddress;
+		u32 cfg = XEmacPs_ReadReg(base, XEMACPS_NWCFG_OFFSET) & ~XEMACPS_NWCFG_RXOFFS_MASK;
+		XEmacPs_WriteReg(base, XEMACPS_NWCFG_OFFSET, cfg | (rx_offset_req << 14));
+		rx_offset_ring = rx_offset_req;
 	}
 
 	XEmacPs_Start(EmacPsInstancePtr);
@@ -618,6 +630,25 @@ int ethernet_restart_dma(const char *reason) {
 	return XST_SUCCESS;
 }
 
+/* Takes effect through a full ring rebuild, so no queued frame was written
+ * with the other offset; the frames queued at the switch are dropped. */
+void ethernet_set_rx_offset2(int on)
+{
+	u32 want = on ? 2 : 0;
+
+	if (want == rx_offset_req)
+		return;
+	rx_offset_req = want;
+	if (ethernet_task_state == ETH_TASK_READY)
+		ethernet_restart_dma("rx-offset2");
+}
+
+/* For a caller that rebuilds the ring itself right after. */
+void ethernet_set_rx_offset2_quiet(int on)
+{
+	rx_offset_req = on ? 2 : 0;
+}
+
 
 void ethernet_task() {
 	XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
@@ -840,7 +871,7 @@ static void XEmacPsRecvHandler(void *Callback)
 
 			if (backlog_slot == ETH_INVALID_BACKLOG_SLOT) {
 				frames_dropped++;
-			} else if (rx_bytes > (FRAME_SIZE - RX_FRAME_PAD)) {
+			} else if (rx_bytes > (FRAME_SIZE - RX_FRAME_PAD - rx_offset_ring)) {
 				frames_dropped++;
 				ethernet_clear_backlog_slot(backlog_slot);
 			} else if (backlog_slot != frames_backlog_write || frames_backlog >= FRAME_MAX_BACKLOG) {
@@ -867,11 +898,14 @@ static void XEmacPsRecvHandler(void *Callback)
 				 * read payload lines the L2 still held from the slot's last use
 				 * or from prefetch past the polled header.
 				 */
-				if (rx_bytes + RX_FRAME_PAD > 32U)
+				if (rx_bytes + RX_FRAME_PAD + rx_offset_ring > 32U)
 					ethernet_backlog_slot_publish_from(backlog_slot, 32U,
-					                                   rx_bytes + RX_FRAME_PAD - 32U);
-				*(frame_bl_ptr)   = (rx_bytes&0xff00)>>8;
-				*(frame_bl_ptr+1) = (rx_bytes&0xff);
+					                                   rx_bytes + RX_FRAME_PAD + rx_offset_ring - 32U);
+				{
+					u16 lenword = (u16)rx_bytes | (rx_offset_ring ? ETH_RX_LEN_OFFSET2 : 0);
+					*(frame_bl_ptr)   = (lenword&0xff00)>>8;
+					*(frame_bl_ptr+1) = (lenword&0xff);
+				}
 				*(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
 				*(frame_bl_ptr+3) = (frame_serial&0xff);
 				ethernet_backlog_slot_publish_from(backlog_slot, 0U, 32U);
@@ -1113,6 +1147,7 @@ u16 ethernet_get_rx_meta(void) {
 		capabilities |= ETH_RX_META_PRESENT;
 	if (XEmacPs_IsTxCsum(&EmacPsInstance))
 		capabilities |= ETH_TX_CSUM_PRESENT | ETH_TX_OFFSET2_PRESENT;
+	capabilities |= ETH_RX_OFFSET2_PRESENT;
 
 	return capabilities | verdict;
 }

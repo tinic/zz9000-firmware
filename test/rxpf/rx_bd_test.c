@@ -22,6 +22,8 @@ typedef u32 XEmacPs_Bd[2];
 #define FRAME_MAX_BACKLOG 128
 #define FRAME_SIZE 2048
 #define RX_FRAME_PAD 4
+#define ETH_RX_LEN_OFFSET2 0x8000
+static u32 rx_offset_ring; /* 0: the default layout these cases cover */
 #define ETH_INVALID_BACKLOG_SLOT 0xffffu
 #define ETH_BACKLOG_HIGH_WATERMARK 120
 #define XEMACPS_RXSR_OFFSET 0u
