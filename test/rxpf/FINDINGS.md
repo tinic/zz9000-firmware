@@ -741,3 +741,25 @@ flushed power cycles ABBA ABBA, `pwab.sh` (driver size verified per leg).
 Every B leg beats every A leg at both clocks (min B - max A = +0.41 / +0.18
 Mbit/s).  The size matches the z3copy prediction (8.5-13 us of a 435-524 us
 frame).  Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2: removing the dst+2 penalty (2026-10-09 10:27-10:55Z)
+
+Firmware zz9k/rx-offset2 2156a56 (= 789e9b1 + opt-in GEM RX buffer offset
+2: ETH_CONFIG command 0x1000|on through a guarded ring rebuild, length-word
+bit 15 on shifted frames, RX_META bit 12, off after every Amiga reset) and
+AmiNetXDuo fix/zz9000-rx-offset2 6c28957a (anxzz9000.device asks for it
+when offered; the copies peel a word only when the source is 2 mod 4).
+
+A/B on one firmware image (BOOT 5659ba94...), driver swapped per leg with
+a flushed power cycle, order ABBA ABBA, `bootmeasure2` per leg.
+A = origin/main 8bb3dc44 driver (never asks), B = 6c28957a.
+
+| | A 50 MHz | B 50 MHz | A 82 MHz | B 82 MHz |
+|---|---|---|---|---|
+| legs | 23.10 23.21 23.21 23.19 | 23.80 23.67 23.64 23.63 | 27.81 27.94 27.99 27.96 | 28.35 28.20 28.17 28.20 |
+| median | 23.20 | **23.66 (+2.0 %)** | 27.95 | **28.20 (+0.9 %)** |
+
+Every B leg beats every A leg at both clocks (worst B - best A: +0.41 /
++0.18 Mbit/s).  The size matches the z3copy dst+2 cost (8.5-13 us per
+frame) and recovers most of the ~2 % the fixed ARM had cost against the
+old-ARM read-ahead peak.  Evidence: ~/ooc-evidence/rxoff2/.
