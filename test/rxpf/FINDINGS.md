@@ -608,3 +608,22 @@ on both sides).  ABBA ABBA, 8 flushed power cycles, size-checked install.
 B beats A in every pair, ranges disjoint: **+2.0 % at 50 MHz, +0.9 % at 82
 MHz**, as predicted from z3copy's dst+2 cost (12.9 / 8.5 us per frame).
 Backpressure 0 throughout.  Evidence: ~/ooc-evidence/rxoff2/.
+
+## RX offset 2 (dst+2 removed): A/B on hardware (2026-10-09 10:27-10:55Z)
+
+Firmware zz9k/rx-offset2 2156a56 (`BOOT-rxpf-2156a56-nofast.bin` 5659ba94...,
+read-ahead bitstream unchanged): opt-in GEM RX buffer offset 2 via
+REG_ZZ_ETH_CONFIG 0x1000|1, length bit 15 on shifted frames, RX_META bit 12,
+off on every Amiga reset.  Driver AmiNetXDuo fix/zz9000-rx-offset2 6c28957a
+asks for it when offered; copies peel a word only when the source is 2 mod 4.
+Same firmware in both arms; A = origin/main 8bb3dc44 anxzz9000.device (never
+asks), B = the branch.  ABBA ABBA, flushed power cycles, install size checked.
+
+| RX Mbit/s | A (4 boots) | B (4 boots) | B vs A |
+|---|---|---|---|
+| 50 MHz | 23.10-23.21, median 23.20 | 23.63-23.80, median 23.66 | +2.0 % |
+| 82 MHz | 27.81-27.99, median 27.95 | 28.17-28.35, median 28.20 | +0.9 % |
+
+No overlap between the arms at either clock; backpressure 0 throughout.
+Predicted from z3copy: dst+2 costs 8.5-13 us of ~435-524 us per frame
+(2-2.5 %).  Evidence: ~/ooc-evidence/rxoff2/.
