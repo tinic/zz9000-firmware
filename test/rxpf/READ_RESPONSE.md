@@ -34,9 +34,9 @@ The response test requires no late data, early ACK, repeated ACK or wrong data.
 Against the original RTL, `run_response.sh baseline` records the expected
 negative control. It does not waive the candidate's acceptance criteria.
 
-The original early/typical-strobe hit responds in 51–60 ns after /FCS, but
+The original early/typical-strobe hit responds in 50–59 ns after /FCS, but
 its actual FPGA data pins become valid 10 ns later. The candidate responds
-in 41–50 ns with early strobes, or at 50 ns when the strobes arrive then.
+in 40–49 ns with early strobes, or at 50 ns when the strobes arrive then.
 With late strobes it responds at the data phase rather than prematurely.
 The miss path adds one 10 ns clock for the output pipeline. These are digital
 simulation measurements, not bus throughput results.
