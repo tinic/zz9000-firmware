@@ -648,3 +648,23 @@ Every B leg beat every A leg at both clocks; backpressure 0 in all 11200
 samples.  Size matches the z3copy estimate (the 8.5-13 us per frame the +2
 destination cost).  Read-ahead + offset 2 at 50 MHz (23.6-23.8) now matches
 the old unfixed read-ahead peak (23.5-23.7) with the ownership fixes kept.
+
+## RX offset 2: removing the dst+2 copy penalty (2026-10-09 10:27-10:55Z)
+
+Firmware zz9k/rx-offset2 2156a56 (opt-in GEM RX buffer offset 2 via
+REG_ZZ_ETH_CONFIG 0x1000|1, length-word bit 15 on shifted frames, RX_META bit
+12, off after every Amiga reset) + AmiNetXDuo fix/zz9000-rx-offset2 6c28957a
+(anxzz9000 asks when offered; the payload copy peels a word only when the
+source is 2 mod 4).  Same firmware both arms; A = origin/main 8bb3dc44 driver
+(never asks), B = the offset-2 driver.  Eight flushed boots ABBA ABBA,
+driver installed by size check before each power cycle.
+
+| Mbit/s | A 50 MHz | B 50 MHz | A 82 MHz | B 82 MHz |
+|---|---|---|---|---|
+| legs | 23.10 23.21 23.21 23.19 | 23.80 23.67 23.64 23.63 | 27.81 27.94 27.99 27.96 | 28.35 28.20 28.17 28.20 |
+| median | 23.20 | **23.66 (+2.0 %)** | 27.95 | **28.20 (+0.9 %)** |
+
+No overlap: every B leg beats every A leg at both clocks; backpressure 0 in
+all samples.  The 50 MHz gain matches the z3copy model (8.5-13 us of ~524 us
+per frame); at 82 MHz the copy saving is a smaller share.  Evidence:
+~/ooc-evidence/rxoff2/.
